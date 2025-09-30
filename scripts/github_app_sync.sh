@@ -2,16 +2,56 @@
 # GitHub App Repository Sync Script
 # Clones new repositories or pulls updates for existing ones using GitHub App authentication
 #
-# GitHub App Authentication Flow:
-# 1. App ID + Private Key → Generate JWT (JSON Web Token)
-# 2. JWT → Query GitHub API to get Installation ID(s) 
-# 3. JWT + Installation ID → Get Installation Access Token
-# 4. Installation Access Token → Access repositories
+# ============================================================================
+# AUTHENTICATION FLOW & ARCHITECTURE
+# ============================================================================
+#
+# This script implements GitHub App authentication using a multi-step process:
+#
+# Step 1: JWT Generation
+#   - Creates a JSON Web Token using RS256 algorithm
+#   - Signed with the GitHub App's private key
+#   - Contains App ID, issued time (iat), and expiration (exp)
+#   - Valid for 10 minutes maximum (GitHub requirement)
+#
+# Step 2: Installation Discovery
+#   - Uses JWT to query GitHub's installations endpoint
+#   - Finds all installations of this GitHub App
+#   - Auto-selects the first installation if not specified
+#
+# Step 3: Access Token Generation
+#   - Exchanges JWT + Installation ID for short-lived access token
+#   - Access token expires in ~1 hour and provides repository access
+#   - This token is used for actual git operations
+#
+# Step 4: Repository Operations
+#   - For each repository: clone if new, pull if existing
+#   - Uses token-based authentication via URL embedding
+#   - Format: https://x-access-token:TOKEN@github.com/owner/repo.git
+#
+# ============================================================================
+# SECURITY CONSIDERATIONS
+# ============================================================================
+#
+# - Private key should have 600 permissions and be stored securely
+# - JWT tokens are logged only partially (first 50 chars)
+# - Access tokens are never logged in full
+# - Git URLs with embedded tokens are cleaned from git config after use
+#
+# ============================================================================
+# ERROR HANDLING & RECOVERY
+# ============================================================================
+#
+# - Script uses 'set -euo pipefail' for strict error handling
+# - Each major operation has explicit error checking and reporting
+# - Failed repositories are tracked and reported in summary
+# - Git authentication failures are caught and explained
 #
 # Required GitHub App Credentials:
 # - App ID: Found in GitHub App settings (e.g., 2030793)
 # - Private Key: Downloaded .pem file from GitHub App settings
 # - Installation ID: Auto-discovered via API (e.g., 88054503)
+# Strict error handling: exit on any error, undefined vars, or pipe failures
 set -euo pipefail
 
 # ============================================================================
@@ -107,12 +147,15 @@ generate_jwt() {
     local app_id="$1"
     local private_key_path="$2"
     
-    # JWT header + payload
+    # JWT header specifying RS256 algorithm (RSA + SHA256)
     local header='{"alg":"RS256","typ":"JWT"}'
-    local now=$(date +%s)
-    local iat=$((now - 30))  # 30 seconds ago to handle clock skew
-    local exp=$((now + 600)) # 10 minutes from now (max allowed)
     
+    # Time calculations for JWT validity window
+    local now=$(date +%s)
+    local iat=$((now - 30))  # Issue time: 30 seconds ago (handles clock skew)
+    local exp=$((now + 600)) # Expiration: 10 minutes from now (GitHub's max limit)
+    
+    # JWT payload containing GitHub App claims
     local payload=$(cat <<-EOF
 	{
 	  "iat": $iat,
@@ -122,11 +165,16 @@ generate_jwt() {
 EOF
 )
     
-    # Base64url encode and sign
+    # Base64url encoding (RFC 4648 Section 5): standard base64 with URL-safe chars
+    # Replace '/' with '_', '+' with '-', remove padding '='
     local header_b64=$(echo -n "$header" | base64 -w0 | tr '/+' '_-' | tr -d '=')
     local payload_b64=$(echo -n "$payload" | base64 -w0 | tr '/+' '_-' | tr -d '=')
+    
+    # Create signature: sign "header.payload" with private key using SHA256
+    # Then base64url encode the binary signature
     local signature=$(echo -n "$header_b64.$payload_b64" | openssl dgst -sha256 -sign "$private_key_path" | base64 -w0 | tr '/+' '_-' | tr -d '=')
     
+    # Return complete JWT: header.payload.signature
     echo "$header_b64.$payload_b64.$signature"
 }
 
@@ -135,6 +183,8 @@ get_installation_id() {
     
     info "Auto-discovering Installation ID..."
     local response
+    # Query GitHub API for all installations of this App
+    # curl flags: -s (silent), -w (write HTTP code), -H (headers)
     response=$(curl -s -w "\n%{http_code}" \
         -H "Authorization: Bearer $jwt" \
         -H "Accept: application/vnd.github+json" \
@@ -142,6 +192,7 @@ get_installation_id() {
         -H "X-GitHub-Api-Version: 2022-11-28" \
         "https://api.github.com/app/installations")
     
+    # Split response: body (all lines except last) + HTTP code (last line)
     local http_code=$(echo "$response" | tail -n1)
     local body=$(echo "$response" | head -n -1)
     
@@ -151,7 +202,8 @@ get_installation_id() {
         return 1
     fi
     
-    # Get the first installation ID
+    # Extract first installation ID from JSON array using jq
+    # '.[0].id // empty' means: get first element's ID, or empty string if null/missing
     local installation_id=$(echo "$body" | jq -r '.[0].id // empty')
     
     if [[ -z "$installation_id" ]]; then
@@ -168,7 +220,11 @@ get_installation_token() {
     local installation_id="$2"
     
     local response
+    # Exchange JWT + Installation ID for short-lived access token
+    # IMPORTANT: Must use POST method (not GET) to create access tokens
+    # The access token expires in ~1 hour and provides repository access
     response=$(curl -s -w "\n%{http_code}" \
+        -X POST \
         -H "Authorization: Bearer $jwt" \
         -H "Accept: application/vnd.github+json" \
         -H "User-Agent: DST-DNS-Sync/1.0" \
@@ -178,12 +234,14 @@ get_installation_token() {
     local http_code=$(echo "$response" | tail -n1)
     local body=$(echo "$response" | head -n -1)
     
+    # GitHub returns 201 (Created) for successful token generation
     if [[ "$http_code" != "201" ]]; then
         error "Failed to get installation token (HTTP $http_code)"
         error "Response: $body"
         return 1
     fi
     
+    # Extract the token from JSON response
     echo "$body" | jq -r '.token'
 }
 
@@ -209,10 +267,12 @@ clone_repo() {
     
     step "Cloning $repo to $repo_path"
     
+    # Use token as username with x-access-token as password for GitHub App authentication
+    local clone_url="https://x-access-token:$token@github.com/$repo.git"
+    
     local clone_args=(
-        -c "http.extraHeader=Authorization: Bearer $token"
         clone
-        "https://github.com/$repo.git"
+        "$clone_url"
         "$repo_path"
     )
     
@@ -266,12 +326,16 @@ pull_repo() {
         fi
     fi
     
-    # Configure auth for this operation
-    git config --local http.extraHeader "Authorization: Bearer $token"
+    # Configure remote URL with token for this operation
+    local auth_url="https://x-access-token:$token@github.com/$repo.git"
+    local original_url=$(git config --get remote.origin.url)
+    git remote set-url origin "$auth_url"
     
     # Fetch and pull
     if ! git fetch origin; then
         error "Failed to fetch from origin for $repo"
+        # Restore original URL
+        git remote set-url origin "$original_url"
         cd - >/dev/null
         return 1
     fi
@@ -281,6 +345,8 @@ pull_repo() {
     
     if ! git pull origin "$current_branch"; then
         error "Failed to pull $current_branch for $repo"
+        # Restore original URL
+        git remote set-url origin "$original_url"
         cd - >/dev/null
         return 1
     fi
@@ -291,8 +357,8 @@ pull_repo() {
         git submodule update --init --recursive
     fi
     
-    # Clean up auth config
-    git config --local --unset http.extraHeader || true
+    # Restore original URL (remove token from git config)
+    git remote set-url origin "$original_url"
     
     cd - >/dev/null
     info "Successfully updated $repo"
@@ -339,10 +405,13 @@ sync_all_repositories() {
         info "Processing repository: $repo"
         
         if sync_repository "$repo" "$token"; then
-            ((success_count++))
+            # IMPORTANT: Use $((var + 1)) instead of ((var++)) with set -e
+            # When var=0, ((var++)) returns 0 (falsy), causing set -e to exit
+            # The expression $((var + 1)) always returns the new value (truthy)
+            success_count=$((success_count + 1))
             info "✅ $repo - SUCCESS"
         else
-            ((failure_count++))
+            failure_count=$((failure_count + 1))
             failed_repos+=("$repo")
             error "❌ $repo - FAILED"
         fi
