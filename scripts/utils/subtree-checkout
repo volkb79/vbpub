@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+
+# ============================================================================
+# Repository Subtree Checkout Tool
+# ============================================================================
+#
+# PURPOSE:
+#   Efficiently clone or download specific subdirectories (subtrees) from
+#   GitHub repositories without downloading the entire repository.
+#   Supports both authenticated and public repository access.
+#
+# USAGE:
+#   utils/subtree-checkout [OPTIONS] [OWNER/REPO] [SUBTREE_PATH]
+#
+# OPTIONS:
+#   -h, --help              Show this help message and exit
+#   -v, --verbose           Enable verbose logging and progress information
+#   -q, --quiet             Suppress non-error output
+#   --owner OWNER           GitHub repository owner (default: volkb79)
+#   --repo REPO             GitHub repository name (default: DST-DNS)
+#   --subtree PATH          Subtree path to checkout (interactive if not specified)
+#   --token TOKEN           GitHub Personal Access Token (for private repos)
+#   --method METHOD         Checkout method: download, sparse-checkout (default: download)
+#   --output DIR            Output directory (default: current directory)
+#   --branch BRANCH         Target branch (default: main)
+#   --list-subtrees         List available subtrees and exit
+#   --force                 Overwrite existing directory without confirmation
+#
+# ARGUMENTS:
+#   OWNER/REPO             Repository in format owner/repo (e.g., volkb79/DST-DNS)
+#   SUBTREE_PATH           Path to subtree within repository (e.g., projects/controller)
+#
+# ENVIRONMENT VARIABLES:
+#   GITHUB_PAT             GitHub Personal Access Token (alternative to --token)
+#   DEFAULT_OWNER          Default repository owner (default: volkb79)
+#   DEFAULT_REPO           Default repository name (default: DST-DNS)
+#
+# EXAMPLES:
+#   # Interactive subtree selection
+#   utils/subtree-checkout volkb79/DST-DNS
+#
+#   # Direct subtree download
+#   utils/subtree-checkout volkb79/DST-DNS projects/controller
+#
+#   # Download to specific directory
+#   utils/subtree-checkout --output /tmp/controller --repo DST-DNS --subtree projects/controller
+#
+#   # List available subtrees
+#   utils/subtree-checkout --list-subtrees --repo DST-DNS
+#
+#   # Use sparse checkout for large repositories
+#   utils/subtree-checkout --method sparse-checkout volkb79/DST-DNS projects/controller
+#
+# CHECKOUT METHODS:
+#   download:
+#     - Downloads only the specified subtree files
+#     - Faster for small subtrees
+#     - No Git history preserved
+#     - Works with GitHub API (requires token for private repos)
+#
+#   sparse-checkout:
+#     - Clones repository with Git sparse-checkout
+#     - Preserves Git history and allows local development
+#     - Better for large subtrees or when Git operations needed
+#     - Requires full repository clone initially
+#
+# AUTHENTICATION:
+#   - Public repositories: No authentication required
+#   - Private repositories: Requires GitHub PAT via --token or GITHUB_PAT
+#   - GitHub App tokens: Not supported (use Personal Access Tokens)
+#
+# EXIT CODES:
+#   0    Success - subtree checked out successfully
+#   1    Configuration error - invalid arguments or missing requirements
+#   2    Authentication error - invalid or missing token
+#   3    Repository error - not found or access denied
+#   4    Subtree error - path not found in repository
+#
+# DEPENDENCIES:
+#   - requests: HTTP requests to GitHub API (pip install requests)
+#   - git: Git operations for sparse-checkout method
+#
+# ============================================================================
+
+import os
+import sys
+import argparse
+import json
+import subprocess
+import tempfile
+import shutil
+from pathlib import Path
+from typing import Optional, List, Dict, Tuple
+import logging
+
+try:
+    import requests
+except ImportError:
+    print("Error: 'requests' library not found. Install with: pip install requests", file=sys.stderr)
+    sys.exit(1)
+
+# Script metadata
+SCRIPT_NAME = "subtree-checkout"
+SCRIPT_VERSION = "2.0.0"
+
+# Default configuration
+DEFAULT_OWNER = os.getenv("DEFAULT_OWNER", "volkb79")
+DEFAULT_REPO = os.getenv("DEFAULT_REPO", "DST-DNS")
+GITHUB_API_BASE = "https://api.github.com"
+
+class SubtreeCheckout:
+    """GitHub repository subtree checkout tool."""
+    
+    def __init__(self):
+        self.logger = self._setup_logging()
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': f'{SCRIPT_NAME}/{SCRIPT_VERSION}',
+            'Accept': 'application/vnd.github+json'
+        })
+    
+    def _setup_logging(self) -> logging.Logger:
+        """Configure logging based on verbosity settings."""
+        logger = logging.getLogger(SCRIPT_NAME)
+        logger.setLevel(logging.INFO)
+        
+        handler = logging.StreamHandler(sys.stderr)
+        formatter = logging.Formatter('[%(levelname)s] %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        
+        return logger
+    
+    def set_verbosity(self, verbose: bool, quiet: bool):
+        """Set logging verbosity level."""
+        if quiet:
+            self.logger.setLevel(logging.ERROR)
+        elif verbose:
+            self.logger.setLevel(logging.DEBUG)
+        else:
+            self.logger.setLevel(logging.INFO)
+    
+    def set_token(self, token: Optional[str]):
+        """Set GitHub authentication token."""
+        if token:
+            self.session.headers['Authorization'] = f'Bearer {token}'
+            self.logger.debug(f"Authentication token configured ({len(token)} chars)")
+    
+    def get_repository_info(self, owner: str, repo: str) -> Dict:
+        """Get repository information from GitHub API."""
+        url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}"
+        self.logger.debug(f"Fetching repository info: {url}")
+        
+        try:
+            response = self.session.get(url)
+            
+            if response.status_code == 404:
+                self.logger.error(f"Repository not found: {owner}/{repo}")
+                sys.exit(3)
+            elif response.status_code == 401:
+                self.logger.error("Authentication failed - check your token")
+                sys.exit(2)
+            elif response.status_code != 200:
+                self.logger.error(f"GitHub API error: HTTP {response.status_code}")
+                self.logger.error(f"Response: {response.text}")
+                sys.exit(3)
+            
+            return response.json()
+            
+        except requests.RequestException as e:
+            self.logger.error(f"Network error: {e}")
+            sys.exit(3)
+    
+    def get_tree_contents(self, owner: str, repo: str, branch: str, path: str = "") -> List[Dict]:
+        """Get directory tree contents from GitHub API."""
+        url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{path}"
+        params = {'ref': branch} if branch != 'main' else {}
+        
+        self.logger.debug(f"Fetching tree contents: {url}")
+        
+        try:
+            response = self.session.get(url, params=params)
+            
+            if response.status_code == 404:
+                self.logger.error(f"Path not found: {path}")
+                return []
+            elif response.status_code != 200:
+                self.logger.error(f"Failed to fetch contents: HTTP {response.status_code}")
+                return []
+            
+            return response.json()
+            
+        except requests.RequestException as e:
+            self.logger.error(f"Network error: {e}")
+            return []
+    
+    def list_subtrees(self, owner: str, repo: str, branch: str) -> List[str]:
+        """List available subtrees (directories) in the repository."""
+        self.logger.info(f"Scanning repository {owner}/{repo} for subtrees...")
+        
+        def scan_directory(path: str = "", depth: int = 0) -> List[str]:
+            if depth > 3:  # Limit recursion depth
+                return []
+            
+            contents = self.get_tree_contents(owner, repo, branch, path)
+            subtrees = []
+            
+            for item in contents:
+                if item['type'] == 'dir':
+                    dir_path = item['path']
+                    subtrees.append(dir_path)
+                    
+                    # Recursively scan subdirectories
+                    subdirs = scan_directory(dir_path, depth + 1)
+                    subtrees.extend(subdirs)
+            
+            return subtrees
+        
+        return sorted(scan_directory())
+    
+    def interactive_subtree_selection(self, subtrees: List[str]) -> str:
+        """Interactively select a subtree from available options."""
+        if not subtrees:
+            self.logger.error("No subtrees found in repository")
+            sys.exit(4)
+        
+        print("\\nAvailable subtrees:")
+        print("=" * 50)
+        
+        for i, subtree in enumerate(subtrees, 1):
+            print(f"{i:3d}. {subtree}")
+        
+        print("\\nEnter selection (number or path):")
+        
+        while True:
+            try:
+                selection = input("> ").strip()
+                
+                if not selection:
+                    continue
+                
+                # Try numeric selection
+                if selection.isdigit():
+                    index = int(selection) - 1
+                    if 0 <= index < len(subtrees):
+                        return subtrees[index]
+                    else:
+                        print(f"Invalid selection: {selection} (valid: 1-{len(subtrees)})")
+                        continue
+                
+                # Try path selection
+                if selection in subtrees:
+                    return selection
+                
+                # Try partial match
+                matches = [s for s in subtrees if selection in s]
+                if len(matches) == 1:
+                    return matches[0]
+                elif len(matches) > 1:
+                    print(f"Multiple matches for '{selection}':")
+                    for match in matches[:5]:  # Show first 5 matches
+                        print(f"  {match}")
+                    continue
+                
+                print(f"Subtree not found: {selection}")
+                
+            except KeyboardInterrupt:
+                print("\\nOperation cancelled")
+                sys.exit(1)
+            except EOFError:
+                print("\\nOperation cancelled")
+                sys.exit(1)
+    
+    def download_subtree_files(self, owner: str, repo: str, branch: str, 
+                              subtree_path: str, output_dir: Path):
+        """Download subtree files using GitHub API (download method)."""
+        self.logger.info(f"Downloading subtree: {subtree_path}")
+        
+        def download_directory(api_path: str, local_path: Path):
+            contents = self.get_tree_contents(owner, repo, branch, api_path)
+            
+            if not contents:
+                self.logger.warning(f"No contents found for: {api_path}")
+                return
+            
+            # Ensure local directory exists
+            local_path.mkdir(parents=True, exist_ok=True)
+            
+            for item in contents:
+                item_name = item['name']
+                item_path = item['path']
+                local_item_path = local_path / item_name
+                
+                if item['type'] == 'file':
+                    self.logger.debug(f"Downloading file: {item_path}")
+                    
+                    # Download file content
+                    file_response = self.session.get(item['download_url'])
+                    if file_response.status_code == 200:
+                        with open(local_item_path, 'wb') as f:
+                            f.write(file_response.content)
+                        self.logger.debug(f"✓ {item_path}")
+                    else:
+                        self.logger.warning(f"Failed to download: {item_path}")
+                
+                elif item['type'] == 'dir':
+                    self.logger.debug(f"Entering directory: {item_path}")
+                    download_directory(item_path, local_item_path)
+        
+        download_directory(subtree_path, output_dir)
+        self.logger.info(f"✓ Subtree downloaded to: {output_dir}")
+    
+    def sparse_checkout_subtree(self, owner: str, repo: str, branch: str,
+                               subtree_path: str, output_dir: Path):
+        """Clone subtree using Git sparse-checkout (sparse-checkout method)."""
+        self.logger.info(f"Cloning with sparse-checkout: {subtree_path}")
+        
+        repo_url = f"https://github.com/{owner}/{repo}.git"
+        
+        try:
+            # Clone repository with no checkout
+            self.logger.debug(f"Cloning repository: {repo_url}")
+            subprocess.run([
+                'git', 'clone', '--no-checkout', '--depth', '1', 
+                '--branch', branch, repo_url, str(output_dir)
+            ], check=True, capture_output=True)
+            
+            # Configure sparse-checkout
+            sparse_checkout_file = output_dir / '.git' / 'info' / 'sparse-checkout'
+            sparse_checkout_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(sparse_checkout_file, 'w') as f:
+                f.write(f"{subtree_path}/*\\n")
+            
+            # Enable sparse-checkout and checkout files
+            subprocess.run([
+                'git', '-C', str(output_dir), 'config', 'core.sparseCheckout', 'true'
+            ], check=True)
+            
+            subprocess.run([
+                'git', '-C', str(output_dir), 'checkout', branch
+            ], check=True)
+            
+            # Move subtree contents to root
+            subtree_full_path = output_dir / subtree_path
+            if subtree_full_path.exists():
+                temp_dir = output_dir.parent / f"{output_dir.name}_temp"
+                shutil.move(str(subtree_full_path), str(temp_dir))
+                shutil.rmtree(output_dir)
+                shutil.move(str(temp_dir), str(output_dir))
+            
+            self.logger.info(f"✓ Sparse checkout completed: {output_dir}")
+            
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"Git operation failed: {e}")
+            if output_dir.exists():
+                shutil.rmtree(output_dir)
+            sys.exit(4)
+        except Exception as e:
+            self.logger.error(f"Sparse checkout failed: {e}")
+            if output_dir.exists():
+                shutil.rmtree(output_dir)
+            sys.exit(4)
+    
+    def checkout_subtree(self, owner: str, repo: str, branch: str, subtree_path: str,
+                        output_dir: Path, method: str, force: bool = False):
+        """Main subtree checkout function."""
+        # Validate repository access
+        repo_info = self.get_repository_info(owner, repo)
+        self.logger.info(f"Repository: {repo_info['full_name']} ({repo_info['visibility']})")
+        
+        # Check if subtree exists
+        contents = self.get_tree_contents(owner, repo, branch, subtree_path)
+        if not contents:
+            self.logger.error(f"Subtree not found: {subtree_path}")
+            sys.exit(4)
+        
+        # Handle output directory
+        if output_dir.exists():
+            if not force:
+                response = input(f"Directory exists: {output_dir}. Overwrite? [y/N]: ")
+                if response.lower() not in ['y', 'yes']:
+                    self.logger.info("Operation cancelled")
+                    sys.exit(0)
+            
+            self.logger.info(f"Removing existing directory: {output_dir}")
+            shutil.rmtree(output_dir)
+        
+        # Execute checkout based on method
+        if method == 'download':
+            self.download_subtree_files(owner, repo, branch, subtree_path, output_dir)
+        elif method == 'sparse-checkout':
+            self.sparse_checkout_subtree(owner, repo, branch, subtree_path, output_dir)
+        else:
+            self.logger.error(f"Unknown method: {method}")
+            sys.exit(1)
+
+
+def parse_repository_arg(repo_arg: str) -> Tuple[str, str]:
+    """Parse repository argument in format owner/repo."""
+    if '/' in repo_arg:
+        parts = repo_arg.split('/', 1)
+        return parts[0], parts[1]
+    else:
+        return DEFAULT_OWNER, repo_arg
+
+
+def main():
+    """Main function with argument parsing and execution."""
+    parser = argparse.ArgumentParser(
+        description="GitHub repository subtree checkout tool",
+        epilog="Examples:\\n"
+               "  %(prog)s volkb79/DST-DNS projects/controller\\n"
+               "  %(prog)s --list-subtrees --repo DST-DNS\\n"
+               "  %(prog)s --method sparse-checkout --output /tmp/controller volkb79/DST-DNS projects/controller",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    # Basic options
+    parser.add_argument('-v', '--verbose', action='store_true',
+                       help='Enable verbose logging')
+    parser.add_argument('-q', '--quiet', action='store_true',
+                       help='Suppress non-error output')
+    parser.add_argument('--version', action='version',
+                       version=f'%(prog)s {SCRIPT_VERSION}')
+    
+    # Repository options
+    parser.add_argument('--owner', default=DEFAULT_OWNER,
+                       help=f'Repository owner (default: {DEFAULT_OWNER})')
+    parser.add_argument('--repo', default=DEFAULT_REPO,
+                       help=f'Repository name (default: {DEFAULT_REPO})')
+    parser.add_argument('--branch', default='main',
+                       help='Target branch (default: main)')
+    parser.add_argument('--token', default=os.getenv('GITHUB_PAT'),
+                       help='GitHub Personal Access Token')
+    
+    # Subtree options
+    parser.add_argument('--subtree',
+                       help='Subtree path to checkout')
+    parser.add_argument('--method', choices=['download', 'sparse-checkout'], 
+                       default='download',
+                       help='Checkout method (default: download)')
+    parser.add_argument('--output', type=Path, default=Path.cwd(),
+                       help='Output directory (default: current directory)')
+    parser.add_argument('--list-subtrees', action='store_true',
+                       help='List available subtrees and exit')
+    parser.add_argument('--force', action='store_true',
+                       help='Overwrite existing directory without confirmation')
+    
+    # Positional arguments
+    parser.add_argument('repository', nargs='?',
+                       help='Repository in format owner/repo')
+    parser.add_argument('subtree_path', nargs='?',
+                       help='Subtree path within repository')
+    
+    args = parser.parse_args()
+    
+    # Parse repository from positional argument
+    if args.repository:
+        args.owner, args.repo = parse_repository_arg(args.repository)
+    
+    # Parse subtree from positional argument
+    if args.subtree_path:
+        args.subtree = args.subtree_path
+    
+    # Initialize checkout tool
+    checkout = SubtreeCheckout()
+    checkout.set_verbosity(args.verbose, args.quiet)
+    checkout.set_token(args.token)
+    
+    try:
+        # List subtrees mode
+        if args.list_subtrees:
+            subtrees = checkout.list_subtrees(args.owner, args.repo, args.branch)
+            if subtrees:
+                print(f"\\nSubtrees in {args.owner}/{args.repo}:")
+                print("=" * 40)
+                for subtree in subtrees:
+                    print(f"  {subtree}")
+                print(f"\\nTotal: {len(subtrees)} subtrees found")
+            else:
+                print(f"No subtrees found in {args.owner}/{args.repo}")
+            return 0
+        
+        # Interactive subtree selection if not specified
+        if not args.subtree:
+            subtrees = checkout.list_subtrees(args.owner, args.repo, args.branch)
+            args.subtree = checkout.interactive_subtree_selection(subtrees)
+        
+        # Determine output directory
+        if args.output == Path.cwd():
+            # Use subtree name as directory
+            args.output = Path.cwd() / Path(args.subtree).name
+        
+        # Execute checkout
+        checkout.checkout_subtree(
+            args.owner, args.repo, args.branch, args.subtree,
+            args.output, args.method, args.force
+        )
+        
+        return 0
+        
+    except KeyboardInterrupt:
+        checkout.logger.info("Operation cancelled by user")
+        return 1
+    except Exception as e:
+        checkout.logger.error(f"Unexpected error: {e}")
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

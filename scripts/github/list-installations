@@ -1,0 +1,612 @@
+#!/bin/bash
+
+# ============================================================================
+# GitHub App Installation Discovery Tool
+# ============================================================================
+#
+# PURPOSE:
+#   Discovers and lists GitHub App installations using App ID and private key.
+#   Provides detailed information about installations, permissions, and
+#   repository access for troubleshooting and configuration verification.
+#
+# USAGE:
+#   github/list-installations [OPTIONS]
+#
+# OPTIONS:
+#   -h, --help              Show this help message and exit
+#   -v, --verbose           Enable verbose logging
+#   -q, --quiet             Suppress headers and formatting
+#   --app-id ID             GitHub App ID (required)
+#   --private-key PATH      Path to private key file (default: ~/.ssh/github_app_key.pem)
+#   --format FORMAT         Output format: json, table, summary (default: table)
+#   --show-repos            Include accessible repositories for each installation
+#   --installation-id ID    Show details for specific installation only
+#   --permissions           Include detailed permission information
+#   --validate              Validate token generation without API calls
+#
+# ENVIRONMENT VARIABLES:
+#   GITHUB_APP_ID                 GitHub App ID (used if --app-id not provided)
+#   GITHUB_APP_PRIVATE_KEY_PATH   Path to private key file
+#
+# EXAMPLES:
+#   # List all installations in table format
+#   github/list-installations --app-id 2030793
+#
+#   # Detailed JSON output with repositories
+#   github/list-installations --app-id 2030793 --format json --show-repos
+#
+#   # Quick summary for automation
+#   github/list-installations --quiet --format summary --app-id 2030793
+#
+#   # Validate specific installation
+#   github/list-installations --installation-id 88054503 --permissions --verbose
+#
+# OUTPUT INFORMATION:
+#   - Installation ID (for API authentication)
+#   - Account details (user/organization name)
+#   - Repository selection (all vs selected)
+#   - Installation permissions and events
+#   - Creation and update timestamps
+#   - Accessible repositories (with --show-repos)
+#
+# AUTHENTICATION FLOW:
+#   1. Generate JWT using App ID + Private Key
+#   2. Query GitHub installations API using JWT
+#   3. Parse and format installation information
+#   4. Optionally query repositories for each installation
+#
+# EXIT CODES:
+#   0    Success - installations retrieved successfully
+#   1    Configuration error - missing App ID or invalid private key
+#   2    Authentication error - JWT generation or API access failed
+#   3    No installations found
+#
+# DEPENDENCIES:
+#   - curl: HTTP requests to GitHub API
+#   - jq: JSON parsing and formatting
+#   - openssl: JWT signing operations
+#   - base64: JWT encoding operations
+#
+# ============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+readonly SCRIPT_VERSION="1.0.0"
+
+# Configuration
+declare -g APP_ID=""
+declare -g INSTALLATION_ID=""
+declare -g PRIVATE_KEY_PATH="$HOME/.ssh/github_app_key.pem"
+declare -g FORMAT="table"
+declare -g SHOW_REPOS="false"
+declare -g SHOW_PERMISSIONS="false"
+declare -g VALIDATE_ONLY="false"
+declare -g VERBOSE="false"
+declare -g QUIET="false"
+
+# ============================================================================
+# Logging Functions
+# ============================================================================
+
+log() {
+    [[ "$QUIET" == "true" ]] && return 0
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
+}
+
+info() {
+    log "[INFO] $*"
+}
+
+verbose() {
+    [[ "$VERBOSE" == "true" ]] && log "[VERBOSE] $*"
+}
+
+error() {
+    echo "[ERROR] $*" >&2
+}
+
+fatal() {
+    error "$*"
+    exit "${2:-1}"
+}
+
+# ============================================================================
+# Help and Usage
+# ============================================================================
+
+show_usage() {
+    cat << 'EOF'
+GitHub App Installation Discovery Tool
+
+USAGE:
+    github/list-installations [OPTIONS]
+
+PURPOSE:
+    Discovers GitHub App installations and provides detailed information
+    about permissions, repositories, and configuration for troubleshooting
+    and automation setup.
+
+OPTIONS:
+    -h, --help              Show this help message and exit
+    -v, --verbose           Enable verbose logging and debug information
+    -q, --quiet             Suppress headers and non-essential output
+    
+    --app-id ID             GitHub App ID (required)
+    --private-key PATH      Path to private key file (default: ~/.ssh/github_app_key.pem)
+    
+    --format FORMAT         Output format options:
+                              table   - Human-readable table (default)
+                              json    - Raw JSON API response
+                              summary - Compact one-line per installation
+    
+    --show-repos            Include accessible repositories for each installation
+    --installation-id ID    Show details for specific installation only
+    --permissions           Include detailed permission breakdown
+    --validate              Validate JWT generation without API calls
+
+ENVIRONMENT VARIABLES:
+    GITHUB_APP_ID                 GitHub App ID (alternative to --app-id)
+    GITHUB_APP_PRIVATE_KEY_PATH   Path to private key file
+
+EXAMPLES:
+    # List all installations
+    github/list-installations --app-id 2030793
+    
+    # Detailed analysis with repositories
+    github/list-installations --app-id 2030793 --show-repos --permissions --verbose
+    
+    # JSON output for automation
+    github/list-installations --app-id 2030793 --format json --quiet
+    
+    # Quick summary
+    github/list-installations --format summary --app-id 2030793
+    
+    # Validate specific installation
+    github/list-installations --installation-id 88054503 --verbose
+
+OUTPUT INFORMATION:
+    Installation Details:
+      - Installation ID (for API authentication)
+      - Account name and type (User/Organization)
+      - Repository selection scope (all/selected)
+      - Installation status and timestamps
+    
+    Permissions (with --permissions):
+      - Repository permissions (read/write access)
+      - Event subscriptions
+      - Administrative capabilities
+    
+    Repositories (with --show-repos):
+      - Accessible repository list
+      - Repository permissions per installation
+      - Private/public repository status
+
+TROUBLESHOOTING:
+    Common Issues:
+      - "No installations found": App not installed on any accounts
+      - "Authentication failed": Check App ID and private key
+      - "Permission denied": App lacks installation permissions
+      
+    Debug Steps:
+      1. Verify App ID: github/list-installations --validate --verbose
+      2. Check private key: openssl rsa -in <key> -check -noout  
+      3. Test API access: Use --verbose for detailed error messages
+
+EXIT CODES:
+    0    Success - installations found and processed
+    1    Configuration error - invalid parameters or missing files
+    2    Authentication error - JWT or API failure
+    3    No installations found (may not be an error)
+
+For GitHub App setup, ensure the app is installed on target accounts/organizations
+before running this tool.
+EOF
+}
+
+# ============================================================================
+# JWT Generation (reused from app-sync)
+# ============================================================================
+
+# Base64 URL encoding function
+b64enc() { 
+    openssl base64 | tr -d '=' | tr '/+' '_-' | tr -d '\n'
+}
+
+generate_jwt() {
+    local app_id="$1"
+    local private_key_path="$2"
+    
+    verbose "Generating JWT for App ID: $app_id"
+    
+    if [[ ! -f "$private_key_path" ]]; then
+        fatal "Private key file not found: $private_key_path" 1
+    fi
+    
+    local pem
+    if ! pem=$(cat "$private_key_path" 2>/dev/null); then
+        fatal "Failed to read private key: $private_key_path" 1
+    fi
+    
+    # Generate timestamps
+    local now=$(date +%s)
+    local iat=$((now - 60))
+    local exp=$((now + 600))
+    
+    verbose "JWT timestamps: iat=$iat, exp=$exp"
+    
+    # Create header and payload
+    local header_json='{
+        "typ": "JWT",
+        "alg": "RS256"
+    }'
+    
+    local payload_json="{
+        \"iat\": $iat,
+        \"exp\": $exp,
+        \"iss\": \"$app_id\"
+    }"
+    
+    # Encode and sign
+    local header payload signature
+    header=$(echo -n "$header_json" | b64enc) || fatal "Failed to encode header" 2
+    payload=$(echo -n "$payload_json" | b64enc) || fatal "Failed to encode payload" 2
+    
+    local header_payload="$header.$payload"
+    signature=$(openssl dgst -sha256 -sign <(echo -n "$pem") <(echo -n "$header_payload") | b64enc) || {
+        fatal "Failed to sign JWT - check private key format" 2
+    }
+    
+    local jwt="$header_payload.$signature"
+    verbose "JWT generated successfully (${#jwt} characters)"
+    
+    echo "$jwt"
+}
+
+# ============================================================================
+# GitHub API Functions
+# ============================================================================
+
+get_installations() {
+    local jwt="$1"
+    
+    verbose "Querying GitHub installations API"
+    
+    local response http_code body
+    response=$(curl -s -w "\n%{http_code}" \
+        -H "Authorization: Bearer $jwt" \
+        -H "Accept: application/vnd.github+json" \
+        -H "User-Agent: github-list-installations/$SCRIPT_VERSION" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        "https://api.github.com/app/installations" 2>/dev/null) || {
+        fatal "Failed to connect to GitHub API" 2
+    }
+    
+    http_code=$(echo "$response" | tail -n1)
+    body=$(echo "$response" | head -n -1)
+    
+    verbose "GitHub API response: HTTP $http_code"
+    
+    case "$http_code" in
+        200)
+            verbose "Successfully retrieved installations"
+            ;;
+        401)
+            error "Authentication failed - check App ID and private key"
+            error "API Response: $body"
+            fatal "GitHub API authentication error" 2
+            ;;
+        404)
+            error "GitHub App not found - verify App ID: $APP_ID"
+            error "API Response: $body"
+            fatal "GitHub App not found" 2
+            ;;
+        *)
+            error "GitHub API error: HTTP $http_code"
+            error "API Response: $body"
+            fatal "GitHub API request failed" 2
+            ;;
+    esac
+    
+    echo "$body"
+}
+
+get_installation_repos() {
+    local jwt="$1"
+    local installation_id="$2"
+    
+    verbose "Fetching repositories for installation: $installation_id"
+    
+    local response http_code body
+    response=$(curl -s -w "\n%{http_code}" \
+        -H "Authorization: Bearer $jwt" \
+        -H "Accept: application/vnd.github+json" \
+        -H "User-Agent: github-list-installations/$SCRIPT_VERSION" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        "https://api.github.com/app/installations/$installation_id/repositories" 2>/dev/null) || {
+        verbose "Failed to fetch repositories (network error)"
+        return 1
+    }
+    
+    http_code=$(echo "$response" | tail -n1)
+    body=$(echo "$response" | head -n -1)
+    
+    if [[ "$http_code" == "200" ]]; then
+        echo "$body"
+    else
+        verbose "Failed to fetch repositories: HTTP $http_code"
+        return 1
+    fi
+}
+
+# ============================================================================
+# Output Formatting Functions
+# ============================================================================
+
+format_table_output() {
+    local installations_json="$1"
+    local jwt="$2"
+    
+    [[ "$QUIET" == "true" ]] || {
+        echo "GitHub App Installations"
+        echo "========================"
+        echo
+    }
+    
+    local count
+    count=$(echo "$installations_json" | jq '. | length')
+    
+    if [[ "$count" == "0" ]]; then
+        echo "No installations found for this GitHub App"
+        return 3
+    fi
+    
+    [[ "$QUIET" == "true" ]] || echo "Found $count installation(s):"
+    [[ "$QUIET" == "true" ]] || echo
+    
+    # Table header
+    printf "%-12s %-20s %-15s %-12s %-20s\n" "ID" "Account" "Type" "Repos" "Updated"
+    printf "%-12s %-20s %-15s %-12s %-20s\n" "------------" "--------------------" "---------------" "------------" "--------------------"
+    
+    # Process each installation
+    echo "$installations_json" | jq -c '.[]' | while read -r installation; do
+        local id account_name account_type repo_selection updated_at
+        
+        id=$(echo "$installation" | jq -r '.id')
+        account_name=$(echo "$installation" | jq -r '.account.login')
+        account_type=$(echo "$installation" | jq -r '.account.type')
+        repo_selection=$(echo "$installation" | jq -r '.repository_selection')
+        updated_at=$(echo "$installation" | jq -r '.updated_at')
+        
+        # Format date
+        local formatted_date
+        if command -v date >/dev/null 2>&1; then
+            formatted_date=$(date -d "$updated_at" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$updated_at")
+        else
+            formatted_date="$updated_at"
+        fi
+        
+        printf "%-12s %-20s %-15s %-12s %-20s\n" "$id" "$account_name" "$account_type" "$repo_selection" "$formatted_date"
+        
+        # Show permissions if requested
+        if [[ "$SHOW_PERMISSIONS" == "true" ]]; then
+            echo "  Permissions:"
+            echo "$installation" | jq -r '.permissions | to_entries[] | "    \(.key): \(.value)"'
+        fi
+        
+        # Show repositories if requested  
+        if [[ "$SHOW_REPOS" == "true" ]]; then
+            local repos_json
+            if repos_json=$(get_installation_repos "$jwt" "$id"); then
+                local repo_count
+                repo_count=$(echo "$repos_json" | jq '.total_count')
+                echo "  Repositories ($repo_count):"
+                echo "$repos_json" | jq -r '.repositories[]? | "    \(.full_name) (\(.visibility))"'
+            else
+                echo "  Repositories: (failed to fetch)"
+            fi
+        fi
+        
+        [[ "$SHOW_PERMISSIONS" == "true" || "$SHOW_REPOS" == "true" ]] && echo
+    done
+}
+
+format_json_output() {
+    local installations_json="$1"
+    local jwt="$2"
+    
+    if [[ "$SHOW_REPOS" == "true" ]]; then
+        # Enhanced JSON with repository information
+        echo "$installations_json" | jq -c '.[]' | while read -r installation; do
+            local id
+            id=$(echo "$installation" | jq -r '.id')
+            
+            local repos_json
+            if repos_json=$(get_installation_repos "$jwt" "$id"); then
+                echo "$installation" | jq --argjson repos "$repos_json" '. + {accessible_repositories: $repos}'
+            else
+                echo "$installation" | jq '. + {accessible_repositories: null}'
+            fi
+        done | jq -s .
+    else
+        # Standard JSON output
+        echo "$installations_json" | jq .
+    fi
+}
+
+format_summary_output() {
+    local installations_json="$1"
+    
+    local count
+    count=$(echo "$installations_json" | jq '. | length')
+    
+    if [[ "$count" == "0" ]]; then
+        echo "No installations found"
+        return 3
+    fi
+    
+    echo "$installations_json" | jq -r '.[] | "\(.id):\(.account.login):\(.account.type):\(.repository_selection)"'
+}
+
+# ============================================================================
+# Configuration and Validation
+# ============================================================================
+
+load_environment() {
+    verbose "Loading configuration from environment"
+    
+    APP_ID="${GITHUB_APP_ID:-$APP_ID}"
+    PRIVATE_KEY_PATH="${GITHUB_APP_PRIVATE_KEY_PATH:-$PRIVATE_KEY_PATH}"
+    
+    verbose "App ID: ${APP_ID:-"(not set)"}"
+    verbose "Private Key: $PRIVATE_KEY_PATH"
+}
+
+validate_config() {
+    verbose "Validating configuration"
+    
+    if [[ -z "$APP_ID" ]]; then
+        fatal "GitHub App ID not specified (use --app-id or GITHUB_APP_ID environment variable)" 1
+    fi
+    
+    if [[ ! -f "$PRIVATE_KEY_PATH" ]]; then
+        fatal "Private key file not found: $PRIVATE_KEY_PATH" 1
+    fi
+    
+    if [[ ! -r "$PRIVATE_KEY_PATH" ]]; then
+        fatal "Private key file not readable: $PRIVATE_KEY_PATH" 1
+    fi
+    
+    # Check required tools
+    for tool in curl jq openssl base64; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            fatal "Required tool not found: $tool" 1
+        fi
+    done
+    
+    verbose "Configuration validation passed"
+}
+
+# ============================================================================
+# Command Line Parsing
+# ============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE="true"
+                shift
+                ;;
+            -q|--quiet)
+                QUIET="true"
+                shift
+                ;;
+            --app-id)
+                [[ -z "${2:-}" ]] && fatal "Option $1 requires an argument" 1
+                APP_ID="$2"
+                shift 2
+                ;;
+            --private-key)
+                [[ -z "${2:-}" ]] && fatal "Option $1 requires an argument" 1
+                PRIVATE_KEY_PATH="$2"
+                shift 2
+                ;;
+            --format)
+                [[ -z "${2:-}" ]] && fatal "Option $1 requires an argument" 1
+                FORMAT="$2"
+                case "$FORMAT" in
+                    json|table|summary) ;;
+                    *) fatal "Invalid format: $FORMAT (use json, table, or summary)" 1 ;;
+                esac
+                shift 2
+                ;;
+            --show-repos)
+                SHOW_REPOS="true"
+                shift
+                ;;
+            --installation-id)
+                [[ -z "${2:-}" ]] && fatal "Option $1 requires an argument" 1
+                INSTALLATION_ID="$2"
+                shift 2
+                ;;
+            --permissions)
+                SHOW_PERMISSIONS="true"
+                shift
+                ;;
+            --validate)
+                VALIDATE_ONLY="true"
+                shift
+                ;;
+            -*)
+                fatal "Unknown option: $1\nUse --help for usage information" 1
+                ;;
+            *)
+                fatal "Unexpected argument: $1\nUse --help for usage information" 1
+                ;;
+        esac
+    done
+}
+
+# ============================================================================
+# Main Function
+# ============================================================================
+
+main() {
+    # Parse arguments and load configuration
+    parse_args "$@"
+    load_environment
+    validate_config
+    
+    # Generate JWT
+    local jwt
+    jwt=$(generate_jwt "$APP_ID" "$PRIVATE_KEY_PATH")
+    
+    if [[ "$VALIDATE_ONLY" == "true" ]]; then
+        info "✅ JWT generation successful - configuration is valid"
+        verbose "JWT: ${jwt:0:50}... (${#jwt} total characters)"
+        return 0
+    fi
+    
+    # Get installations
+    local installations_json
+    installations_json=$(get_installations "$jwt")
+    
+    # Filter for specific installation if requested
+    if [[ -n "$INSTALLATION_ID" ]]; then
+        verbose "Filtering for installation ID: $INSTALLATION_ID"
+        installations_json=$(echo "$installations_json" | jq --arg id "$INSTALLATION_ID" '[.[] | select(.id == ($id | tonumber))]')
+        
+        local count
+        count=$(echo "$installations_json" | jq '. | length')
+        if [[ "$count" == "0" ]]; then
+            fatal "Installation not found: $INSTALLATION_ID" 3
+        fi
+    fi
+    
+    # Format and display output
+    case "$FORMAT" in
+        table)
+            format_table_output "$installations_json" "$jwt"
+            ;;
+        json)
+            format_json_output "$installations_json" "$jwt"
+            ;;
+        summary)
+            format_summary_output "$installations_json"
+            ;;
+    esac
+}
+
+# ============================================================================
+# Script Entry Point
+# ============================================================================
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

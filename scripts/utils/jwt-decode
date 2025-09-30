@@ -1,0 +1,592 @@
+#!/bin/bash
+
+# ============================================================================
+# JWT Decoder and Analyzer for GitHub Apps
+# ============================================================================
+#
+# PURPOSE:
+#   Decodes and analyzes JSON Web Tokens (JWTs) used for GitHub App authentication.
+#   Provides human-readable output of JWT headers, payloads, and validation status.
+#   Useful for debugging authentication issues and verifying token contents.
+#
+# USAGE:
+#   utils/jwt-decode [OPTIONS] <JWT_TOKEN>
+#   echo "JWT_TOKEN" | utils/jwt-decode [OPTIONS]
+#
+# OPTIONS:
+#   -h, --help          Show this help message and exit
+#   -v, --verbose       Enable verbose output with additional validation
+#   -q, --quiet         Suppress headers, show only payload
+#   --header-only       Show only JWT header
+#   --payload-only      Show only JWT payload  
+#   --signature-info    Show signature information
+#   --validate          Validate JWT structure and timestamps
+#   --format FORMAT     Output format: json, yaml, table (default: json)
+#
+# ARGUMENTS:
+#   JWT_TOKEN          The JWT token to decode (base64url encoded)
+#                      If not provided, reads from stdin
+#
+# EXAMPLES:
+#   # Basic JWT decoding
+#   utils/jwt-decode eyJhbGciOiJSUzI1NiIs...
+#
+#   # Decode from file or command output
+#   cat jwt_token.txt | utils/jwt-decode
+#   
+#   # Verbose analysis with validation
+#   utils/jwt-decode --verbose --validate <TOKEN>
+#
+#   # Extract only payload in quiet mode
+#   utils/jwt-decode --quiet --payload-only <TOKEN>
+#
+# JWT STRUCTURE:
+#   A JWT consists of three base64url-encoded parts separated by dots:
+#   1. Header: Algorithm and token type information
+#   2. Payload: Claims including issuer, expiration, issued time
+#   3. Signature: Cryptographic signature for verification
+#
+# COMMON GITHUB APP CLAIMS:
+#   iss (issuer):     GitHub App ID or Client ID
+#   iat (issued at):  Token creation timestamp
+#   exp (expires):    Token expiration timestamp (max 10 minutes for GitHub)
+#   alg (algorithm):  Must be RS256 for GitHub Apps
+#   typ (type):       Must be "JWT"
+#
+# EXIT CODES:
+#   0    Success - JWT decoded successfully
+#   1    Invalid arguments or usage
+#   2    Invalid JWT format or structure
+#   3    JWT validation failed (expired, malformed, etc.)
+#
+# DEPENDENCIES:
+#   - base64: Base64 decoding operations
+#   - jq: JSON parsing and formatting
+#   - date: Timestamp conversion and validation
+#
+# ============================================================================
+
+set -euo pipefail
+
+# Script metadata
+readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+readonly SCRIPT_VERSION="1.0.0"
+
+# Configuration
+declare -g VERBOSE="false"
+declare -g QUIET="false" 
+declare -g HEADER_ONLY="false"
+declare -g PAYLOAD_ONLY="false"
+declare -g SIGNATURE_INFO="false"
+declare -g VALIDATE="false"
+declare -g FORMAT="json"
+
+# ============================================================================
+# Logging Functions
+# ============================================================================
+
+log() {
+    [[ "$QUIET" == "true" ]] && return 0
+    echo "$*" >&2
+}
+
+verbose() {
+    [[ "$VERBOSE" == "true" ]] && log "[VERBOSE] $*"
+}
+
+error() {
+    echo "[ERROR] $*" >&2
+}
+
+fatal() {
+    error "$*"
+    exit "${2:-1}"
+}
+
+# ============================================================================
+# Help and Usage
+# ============================================================================
+
+show_usage() {
+    cat << 'EOF'
+JWT Decoder and Analyzer for GitHub Apps
+
+USAGE:
+    utils/jwt-decode [OPTIONS] <JWT_TOKEN>
+    echo "JWT_TOKEN" | utils/jwt-decode [OPTIONS]
+
+PURPOSE:
+    Decodes and analyzes JSON Web Tokens (JWTs) for GitHub App authentication.
+    Provides detailed analysis of token structure, claims, and validation status.
+
+OPTIONS:
+    -h, --help          Show this help message and exit
+    -v, --verbose       Enable verbose output with validation details
+    -q, --quiet         Suppress headers and formatting
+    --header-only       Display only JWT header information
+    --payload-only      Display only JWT payload/claims
+    --signature-info    Show signature analysis and metadata
+    --validate          Perform timestamp and structure validation
+    --format FORMAT     Output format: json, yaml, table (default: json)
+
+ARGUMENTS:
+    JWT_TOKEN          Base64url-encoded JWT token to decode
+                       If omitted, reads from stdin
+
+EXAMPLES:
+    # Decode a complete JWT
+    utils/jwt-decode "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."
+    
+    # Pipeline usage with GitHub App authentication
+    ./github/generate-jwt --app-id 123456 | utils/jwt-decode --verbose
+    
+    # Extract specific information
+    utils/jwt-decode --payload-only --quiet <TOKEN> | jq -r '.exp'
+    
+    # Validate token timestamps and structure
+    utils/jwt-decode --validate --verbose <TOKEN>
+
+JWT STRUCTURE:
+    Header.Payload.Signature (three base64url parts separated by dots)
+    
+    Header contains:
+      - alg: Signature algorithm (RS256 for GitHub Apps)
+      - typ: Token type (JWT)
+    
+    Payload contains GitHub App claims:
+      - iss: App ID or Client ID (issuer)
+      - iat: Issued at timestamp (Unix epoch)
+      - exp: Expiration timestamp (max 10 min for GitHub)
+    
+    Signature: RS256 cryptographic signature
+
+EXIT CODES:
+    0    JWT decoded successfully
+    1    Invalid arguments or missing dependencies
+    2    Malformed JWT structure
+    3    JWT validation failed (expired, invalid claims)
+
+VALIDATION CHECKS:
+    - JWT has exactly 3 parts (header.payload.signature)
+    - Header and payload are valid base64url and JSON
+    - Required claims present (iss, iat, exp)
+    - Timestamps are valid and not expired
+    - Algorithm is RS256 for GitHub Apps
+
+For GitHub App troubleshooting, use --validate --verbose for comprehensive analysis.
+EOF
+}
+
+# ============================================================================
+# JWT Decoding Functions
+# ============================================================================
+
+# Base64url decode with padding adjustment
+base64url_decode() {
+    local input="$1"
+    
+    # Add padding if needed (base64url omits padding)
+    local len=$((${#input} % 4))
+    if [[ $len -ne 0 ]]; then
+        local padding=$((4 - len))
+        for ((i=0; i<padding; i++)); do
+            input="${input}="
+        done
+    fi
+    
+    # Convert base64url to standard base64 and decode
+    echo "$input" | tr '_-' '/+' | base64 -d 2>/dev/null
+}
+
+decode_jwt_part() {
+    local part="$1"
+    local part_name="$2"
+    
+    verbose "Decoding JWT $part_name (${#part} chars)"
+    
+    local decoded
+    if ! decoded=$(base64url_decode "$part"); then
+        fatal "Failed to base64url decode JWT $part_name" 2
+    fi
+    
+    # Validate JSON format
+    if ! echo "$decoded" | jq . >/dev/null 2>&1; then
+        fatal "JWT $part_name is not valid JSON" 2
+    fi
+    
+    echo "$decoded"
+}
+
+validate_jwt_structure() {
+    local jwt="$1"
+    
+    verbose "Validating JWT structure"
+    
+    # Split JWT into parts
+    IFS='.' read -ra parts <<< "$jwt"
+    
+    if [[ ${#parts[@]} -ne 3 ]]; then
+        fatal "Invalid JWT format: expected 3 parts (header.payload.signature), got ${#parts[@]}" 2
+    fi
+    
+    verbose "JWT structure valid: ${#parts[0]} chars header, ${#parts[1]} chars payload, ${#parts[2]} chars signature"
+    
+    # Return parts as global variables for reuse
+    JWT_HEADER="${parts[0]}"
+    JWT_PAYLOAD="${parts[1]}"
+    JWT_SIGNATURE="${parts[2]}"
+}
+
+validate_jwt_claims() {
+    local header_json="$1"
+    local payload_json="$2"
+    
+    verbose "Validating JWT claims and timestamps"
+    
+    local errors=0
+    
+    # Validate header claims
+    local alg typ
+    alg=$(echo "$header_json" | jq -r '.alg // empty')
+    typ=$(echo "$header_json" | jq -r '.typ // empty')
+    
+    if [[ "$typ" != "JWT" ]]; then
+        error "Invalid token type: expected 'JWT', got '$typ'"
+        ((errors++))
+    fi
+    
+    if [[ "$alg" != "RS256" ]]; then
+        error "Invalid algorithm for GitHub Apps: expected 'RS256', got '$alg'"
+        ((errors++))
+    fi
+    
+    # Validate payload claims
+    local iss iat exp
+    iss=$(echo "$payload_json" | jq -r '.iss // empty')
+    iat=$(echo "$payload_json" | jq -r '.iat // empty') 
+    exp=$(echo "$payload_json" | jq -r '.exp // empty')
+    
+    if [[ -z "$iss" ]]; then
+        error "Missing required claim: iss (issuer)"
+        ((errors++))
+    fi
+    
+    if [[ -z "$iat" ]]; then
+        error "Missing required claim: iat (issued at)"
+        ((errors++))
+    fi
+    
+    if [[ -z "$exp" ]]; then
+        error "Missing required claim: exp (expires)"
+        ((errors++))
+    fi
+    
+    # Validate timestamps if present
+    if [[ -n "$iat" && -n "$exp" ]]; then
+        local now=$(date +%s)
+        
+        verbose "Timestamp validation: now=$now, iat=$iat, exp=$exp"
+        
+        if [[ "$iat" -gt "$now" ]]; then
+            error "Token issued in future: iat=$iat > now=$now"
+            ((errors++))
+        fi
+        
+        if [[ "$exp" -lt "$now" ]]; then
+            error "Token expired: exp=$exp < now=$now (expired $(($now - $exp)) seconds ago)"
+            ((errors++))
+        fi
+        
+        local duration=$((exp - iat))
+        if [[ "$duration" -gt 600 ]]; then
+            error "Token lifetime too long: ${duration}s (GitHub max is 600s)"
+            ((errors++))
+        fi
+        
+        verbose "Token lifetime: ${duration} seconds ($(date -d "@$iat" '+%H:%M:%S') - $(date -d "@$exp" '+%H:%M:%S'))"
+    fi
+    
+    if [[ $errors -gt 0 ]]; then
+        fatal "JWT validation failed with $errors error(s)" 3
+    fi
+    
+    verbose "JWT claims validation passed"
+}
+
+format_timestamp() {
+    local timestamp="$1"
+    local name="$2"
+    
+    if [[ -z "$timestamp" || "$timestamp" == "null" ]]; then
+        echo "\"$name\": null"
+        return
+    fi
+    
+    local human_date
+    if human_date=$(date -d "@$timestamp" 2>/dev/null); then
+        local now=$(date +%s)
+        local diff=$((timestamp - now))
+        local status
+        
+        if [[ $diff -gt 0 ]]; then
+            status="in ${diff}s"
+        elif [[ $diff -eq 0 ]]; then
+            status="now"
+        else
+            status="${((-diff))}s ago"
+        fi
+        
+        echo "\"${name}\": $timestamp,  // $human_date ($status)"
+    else
+        echo "\"${name}\": $timestamp,  // Invalid timestamp"
+    fi
+}
+
+format_output() {
+    local header_json="$1"
+    local payload_json="$2" 
+    local signature="$3"
+    
+    case "$FORMAT" in
+        json)
+            format_json_output "$header_json" "$payload_json" "$signature"
+            ;;
+        yaml)
+            format_yaml_output "$header_json" "$payload_json" "$signature"
+            ;;
+        table)
+            format_table_output "$header_json" "$payload_json" "$signature"
+            ;;
+        *)
+            fatal "Unknown format: $FORMAT" 1
+            ;;
+    esac
+}
+
+format_json_output() {
+    local header_json="$1"
+    local payload_json="$2"
+    local signature="$3"
+    
+    # Display components based on options
+    if [[ "$HEADER_ONLY" == "true" ]]; then
+        echo "$header_json" | jq .
+    elif [[ "$PAYLOAD_ONLY" == "true" ]]; then
+        echo "$payload_json" | jq .
+    else
+        # Full output with enhanced timestamp display
+        [[ "$QUIET" != "true" ]] && echo "=== JWT HEADER ==="
+        echo "$header_json" | jq .
+        
+        [[ "$QUIET" != "true" ]] && echo -e "\n=== JWT PAYLOAD ==="
+        
+        # Enhanced payload with human-readable timestamps
+        if [[ "$VERBOSE" == "true" ]]; then
+            echo "{"
+            echo "$payload_json" | jq -r 'to_entries[] | "  \"\(.key)\": \(.value),"' | while IFS= read -r line; do
+                if [[ "$line" =~ \"(iat|exp|nbf)\":\ ([0-9]+), ]]; then
+                    format_timestamp "${BASH_REMATCH[2]}" "${BASH_REMATCH[1]}"
+                else
+                    echo "$line"
+                fi
+            done | sed '$ s/,$//'
+            echo "}"
+        else
+            echo "$payload_json" | jq .
+        fi
+        
+        if [[ "$SIGNATURE_INFO" == "true" ]]; then
+            [[ "$QUIET" != "true" ]] && echo -e "\n=== JWT SIGNATURE ==="
+            echo "{"
+            echo "  \"length\": ${#signature},"
+            echo "  \"algorithm\": \"$(echo "$header_json" | jq -r '.alg')\","
+            echo "  \"first_chars\": \"${signature:0:20}...\","
+            echo "  \"last_chars\": \"...${signature: -20}\""
+            echo "}"
+        fi
+    fi
+}
+
+format_yaml_output() {
+    local header_json="$1"
+    local payload_json="$2"
+    local signature="$3"
+    
+    if [[ "$HEADER_ONLY" == "true" ]]; then
+        echo "header:"
+        echo "$header_json" | jq -r 'to_entries[] | "  \(.key): \(.value)"'
+    elif [[ "$PAYLOAD_ONLY" == "true" ]]; then
+        echo "payload:"  
+        echo "$payload_json" | jq -r 'to_entries[] | "  \(.key): \(.value)"'
+    else
+        echo "jwt:"
+        echo "  header:"
+        echo "$header_json" | jq -r 'to_entries[] | "    \(.key): \(.value)"'
+        echo "  payload:"
+        echo "$payload_json" | jq -r 'to_entries[] | "    \(.key): \(.value)"'
+        if [[ "$SIGNATURE_INFO" == "true" ]]; then
+            echo "  signature:"
+            echo "    length: ${#signature}"
+            echo "    preview: ${signature:0:40}..."
+        fi
+    fi
+}
+
+format_table_output() {
+    local header_json="$1"
+    local payload_json="$2"
+    local signature="$3"
+    
+    if [[ "$HEADER_ONLY" == "true" ]]; then
+        echo "JWT HEADER"
+        echo "==========="
+        echo "$header_json" | jq -r 'to_entries[] | "\(.key): \(.value)"'
+    elif [[ "$PAYLOAD_ONLY" == "true" ]]; then
+        echo "JWT PAYLOAD"
+        echo "==========="
+        echo "$payload_json" | jq -r 'to_entries[] | "\(.key): \(.value)"'
+    else
+        echo "JWT TOKEN ANALYSIS"
+        echo "=================="
+        echo
+        echo "HEADER:"
+        echo "$header_json" | jq -r 'to_entries[] | "  \(.key): \(.value)"'
+        echo
+        echo "PAYLOAD:"
+        echo "$payload_json" | jq -r 'to_entries[] | "  \(.key): \(.value)"'
+        
+        if [[ "$SIGNATURE_INFO" == "true" ]]; then
+            echo
+            echo "SIGNATURE:"
+            echo "  Length: ${#signature} characters"
+            echo "  Preview: ${signature:0:40}..."
+        fi
+    fi
+}
+
+# ============================================================================
+# Command Line Parsing
+# ============================================================================
+
+parse_args() {
+    local jwt_token=""
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE="true"
+                shift
+                ;;
+            -q|--quiet)
+                QUIET="true"
+                shift
+                ;;
+            --header-only)
+                HEADER_ONLY="true"
+                shift
+                ;;
+            --payload-only)
+                PAYLOAD_ONLY="true"
+                shift
+                ;;
+            --signature-info)
+                SIGNATURE_INFO="true"
+                shift
+                ;;
+            --validate)
+                VALIDATE="true"
+                shift
+                ;;
+            --format)
+                [[ -z "${2:-}" ]] && fatal "Option $1 requires an argument" 1
+                FORMAT="$2"
+                case "$FORMAT" in
+                    json|yaml|table) ;;
+                    *) fatal "Invalid format: $FORMAT (use json, yaml, or table)" 1 ;;
+                esac
+                shift 2
+                ;;
+            -*)
+                fatal "Unknown option: $1\nUse --help for usage information" 1
+                ;;
+            *)
+                [[ -n "$jwt_token" ]] && fatal "Multiple JWT tokens provided" 1
+                jwt_token="$1"
+                shift
+                ;;
+        esac
+    done
+    
+    # Get JWT token from stdin if not provided as argument
+    if [[ -z "$jwt_token" ]]; then
+        if [[ -t 0 ]]; then
+            fatal "JWT token required as argument or via stdin\nUse --help for usage information" 1
+        fi
+        
+        verbose "Reading JWT token from stdin"
+        if ! jwt_token=$(cat); then
+            fatal "Failed to read JWT token from stdin" 1
+        fi
+        
+        # Clean up input (remove whitespace, newlines)
+        jwt_token=$(echo "$jwt_token" | tr -d '[:space:]')
+    fi
+    
+    [[ -z "$jwt_token" ]] && fatal "Empty JWT token provided" 1
+    
+    echo "$jwt_token"
+}
+
+# ============================================================================
+# Main Function
+# ============================================================================
+
+main() {
+    # Check dependencies
+    for cmd in base64 jq date; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            fatal "Required command not found: $cmd" 1
+        fi
+    done
+    
+    # Parse arguments and get JWT token
+    local jwt_token
+    jwt_token=$(parse_args "$@")
+    
+    verbose "Decoding JWT token (${#jwt_token} characters)"
+    
+    # Validate and split JWT structure
+    validate_jwt_structure "$jwt_token"
+    
+    # Decode JWT components
+    local header_json payload_json
+    header_json=$(decode_jwt_part "$JWT_HEADER" "header")
+    payload_json=$(decode_jwt_part "$JWT_PAYLOAD" "payload")
+    
+    verbose "JWT decoded successfully"
+    
+    # Validate claims if requested
+    if [[ "$VALIDATE" == "true" ]]; then
+        validate_jwt_claims "$header_json" "$payload_json"
+    fi
+    
+    # Format and display output
+    format_output "$header_json" "$payload_json" "$JWT_SIGNATURE"
+}
+
+# ============================================================================
+# Script Entry Point
+# ============================================================================
+
+# Global variables for JWT parts (set by validate_jwt_structure)
+declare -g JWT_HEADER=""
+declare -g JWT_PAYLOAD=""
+declare -g JWT_SIGNATURE=""
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

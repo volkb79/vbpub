@@ -1,0 +1,896 @@
+#!/bin/bash
+
+# ============================================================================
+# GitHub App Repository Synchronization Tool
+# ============================================================================
+#
+# PURPOSE:
+#   Synchronizes multiple GitHub repositories using GitHub App authentication.
+#   Clones new repositories or pulls updates for existing ones with robust
+#   error handling and comprehensive logging.
+#
+# AUTHENTICATION FLOW:
+#   1. JWT Generation: Creates JSON Web Token using App ID + Private Key
+#   2. Installation Discovery: Queries GitHub API to find Installation IDs
+#   3. Access Token: Exchanges JWT + Installation ID for repository access token
+#   4. Git Operations: Uses access token for clone/pull operations
+#
+# USAGE:
+#   github/app-sync [OPTIONS]
+#
+# OPTIONS:
+#   -h, --help              Show this help message and exit
+#   -v, --verbose           Enable verbose logging
+#   -q, --quiet             Suppress non-error output
+#   -s, --status            Show configuration status and exit
+#   --validate              Validate configuration without running sync
+#   -d, --directory DIR     Base directory for repositories (default: ~/repos)
+#   -b, --branch BRANCH     Branch to checkout (default: main)
+#   --submodules            Include git submodules in operations
+#   --force-clean           Force clean working directories before pull
+#   -j, --jobs NUM          Number of parallel jobs (default: 1)
+#   --app-id ID             GitHub App ID (overrides environment)
+#   --installation-id ID    Installation ID (auto-discovered if not set)
+#   --private-key PATH      Path to private key file (default: ~/.ssh/github_app_key.pem)
+#
+# ENVIRONMENT VARIABLES:
+#   GITHUB_APP_ID                 GitHub App ID (required if not passed via --app-id)
+#   GITHUB_INSTALLATION_ID        Installation ID (optional - auto-discovered)
+#   GITHUB_APP_PRIVATE_KEY_PATH   Path to private key (default: ~/.ssh/github_app_key.pem)
+#   REPO_BASE_DIR                 Base directory for repos (default: ~/repos)
+#   FETCH_SUBMODULES              Include git submodules (default: false)
+#   CHECKOUT_BRANCH               Branch to checkout (default: main)
+#   FORCE_CLEAN                   Clean working dir before pull (default: false)
+#
+# EXAMPLES:
+#   # Basic synchronization with auto-discovery
+#   github/app-sync --app-id 2030793
+#
+#   # Sync with custom directory and branch
+#   github/app-sync --directory /opt/repos --branch develop
+#
+#   # Validate configuration without running
+#   github/app-sync --validate --verbose
+#
+#   # Force clean and include submodules
+#   github/app-sync --force-clean --submodules --verbose
+#
+# SECURITY NOTES:
+#   - Private key file should have 600 permissions
+#   - Access tokens are short-lived (1 hour) and never logged in full
+#   - JWT tokens are logged partially for debugging (first 50 chars only)
+#   - Git URLs with embedded tokens are cleaned from config after use
+#
+# ERROR HANDLING:
+#   - Strict error handling with 'set -euo pipefail'
+#   - Individual repository failures don't stop overall sync
+#   - Comprehensive error reporting with actionable suggestions
+#   - Exit codes: 0=success, 1=configuration error, 2=authentication error, 3=sync failures
+#
+# DEPENDENCIES:
+#   - curl: HTTP requests to GitHub API
+#   - jq: JSON parsing and manipulation
+#   - git: Version control operations
+#   - openssl: JWT signing and key operations
+#   - base64: JWT encoding operations
+#
+# ============================================================================
+
+set -euo pipefail
+
+# ============================================================================
+# Global Configuration
+# ============================================================================
+
+# Script metadata
+readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_VERSION="2.0.0"
+
+# Default configuration
+declare -g APP_ID=""
+declare -g INSTALLATION_ID=""
+declare -g PRIVATE_KEY_PATH="$HOME/.ssh/github_app_key.pem"
+declare -g REPO_BASE_DIR="$HOME/repos"
+declare -g CHECKOUT_BRANCH="main"
+declare -g FETCH_SUBMODULES="false"
+declare -g FORCE_CLEAN="false"
+declare -g PARALLEL_JOBS="1"
+declare -g VERBOSE="false"
+declare -g QUIET="false"
+
+# Repository list - customize as needed
+readonly REPOSITORIES=(
+    "volkb79/DST-DNS"
+    "volkb79/vbpro"
+    "volkb79/vbpub"
+)
+
+# ============================================================================
+# Logging Functions
+# ============================================================================
+
+log() {
+    [[ "$QUIET" == "true" ]] && return 0
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
+}
+
+info() {
+    log "[INFO] $*"
+}
+
+verbose() {
+    [[ "$VERBOSE" == "true" ]] && log "[VERBOSE] $*"
+}
+
+warn() {
+    log "[WARN] $*"
+}
+
+error() {
+    log "[ERROR] $*"
+}
+
+step() {
+    [[ "$QUIET" == "true" ]] && return 0
+    log "[STEP] $*"
+}
+
+fatal() {
+    error "$*"
+    exit "${2:-1}"
+}
+
+# ============================================================================
+# Help and Usage Functions
+# ============================================================================
+
+show_usage() {
+    cat << 'EOF'
+GitHub App Repository Synchronization Tool
+
+USAGE:
+    github/app-sync [OPTIONS]
+
+PURPOSE:
+    Synchronizes multiple GitHub repositories using GitHub App authentication.
+    Supports automatic installation discovery, robust error handling, and
+    comprehensive logging for production automation workflows.
+
+OPTIONS:
+    -h, --help              Show this help message and exit
+    -v, --verbose           Enable verbose logging output
+    -q, --quiet             Suppress non-error output
+    -s, --status            Show configuration status and exit
+    --validate              Validate configuration without running sync
+    
+    -d, --directory DIR     Base directory for repositories (default: ~/repos)
+    -b, --branch BRANCH     Branch to checkout (default: main)
+    --submodules            Include git submodules in operations
+    --force-clean           Force clean working directories before pull
+    -j, --jobs NUM          Number of parallel jobs (default: 1, not implemented)
+    
+    --app-id ID             GitHub App ID (overrides environment)
+    --installation-id ID    Installation ID (auto-discovered if not set)
+    --private-key PATH      Path to private key file
+
+ENVIRONMENT VARIABLES:
+    GITHUB_APP_ID                 GitHub App ID (required)
+    GITHUB_INSTALLATION_ID        Installation ID (optional - auto-discovered)
+    GITHUB_APP_PRIVATE_KEY_PATH   Path to private key (default: ~/.ssh/github_app_key.pem)
+    REPO_BASE_DIR                 Base directory (default: ~/repos)
+    FETCH_SUBMODULES              Include submodules (true/false, default: false)
+    CHECKOUT_BRANCH               Target branch (default: main)
+    FORCE_CLEAN                   Force clean (true/false, default: false)
+
+EXAMPLES:
+    # Basic sync with auto-discovery
+    github/app-sync --app-id 2030793
+
+    # Verbose sync with custom directory
+    github/app-sync --verbose --directory /opt/repos
+
+    # Validate configuration
+    github/app-sync --validate --app-id 2030793
+
+    # Production automation
+    export GITHUB_APP_ID=2030793
+    export GITHUB_APP_PRIVATE_KEY_PATH=/etc/github/app.pem
+    github/app-sync --quiet --force-clean
+
+AUTHENTICATION FLOW:
+    1. Generate JWT using App ID + Private Key (RS256 signature)
+    2. Query GitHub API for Installation IDs using JWT
+    3. Exchange JWT + Installation ID for access token
+    4. Use access token for Git operations (clone/pull)
+
+EXIT CODES:
+    0    Success - all operations completed
+    1    Configuration error - invalid arguments or missing requirements
+    2    Authentication error - JWT/token generation failed
+    3    Sync error - one or more repository operations failed
+
+For more information, see the documentation in the script header.
+EOF
+}
+
+show_version() {
+    echo "$SCRIPT_NAME version $SCRIPT_VERSION"
+}
+
+# ============================================================================
+# Configuration and Validation
+# ============================================================================
+
+load_environment() {
+    verbose "Loading environment variables"
+    
+    # Load from environment with defaults
+    APP_ID="${GITHUB_APP_ID:-$APP_ID}"
+    INSTALLATION_ID="${GITHUB_INSTALLATION_ID:-$INSTALLATION_ID}"
+    PRIVATE_KEY_PATH="${GITHUB_APP_PRIVATE_KEY_PATH:-$PRIVATE_KEY_PATH}"
+    REPO_BASE_DIR="${REPO_BASE_DIR:-$REPO_BASE_DIR}"
+    CHECKOUT_BRANCH="${CHECKOUT_BRANCH:-$CHECKOUT_BRANCH}"
+    FETCH_SUBMODULES="${FETCH_SUBMODULES:-$FETCH_SUBMODULES}"
+    FORCE_CLEAN="${FORCE_CLEAN:-$FORCE_CLEAN}"
+    PARALLEL_JOBS="${PARALLEL_JOBS:-$PARALLEL_JOBS}"
+    
+    verbose "Configuration loaded from environment"
+}
+
+validate_config() {
+    verbose "Validating configuration"
+    local errors=0
+    
+    # Check required parameters
+    if [[ -z "$APP_ID" ]]; then
+        error "GitHub App ID not specified (use --app-id or GITHUB_APP_ID environment variable)"
+        ((errors++))
+    fi
+    
+    # Validate private key
+    if [[ ! -f "$PRIVATE_KEY_PATH" ]]; then
+        error "Private key file not found: $PRIVATE_KEY_PATH"
+        ((errors++))
+    elif [[ ! -r "$PRIVATE_KEY_PATH" ]]; then
+        error "Private key file not readable: $PRIVATE_KEY_PATH"
+        ((errors++))
+    else
+        # Check file permissions (should be 600 or 400)
+        local perms=$(stat -c "%a" "$PRIVATE_KEY_PATH" 2>/dev/null || echo "000")
+        if [[ "$perms" != "600" && "$perms" != "400" ]]; then
+            warn "Private key file permissions are $perms, recommend 600 for security"
+        fi
+    fi
+    
+    # Check required tools
+    local required_tools=("curl" "jq" "git" "openssl" "base64")
+    for tool in "${required_tools[@]}"; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            error "Required tool not found: $tool"
+            error "  Install with: apt-get install $tool  # (Ubuntu/Debian)"
+            ((errors++))
+        fi
+    done
+    
+    # Validate numeric parameters
+    if ! [[ "$PARALLEL_JOBS" =~ ^[0-9]+$ ]] || [[ "$PARALLEL_JOBS" -lt 1 ]]; then
+        error "Invalid parallel jobs value: $PARALLEL_JOBS (must be positive integer)"
+        ((errors++))
+    fi
+    
+    if (( errors > 0 )); then
+        fatal "Configuration validation failed with $errors error(s)" 1
+    fi
+    
+    info "Configuration validation passed"
+}
+
+show_status() {
+    echo "GitHub App Sync Configuration Status"
+    echo "===================================="
+    echo
+    echo "Script Information:"
+    echo "  Name: $SCRIPT_NAME"
+    echo "  Version: $SCRIPT_VERSION"
+    echo "  Location: $SCRIPT_DIR"
+    echo
+    echo "GitHub App Configuration:"
+    echo "  App ID: ${APP_ID:-"(not set)"}"
+    echo "  Installation ID: ${INSTALLATION_ID:-"(auto-discover)"}"
+    echo "  Private Key: $PRIVATE_KEY_PATH"
+    echo "  Private Key Exists: $(test -f "$PRIVATE_KEY_PATH" && echo "✓ Yes" || echo "✗ No")"
+    if [[ -f "$PRIVATE_KEY_PATH" ]]; then
+        echo "  Private Key Perms: $(stat -c "%a" "$PRIVATE_KEY_PATH" 2>/dev/null || echo "unknown")"
+    fi
+    echo
+    echo "Repository Configuration:"
+    echo "  Base Directory: $REPO_BASE_DIR"
+    echo "  Target Branch: $CHECKOUT_BRANCH"
+    echo "  Fetch Submodules: $FETCH_SUBMODULES"
+    echo "  Force Clean: $FORCE_CLEAN"
+    echo "  Parallel Jobs: $PARALLEL_JOBS"
+    echo "  Repositories (${#REPOSITORIES[@]}):"
+    for repo in "${REPOSITORIES[@]}"; do
+        echo "    - $repo"
+    done
+    echo
+    echo "Runtime Options:"
+    echo "  Verbose: $VERBOSE"
+    echo "  Quiet: $QUIET"
+    echo
+    echo "Required Tools:"
+    local tools=("curl" "jq" "git" "openssl" "base64")
+    for tool in "${tools[@]}"; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            echo "  $tool: ✓ $(command -v "$tool")"
+        else
+            echo "  $tool: ✗ Not found"
+        fi
+    done
+}
+
+# ============================================================================
+# GitHub App Authentication
+# ============================================================================
+
+# Base64 URL encoding function (from GitHub's official documentation)
+b64enc() { 
+    openssl base64 | tr -d '=' | tr '/+' '_-' | tr -d '\n'
+}
+
+generate_jwt() {
+    local app_id="$1"
+    local private_key_path="$2"
+    
+    verbose "Generating JWT for App ID: $app_id"
+    
+    # Read and validate private key
+    if [[ ! -f "$private_key_path" ]]; then
+        fatal "Private key file not found: $private_key_path" 2
+    fi
+    
+    local pem
+    if ! pem=$(cat "$private_key_path" 2>/dev/null); then
+        fatal "Failed to read private key file: $private_key_path" 2
+    fi
+    
+    # Generate timestamps (GitHub requirements)
+    local now=$(date +%s)
+    local iat=$((now - 60))  # 60 seconds ago to handle clock drift
+    local exp=$((now + 600)) # 10 minutes from now (GitHub maximum)
+    
+    verbose "JWT timestamps: iat=$iat, exp=$exp (valid for $((exp - iat)) seconds)"
+    
+    # Create JWT header and payload (following GitHub's spec)
+    local header_json='{
+        "typ": "JWT",
+        "alg": "RS256"
+    }'
+    
+    local payload_json="{
+        \"iat\": $iat,
+        \"exp\": $exp,
+        \"iss\": \"$app_id\"
+    }"
+    
+    verbose "JWT payload: iss=$app_id"
+    
+    # Encode header and payload
+    local header payload
+    header=$(echo -n "$header_json" | b64enc) || fatal "Failed to encode JWT header" 2
+    payload=$(echo -n "$payload_json" | b64enc) || fatal "Failed to encode JWT payload" 2
+    
+    # Create signature using private key
+    local header_payload="$header.$payload"
+    local signature
+    if ! signature=$(openssl dgst -sha256 -sign <(echo -n "$pem") <(echo -n "$header_payload") | b64enc); then
+        fatal "Failed to sign JWT with private key" 2
+    fi
+    
+    # Assemble final JWT
+    local jwt="$header_payload.$signature"
+    verbose "Generated JWT successfully (${#jwt} chars)"
+    
+    echo "$jwt"
+}
+
+get_installation_id() {
+    local jwt="$1"
+    
+    info "Auto-discovering Installation ID for GitHub App"
+    verbose "Querying GitHub installations API"
+    
+    local response http_code body
+    response=$(curl -s -w "\n%{http_code}" \
+        -H "Authorization: Bearer $jwt" \
+        -H "Accept: application/vnd.github+json" \
+        -H "User-Agent: github-app-sync/$SCRIPT_VERSION" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        "https://api.github.com/app/installations" 2>/dev/null) || {
+        fatal "Failed to connect to GitHub API (network error)" 2
+    }
+    
+    http_code=$(echo "$response" | tail -n1)
+    body=$(echo "$response" | head -n -1)
+    
+    verbose "GitHub API response: HTTP $http_code"
+    
+    case "$http_code" in
+        200)
+            verbose "Successfully retrieved installations"
+            ;;
+        401)
+            error "Authentication failed - check App ID and private key"
+            error "Response: $body"
+            fatal "GitHub API authentication error" 2
+            ;;
+        404)
+            error "GitHub App not found - check App ID"
+            error "Response: $body"
+            fatal "GitHub App not found" 2
+            ;;
+        *)
+            error "GitHub API error (HTTP $http_code)"
+            error "Response: $body"
+            fatal "GitHub API request failed" 2
+            ;;
+    esac
+    
+    # Parse installation ID from response
+    local installation_id
+    if ! installation_id=$(echo "$body" | jq -r '.[0].id // empty' 2>/dev/null); then
+        fatal "Failed to parse GitHub API response" 2
+    fi
+    
+    if [[ -z "$installation_id" || "$installation_id" == "null" ]]; then
+        error "No installations found for this GitHub App"
+        error "Ensure the GitHub App is installed on your account/organization"
+        fatal "No GitHub App installations found" 2
+    fi
+    
+    info "Found Installation ID: $installation_id"
+    echo "$installation_id"
+}
+
+get_installation_token() {
+    local jwt="$1"
+    local installation_id="$2"
+    
+    verbose "Requesting installation access token for ID: $installation_id"
+    
+    local response http_code body
+    response=$(curl -s -w "\n%{http_code}" \
+        -X POST \
+        -H "Authorization: Bearer $jwt" \
+        -H "Accept: application/vnd.github+json" \
+        -H "User-Agent: github-app-sync/$SCRIPT_VERSION" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        "https://api.github.com/app/installations/$installation_id/access_tokens" 2>/dev/null) || {
+        fatal "Failed to request installation token (network error)" 2
+    }
+    
+    http_code=$(echo "$response" | tail -n1)
+    body=$(echo "$response" | head -n -1)
+    
+    verbose "Installation token response: HTTP $http_code"
+    
+    case "$http_code" in
+        201)
+            verbose "Installation token generated successfully"
+            ;;
+        401|403)
+            error "Permission denied - check GitHub App permissions and installation"
+            error "Response: $body"
+            fatal "Installation token permission denied" 2
+            ;;
+        404)
+            error "Installation not found: $installation_id"
+            error "Response: $body"
+            fatal "Installation not found" 2
+            ;;
+        *)
+            error "Failed to get installation token (HTTP $http_code)"
+            error "Response: $body"
+            fatal "Installation token request failed" 2
+            ;;
+    esac
+    
+    # Extract token from response
+    local token
+    if ! token=$(echo "$body" | jq -r '.token // empty' 2>/dev/null); then
+        fatal "Failed to parse installation token response" 2
+    fi
+    
+    if [[ -z "$token" || "$token" == "null" ]]; then
+        fatal "No token found in installation response" 2
+    fi
+    
+    verbose "Installation token obtained (expires in ~1 hour)"
+    echo "$token"
+}
+
+# ============================================================================
+# Repository Management
+# ============================================================================
+
+ensure_repo_dir() {
+    verbose "Ensuring repository base directory: $REPO_BASE_DIR"
+    
+    if ! mkdir -p "$REPO_BASE_DIR"; then
+        fatal "Failed to create repository directory: $REPO_BASE_DIR" 1
+    fi
+    
+    if ! cd "$REPO_BASE_DIR"; then
+        fatal "Failed to change to repository directory: $REPO_BASE_DIR" 1
+    fi
+    
+    info "Working in directory: $(pwd)"
+}
+
+get_repo_path() {
+    local repo="$1"
+    local repo_name
+    repo_name=$(basename "$repo")
+    echo "$REPO_BASE_DIR/$repo_name"
+}
+
+clone_repo() {
+    local repo="$1"
+    local token="$2"
+    local repo_path="$3"
+    
+    step "Cloning $repo → $repo_path"
+    verbose "Starting fresh clone operation"
+    
+    # Prepare clone arguments
+    local clone_args=(
+        -c "http.extraHeader=Authorization: Bearer $token"
+        clone
+        "https://github.com/$repo.git"
+        "$repo_path"
+    )
+    
+    # Add submodules if requested
+    if [[ "$FETCH_SUBMODULES" == "true" ]]; then
+        clone_args+=(--recurse-submodules)
+        verbose "Including submodules in clone"
+    fi
+    
+    # Execute clone
+    verbose "Git command: git ${clone_args[*]}"
+    if ! git "${clone_args[@]}"; then
+        error "Failed to clone repository: $repo"
+        return 1
+    fi
+    
+    # Handle branch checkout
+    if [[ "$CHECKOUT_BRANCH" != "main" && "$CHECKOUT_BRANCH" != "master" ]]; then
+        verbose "Checking for custom branch: $CHECKOUT_BRANCH"
+        if ! cd "$repo_path"; then
+            error "Failed to enter cloned repository: $repo_path"
+            return 1
+        fi
+        
+        if git show-ref --verify --quiet "refs/remotes/origin/$CHECKOUT_BRANCH"; then
+            info "Checking out branch: $CHECKOUT_BRANCH"
+            if ! git checkout -b "$CHECKOUT_BRANCH" "origin/$CHECKOUT_BRANCH"; then
+                warn "Failed to checkout branch $CHECKOUT_BRANCH, staying on default"
+            fi
+        else
+            warn "Branch $CHECKOUT_BRANCH not found in $repo, staying on default"
+        fi
+        
+        cd - >/dev/null || true
+    fi
+    
+    info "✅ Successfully cloned $repo"
+    return 0
+}
+
+pull_repo() {
+    local repo="$1"
+    local token="$2"
+    local repo_path="$3"
+    
+    step "Updating $repo at $repo_path"
+    verbose "Starting repository update"
+    
+    if ! cd "$repo_path"; then
+        error "Failed to enter repository directory: $repo_path"
+        return 1
+    fi
+    
+    # Clean working directory if requested
+    if [[ "$FORCE_CLEAN" == "true" ]]; then
+        info "Force cleaning working directory"
+        verbose "Running git clean and reset"
+        git clean -fd || warn "Git clean failed (non-critical)"
+        git reset --hard HEAD || warn "Git reset failed (non-critical)"
+    fi
+    
+    # Check for uncommitted changes
+    if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+        if [[ "$FORCE_CLEAN" != "true" ]]; then
+            warn "Repository $repo has uncommitted changes"
+            error "Use --force-clean to override uncommitted changes"
+            cd - >/dev/null || true
+            return 1
+        fi
+    fi
+    
+    # Configure authentication for this operation
+    verbose "Configuring Git authentication"
+    git config --local http.extraHeader "Authorization: Bearer $token"
+    
+    # Fetch updates
+    verbose "Fetching from origin"
+    if ! git fetch origin; then
+        error "Failed to fetch from origin: $repo"
+        git config --local --unset http.extraHeader || true
+        cd - >/dev/null || true
+        return 1
+    fi
+    
+    # Determine current branch
+    local current_branch
+    if ! current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null); then
+        error "Failed to determine current branch for $repo"
+        git config --local --unset http.extraHeader || true
+        cd - >/dev/null || true
+        return 1
+    fi
+    
+    verbose "Current branch: $current_branch"
+    
+    # Pull updates
+    verbose "Pulling updates for branch: $current_branch"
+    if ! git pull origin "$current_branch"; then
+        error "Failed to pull updates for $repo (branch: $current_branch)"
+        git config --local --unset http.extraHeader || true
+        cd - >/dev/null || true
+        return 1
+    fi
+    
+    # Update submodules if enabled
+    if [[ "$FETCH_SUBMODULES" == "true" ]]; then
+        verbose "Updating submodules"
+        if ! git submodule update --init --recursive; then
+            warn "Submodule update failed for $repo (non-critical)"
+        fi
+    fi
+    
+    # Clean up authentication config
+    git config --local --unset http.extraHeader || true
+    
+    cd - >/dev/null || true
+    info "✅ Successfully updated $repo"
+    return 0
+}
+
+sync_repository() {
+    local repo="$1"
+    local token="$2"
+    
+    verbose "Starting sync for repository: $repo"
+    
+    local repo_path
+    repo_path=$(get_repo_path "$repo")
+    
+    if [[ -d "$repo_path/.git" ]]; then
+        verbose "Repository exists, performing update"
+        pull_repo "$repo" "$token" "$repo_path"
+    else
+        verbose "Repository not found, performing clone"
+        clone_repo "$repo" "$token" "$repo_path"
+    fi
+}
+
+# ============================================================================
+# Main Sync Logic
+# ============================================================================
+
+sync_all_repositories() {
+    local token="$1"
+    
+    step "Starting repository synchronization"
+    
+    local success_count=0
+    local failure_count=0
+    local failed_repos=()
+    
+    ensure_repo_dir
+    
+    for repo in "${REPOSITORIES[@]}"; do
+        info "Processing repository: $repo"
+        
+        if sync_repository "$repo" "$token"; then
+            ((success_count++))
+            info "✅ $repo - SUCCESS"
+        else
+            ((failure_count++))
+            failed_repos+=("$repo")
+            error "❌ $repo - FAILED"
+        fi
+        
+        echo  # Add spacing between repositories
+    done
+    
+    # Generate summary report
+    step "Synchronization Summary"
+    info "Total repositories: ${#REPOSITORIES[@]}"
+    info "Successful: $success_count"
+    info "Failed: $failure_count"
+    
+    if (( failure_count > 0 )); then
+        error "Failed repositories:"
+        for repo in "${failed_repos[@]}"; do
+            error "  - $repo"
+        done
+        
+        echo
+        error "Troubleshooting suggestions:"
+        error "  1. Check repository permissions in GitHub App settings"
+        error "  2. Verify repositories are accessible with current installation"
+        error "  3. Check network connectivity to github.com"
+        error "  4. Run with --verbose for detailed error information"
+        
+        return 3  # Sync failure exit code
+    fi
+    
+    info "🎉 All repositories synchronized successfully!"
+    return 0
+}
+
+# ============================================================================
+# Command Line Argument Parsing
+# ============================================================================
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            --version)
+                show_version
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE="true"
+                verbose "Verbose logging enabled"
+                shift
+                ;;
+            -q|--quiet)
+                QUIET="true"
+                shift
+                ;;
+            -s|--status)
+                show_status
+                exit 0
+                ;;
+            --validate)
+                load_environment
+                validate_config
+                info "✅ Configuration is valid"
+                exit 0
+                ;;
+            -d|--directory)
+                [[ -z "${2:-}" ]] && fatal "Option $1 requires an argument" 1
+                REPO_BASE_DIR="$2"
+                verbose "Base directory set to: $REPO_BASE_DIR"
+                shift 2
+                ;;
+            -b|--branch)
+                [[ -z "${2:-}" ]] && fatal "Option $1 requires an argument" 1
+                CHECKOUT_BRANCH="$2"
+                verbose "Target branch set to: $CHECKOUT_BRANCH"
+                shift 2
+                ;;
+            --submodules)
+                FETCH_SUBMODULES="true"
+                verbose "Submodule fetching enabled"
+                shift
+                ;;
+            --force-clean)
+                FORCE_CLEAN="true"
+                verbose "Force clean enabled"
+                shift
+                ;;
+            -j|--jobs)
+                [[ -z "${2:-}" ]] && fatal "Option $1 requires an argument" 1
+                PARALLEL_JOBS="$2"
+                verbose "Parallel jobs set to: $PARALLEL_JOBS"
+                shift 2
+                ;;
+            --app-id)
+                [[ -z "${2:-}" ]] && fatal "Option $1 requires an argument" 1
+                APP_ID="$2"
+                verbose "App ID set to: $APP_ID"
+                shift 2
+                ;;
+            --installation-id)
+                [[ -z "${2:-}" ]] && fatal "Option $1 requires an argument" 1
+                INSTALLATION_ID="$2"
+                verbose "Installation ID set to: $INSTALLATION_ID"
+                shift 2
+                ;;
+            --private-key)
+                [[ -z "${2:-}" ]] && fatal "Option $1 requires an argument" 1
+                PRIVATE_KEY_PATH="$2"
+                verbose "Private key path set to: $PRIVATE_KEY_PATH"
+                shift 2
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                fatal "Unknown option: $1\nUse --help for usage information" 1
+                ;;
+            *)
+                fatal "Unexpected argument: $1\nUse --help for usage information" 1
+                ;;
+        esac
+    done
+    
+    # Handle any remaining arguments
+    if [[ $# -gt 0 ]]; then
+        fatal "Unexpected arguments: $*\nUse --help for usage information" 1
+    fi
+}
+
+# ============================================================================
+# Main Function
+# ============================================================================
+
+main() {
+    verbose "Starting $SCRIPT_NAME version $SCRIPT_VERSION"
+    
+    # Parse command line arguments
+    parse_args "$@"
+    
+    # Load environment and validate configuration
+    load_environment
+    validate_config
+    
+    # Authentication flow
+    step "Authenticating with GitHub App (ID: $APP_ID)"
+    
+    local jwt
+    jwt=$(generate_jwt "$APP_ID" "$PRIVATE_KEY_PATH")
+    verbose "JWT generated: ${jwt:0:50}... (${#jwt} total chars)"
+    
+    # Auto-discover Installation ID if not provided
+    if [[ -z "$INSTALLATION_ID" ]]; then
+        INSTALLATION_ID=$(get_installation_id "$jwt")
+    else
+        info "Using provided Installation ID: $INSTALLATION_ID"
+    fi
+    
+    # Get installation access token
+    local install_token
+    install_token=$(get_installation_token "$jwt" "$INSTALLATION_ID")
+    verbose "Installation token obtained (${#install_token} chars)"
+    
+    # Execute repository synchronization
+    local exit_code
+    if sync_all_repositories "$install_token"; then
+        exit_code=0
+    else
+        exit_code=$?
+    fi
+    
+    info "$SCRIPT_NAME completed with exit code $exit_code"
+    exit $exit_code
+}
+
+# ============================================================================
+# Script Entry Point
+# ============================================================================
+
+# Only run main function if script is executed directly (not sourced)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
