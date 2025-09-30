@@ -1,6 +1,17 @@
 #!/bin/bash
 # GitHub App Repository Sync Script
 # Clones new repositories or pulls updates for existing ones using GitHub App authentication
+#
+# GitHub App Authentication Flow:
+# 1. App ID + Private Key → Generate JWT (JSON Web Token)
+# 2. JWT → Query GitHub API to get Installation ID(s) 
+# 3. JWT + Installation ID → Get Installation Access Token
+# 4. Installation Access Token → Access repositories
+#
+# Required GitHub App Credentials:
+# - App ID: Found in GitHub App settings (e.g., 2030793)
+# - Private Key: Downloaded .pem file from GitHub App settings
+# - Installation ID: Auto-discovered via API (e.g., 88054503)
 set -euo pipefail
 
 # ============================================================================
@@ -8,9 +19,9 @@ set -euo pipefail
 # ============================================================================
 
 # GitHub App credentials (configure these)
-APP_ID="${GITHUB_APP_ID:-}"
-INSTALLATION_ID="${GITHUB_INSTALLATION_ID:-}"
-PRIVATE_KEY_PATH="${GITHUB_APP_PRIVATE_KEY_PATH:-/etc/github-app/app.pem}"
+APP_ID="${GITHUB_APP_ID:-2030793}"
+INSTALLATION_ID="${GITHUB_INSTALLATION_ID:-}"  # Auto-discovered if not set
+PRIVATE_KEY_PATH="${GITHUB_APP_PRIVATE_KEY_PATH:-$HOME/.ssh/github_app_key.pem}"
 
 # Base directory for repositories
 REPO_BASE_DIR="${REPO_BASE_DIR:-$HOME/repos}"
@@ -65,9 +76,9 @@ validate_config() {
         ((errors++))
     fi
     
+    # Installation ID is optional - will be auto-discovered if not provided
     if [[ -z "$INSTALLATION_ID" ]]; then
-        error "GITHUB_INSTALLATION_ID environment variable not set"
-        ((errors++))
+        info "GITHUB_INSTALLATION_ID not set - will auto-discover"
     fi
     
     if [[ ! -f "$PRIVATE_KEY_PATH" ]]; then
@@ -119,6 +130,39 @@ EOF
     echo "$header_b64.$payload_b64.$signature"
 }
 
+get_installation_id() {
+    local jwt="$1"
+    
+    info "Auto-discovering Installation ID..."
+    local response
+    response=$(curl -s -w "\n%{http_code}" \
+        -H "Authorization: Bearer $jwt" \
+        -H "Accept: application/vnd.github+json" \
+        -H "User-Agent: DST-DNS-Sync/1.0" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        "https://api.github.com/app/installations")
+    
+    local http_code=$(echo "$response" | tail -n1)
+    local body=$(echo "$response" | head -n -1)
+    
+    if [[ "$http_code" != "200" ]]; then
+        error "Failed to get installations (HTTP $http_code)"
+        error "Response: $body"
+        return 1
+    fi
+    
+    # Get the first installation ID
+    local installation_id=$(echo "$body" | jq -r '.[0].id // empty')
+    
+    if [[ -z "$installation_id" ]]; then
+        error "No installations found for this GitHub App"
+        return 1
+    fi
+    
+    info "Found Installation ID: $installation_id"
+    echo "$installation_id"
+}
+
 get_installation_token() {
     local jwt="$1"
     local installation_id="$2"
@@ -128,6 +172,7 @@ get_installation_token() {
         -H "Authorization: Bearer $jwt" \
         -H "Accept: application/vnd.github+json" \
         -H "User-Agent: DST-DNS-Sync/1.0" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
         "https://api.github.com/app/installations/$installation_id/access_tokens")
     
     local http_code=$(echo "$response" | tail -n1)
@@ -329,9 +374,9 @@ show_usage() {
 	    $0 [OPTIONS]
 
 	ENVIRONMENT VARIABLES:
-	    GITHUB_APP_ID                 GitHub App ID (required)
-	    GITHUB_INSTALLATION_ID        Installation ID (required)
-	    GITHUB_APP_PRIVATE_KEY_PATH   Path to private key (default: /etc/github-app/app.pem)
+	    GITHUB_APP_ID                 GitHub App ID (required - from GitHub App settings)
+	    GITHUB_INSTALLATION_ID        Installation ID (optional - auto-discovered if not set)
+	    GITHUB_APP_PRIVATE_KEY_PATH   Path to private key (default: ~/.ssh/github_app_key.pem)
 	    REPO_BASE_DIR                 Base directory for repos (default: ~/repos)
 	    FETCH_SUBMODULES              Fetch git submodules (default: false)
 	    CHECKOUT_BRANCH               Branch to checkout (default: main)
@@ -344,9 +389,13 @@ show_usage() {
 	    -v, --validate                Validate configuration and exit
 
 	EXAMPLES:
-	    # Basic sync
-	    export GITHUB_APP_ID=123456
-	    export GITHUB_INSTALLATION_ID=987654321
+	    # Basic sync (Installation ID auto-discovered)
+	    export GITHUB_APP_ID=2030793
+	    $0
+	    
+	    # Sync with specific installation (if you have multiple)
+	    export GITHUB_APP_ID=2030793
+	    export GITHUB_INSTALLATION_ID=88054503
 	    $0
 	    
 	    # Sync with submodules to custom directory
@@ -398,6 +447,15 @@ main() {
     local jwt
     jwt=$(generate_jwt "$APP_ID" "$PRIVATE_KEY_PATH")
     info "Generated JWT token"
+    
+    # Auto-discover Installation ID if not provided
+    if [[ -z "$INSTALLATION_ID" ]]; then
+        INSTALLATION_ID=$(get_installation_id "$jwt")
+        if [[ $? -ne 0 ]]; then
+            error "Failed to auto-discover Installation ID"
+            exit 1
+        fi
+    fi
     
     local install_token
     install_token=$(get_installation_token "$jwt" "$INSTALLATION_ID")
