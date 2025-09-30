@@ -59,9 +59,16 @@ set -euo pipefail
 # ============================================================================
 
 # GitHub App credentials (configure these)
-APP_ID="${GITHUB_APP_ID:-2030793}"
+# NOTE: Update these values when switching from read-only to writeable GitHub App
+APP_ID="${GITHUB_APP_ID:-}"  # Set via environment variable - no default for security
 INSTALLATION_ID="${GITHUB_INSTALLATION_ID:-}"  # Auto-discovered if not set
 PRIVATE_KEY_PATH="${GITHUB_APP_PRIVATE_KEY_PATH:-$HOME/.ssh/github_app_key.pem}"
+
+# App configuration profiles (for easy switching between read-only and writeable apps)
+READONLY_APP_ID="2030793"
+WRITEABLE_APP_ID="${WRITEABLE_APP_ID:-}"  # Set this for your new writeable app
+READONLY_KEY_PATH="$HOME/.ssh/github_app_key.pem.reader"
+WRITEABLE_KEY_PATH="$HOME/.ssh/github_app_key.pem"
 
 # Base directory for repositories
 REPO_BASE_DIR="${REPO_BASE_DIR:-$HOME/repos}"
@@ -78,6 +85,7 @@ REPOSITORIES=(
 FETCH_SUBMODULES="${FETCH_SUBMODULES:-false}"
 CHECKOUT_BRANCH="${CHECKOUT_BRANCH:-main}"
 FORCE_CLEAN="${FORCE_CLEAN:-false}"
+PUSH_CHANGES="${PUSH_CHANGES:-false}"  # Only works with writeable GitHub Apps
 PARALLEL_JOBS="${PARALLEL_JOBS:-1}"
 
 # ============================================================================
@@ -111,9 +119,31 @@ step() {
 validate_config() {
     local errors=0
     
+    # Auto-configure based on available keys if APP_ID not explicitly set
     if [[ -z "$APP_ID" ]]; then
-        error "GITHUB_APP_ID environment variable not set"
-        ((errors++))
+        if [[ -f "$WRITEABLE_KEY_PATH" && -n "$WRITEABLE_APP_ID" ]]; then
+            warn "No APP_ID specified - using writeable app profile"
+            APP_ID="$WRITEABLE_APP_ID"
+            PRIVATE_KEY_PATH="$WRITEABLE_KEY_PATH"
+            info "Configured for WRITEABLE GitHub App: $APP_ID"
+        elif [[ -f "$READONLY_KEY_PATH" ]]; then
+            warn "No APP_ID specified - using read-only app profile"
+            APP_ID="$READONLY_APP_ID"
+            PRIVATE_KEY_PATH="$READONLY_KEY_PATH"
+            info "Configured for READ-ONLY GitHub App: $APP_ID"
+        else
+            error "GITHUB_APP_ID environment variable not set and no app profiles detected"
+            error "Either set GITHUB_APP_ID or ensure key files exist:"
+            error "  Writeable: $WRITEABLE_KEY_PATH (requires WRITEABLE_APP_ID env var)"
+            error "  Read-only: $READONLY_KEY_PATH"
+            ((errors++))
+        fi
+    fi
+    
+    # Validate the selected configuration
+    if [[ -n "$APP_ID" ]]; then
+        info "Using GitHub App ID: $APP_ID"
+        info "Using private key: $PRIVATE_KEY_PATH"
     fi
     
     # Installation ID is optional - will be auto-discovered if not provided
@@ -213,6 +243,41 @@ get_installation_id() {
     
     info "Found Installation ID: $installation_id"
     echo "$installation_id"
+}
+
+get_app_permissions() {
+    local jwt="$1"
+    
+    info "Checking GitHub App permissions..."
+    local response
+    response=$(curl -s -w "\n%{http_code}" \
+        -H "Authorization: Bearer $jwt" \
+        -H "Accept: application/vnd.github+json" \
+        -H "User-Agent: DST-DNS-Sync/1.0" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        "https://api.github.com/app")
+    
+    local http_code=$(echo "$response" | tail -n1)
+    local body=$(echo "$response" | head -n -1)
+    
+    if [[ "$http_code" == "200" ]]; then
+        local app_name=$(echo "$body" | jq -r '.name // "Unknown"')
+        local permissions=$(echo "$body" | jq -r '.permissions | keys | join(", ")' 2>/dev/null || echo "Unable to parse")
+        info "App Name: $app_name"
+        info "Permissions: $permissions"
+        
+        # Check if this is a writeable app by looking for write permissions
+        local has_write=$(echo "$body" | jq -r '.permissions | has("contents") and (.contents == "write")' 2>/dev/null || echo "false")
+        if [[ "$has_write" == "true" ]]; then
+            info "✓ App has WRITE permissions - can push changes"
+            export APP_MODE="writeable"
+        else
+            info "ⓘ App has READ-only permissions - clone/pull only"
+            export APP_MODE="readonly"
+        fi
+    else
+        warn "Could not fetch app permissions (HTTP $http_code)"
+    fi
 }
 
 get_installation_token() {
@@ -364,6 +429,59 @@ pull_repo() {
     info "Successfully updated $repo"
 }
 
+push_repo() {
+    local repo="$1"
+    local token="$2"
+    local repo_path="$3"
+    local commit_message="${4:-Automated sync from $(hostname)}"
+    
+    if [[ "$APP_MODE" != "writeable" ]]; then
+        warn "Cannot push - app does not have write permissions"
+        return 1
+    fi
+    
+    step "Checking for changes to push in $repo"
+    cd "$repo_path"
+    
+    # Check if there are any changes to commit
+    if git diff-index --quiet HEAD --; then
+        info "No changes to push in $repo"
+        cd - >/dev/null
+        return 0
+    fi
+    
+    # Stage all changes
+    info "Staging changes in $repo"
+    git add -A
+    
+    # Commit changes
+    info "Committing changes: $commit_message"
+    git commit -m "$commit_message"
+    
+    # Configure remote URL with token for push
+    local auth_url="https://x-access-token:$token@github.com/$repo.git"
+    local original_url=$(git config --get remote.origin.url)
+    git remote set-url origin "$auth_url"
+    
+    # Push changes
+    local current_branch
+    current_branch=$(git rev-parse --abbrev-ref HEAD)
+    
+    if git push origin "$current_branch"; then
+        info "✓ Successfully pushed changes to $repo"
+    else
+        error "✗ Failed to push changes to $repo"
+        git remote set-url origin "$original_url"
+        cd - >/dev/null
+        return 1
+    fi
+    
+    # Restore original URL
+    git remote set-url origin "$original_url"
+    cd - >/dev/null
+    return 0
+}
+
 sync_repository() {
     local repo="$1"
     local token="$2"
@@ -375,6 +493,11 @@ sync_repository() {
         pull_repo "$repo" "$token" "$repo_path"
     else
         clone_repo "$repo" "$token" "$repo_path"
+    fi
+    
+    # If we have a writeable app and PUSH_CHANGES is enabled, push any local changes
+    if [[ "$PUSH_CHANGES" == "true" && "$APP_MODE" == "writeable" ]]; then
+        push_repo "$repo" "$token" "$repo_path"
     fi
 }
 
@@ -443,13 +566,15 @@ show_usage() {
 	    $0 [OPTIONS]
 
 	ENVIRONMENT VARIABLES:
-	    GITHUB_APP_ID                 GitHub App ID (required - from GitHub App settings)
+	    GITHUB_APP_ID                 GitHub App ID (auto-detected if not set)
+	    WRITEABLE_APP_ID              Writeable GitHub App ID (for push operations)
 	    GITHUB_INSTALLATION_ID        Installation ID (optional - auto-discovered if not set)
 	    GITHUB_APP_PRIVATE_KEY_PATH   Path to private key (default: ~/.ssh/github_app_key.pem)
 	    REPO_BASE_DIR                 Base directory for repos (default: ~/repos)
 	    FETCH_SUBMODULES              Fetch git submodules (default: false)
 	    CHECKOUT_BRANCH               Branch to checkout (default: main)
 	    FORCE_CLEAN                   Clean working dir before pull (default: false)
+	    PUSH_CHANGES                  Push local changes (writeable apps only, default: false)
 	    PARALLEL_JOBS                 Parallel sync jobs (default: 1) [NOT IMPLEMENTED YET]
 
 	OPTIONS:
@@ -458,13 +583,16 @@ show_usage() {
 	    -v, --validate                Validate configuration and exit
 
 	EXAMPLES:
-	    # Basic sync (Installation ID auto-discovered)
-	    export GITHUB_APP_ID=2030793
+	    # Auto-detect app (uses writeable if available, falls back to read-only)
 	    $0
 	    
-	    # Sync with specific installation (if you have multiple)
+	    # Use specific writeable app
+	    export WRITEABLE_APP_ID=YOUR_WRITEABLE_APP_ID
+	    export PUSH_CHANGES=true
+	    $0
+	    
+	    # Use specific read-only app
 	    export GITHUB_APP_ID=2030793
-	    export GITHUB_INSTALLATION_ID=88054503
 	    $0
 	    
 	    # Sync with submodules to custom directory
@@ -516,6 +644,9 @@ main() {
     local jwt
     jwt=$(generate_jwt "$APP_ID" "$PRIVATE_KEY_PATH")
     info "Generated JWT token"
+    
+    # Check app permissions
+    get_app_permissions "$jwt"
     
     # Auto-discover Installation ID if not provided
     if [[ -z "$INSTALLATION_ID" ]]; then
