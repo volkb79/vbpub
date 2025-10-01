@@ -16,7 +16,7 @@ scripts/
 │   ├── jwt-decode              # JWT token analyzer (enhanced)
 │   └── subtree-checkout        # Repository subtree tool (enhanced)
 ├── docker/                      # Docker tools (NEW)
-│   └── compose-init            # Docker Compose automation (enhanced)
+│   └── compose-init-up.py      # Docker Compose automation (enhanced)
 ├── legacy/                      # Original scripts (MOVED)
 │   ├── github_app_sync.sh
 │   ├── get_installation_id.sh
@@ -130,7 +130,7 @@ echo "JWT_TOKEN" | utils/jwt-decode --validate --verbose
 utils/subtree-checkout volkb79/DST-DNS projects/controller
 
 # Initialize Docker Compose
-docker/compose-init --directory /path/to/project --verbose
+compose-init-up.py --directory /path/to/project --verbose
 ```
 
 ### Configuration Validation

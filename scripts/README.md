@@ -41,7 +41,7 @@ utils/subtree-checkout --repo DST-DNS
 
 ```bash
 # Initialize and start Docker Compose services
-docker/compose-init --directory /path/to/project --verbose
+compose-init-up.py --directory /path/to/project --verbose
 ```
 
 ## 📚 Script Documentation
@@ -165,15 +165,15 @@ utils/subtree-checkout --method sparse-checkout volkb79/DST-DNS projects/control
 
 ### Docker Tools (`docker/`)
 
-#### `docker/compose-init` - Docker Compose Automation
+#### `compose-init-up.py` - Docker Compose Automation
 **Purpose:** Automates Docker Compose initialization, environment setup, and service startup.
 
 ```bash
 # Initialize and start services
-docker/compose-init --directory /path/to/project
+compose-init-up.py --directory /path/to/project
 
 # Generate environment configuration only
-docker/compose-init --env-only --file docker-compose.yml
+compose-init-up.py --env-only --file docker-compose.yml
 ```
 
 **Key Features:**
@@ -397,7 +397,7 @@ The `scripts/` directory contains legacy scripts that are being reorganized:
   - `checkout_subtree.py` → `utils/subtree-checkout` (enhanced) ~~deleted~~
   
 - ✅ **Migrated to `docker/`:**
-  - `compose-init-up.py` → `docker/compose-init` (enhanced)
+  - `docker/compose-init` → `compose-init-up.py` (canonical)
 
 - � **Legacy Scripts (unique functionality, kept):**
   - `git-credential-github-app` - Git credential helper

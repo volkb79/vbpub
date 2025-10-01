@@ -354,6 +354,9 @@ def load_env_file(env_file: str) -> Tuple[Dict[str, str], List[str]]:
     
     return env_vars, loaded_keys
 
+
+# Legacy mapping helper removed: scripts now require canonical variable names only.
+
 def run(cmd: str, check: bool = True, capture_output: bool = False, 
         env: Optional[Dict[str, str]] = None, suppress_output: bool = False) -> Optional[str]:
     """
@@ -511,7 +514,7 @@ def check_compose_yaml(compose_file: str, env_vars: Dict[str, str], env_file: st
     # Warn for defined but unused variables (not necessarily an error)
     unused = defined_vars - referenced_vars
     for var in sorted(unused):
-        if var.startswith('STARTWRAP_'):
+        if var.startswith('COMPINIT_'):
             continue  # Exclude script control variables from warning
         warn(f"Variable defined in {env_file} but not used in compose YAML: {var}")
     
@@ -666,7 +669,7 @@ def check_images_parallel(images: List[str]) -> Tuple[List[str], List[str]]:
     q = queue.Queue()
     
     # Read control variable from environment
-    continue_on_error = os.environ.get('STARTWRAP_CONTINUE_ON_IMAGE_CHECK_ERROR', '0') == '1'
+    continue_on_error = os.environ.get('COMPINIT_CONTINUE_ON_IMAGE_CHECK_ERROR', '0') == '1'
     
     def worker(image: str) -> None:
         """Worker function to check a single image."""
@@ -692,7 +695,7 @@ def check_images_parallel(images: List[str]) -> Tuple[List[str], List[str]]:
                     'denied' in error_msg.lower() or 'unauthorized' in error_msg.lower()):
                     msg = f"Image NOT available: {image} ({error_msg}) [local image access denied]"
                     if continue_on_error:
-                        warn(msg + " [continuing due to STARTWRAP_CONTINUE_ON_IMAGE_CHECK_ERROR=1]")
+                        warn(msg + " [continuing due to COMPINIT_CONTINUE_ON_IMAGE_CHECK_ERROR=1]")
                         q.put((image, True, None))
                     else:
                         q.put((image, False, msg, 'fatal'))
@@ -872,13 +875,13 @@ def main() -> None:
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(
-        description="Python replacement for start-init.sh",
+        description="Python replacement for 'docker compose up' or custom start scripts",
         epilog="""
-This script initializes the DST-DNS infrastructure by setting up environment
+This script initializes the any infrastructure by setting up generating environment
 files, validating configuration, and starting Docker Compose services.
 
-On first run, it generates .env.active from .env.sample and exits.
-On subsequent runs, it validates the configuration and starts services.
+On first run, it generates .env.active from .env.sample.
+It validates the configuration and starts services.
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -965,7 +968,7 @@ On subsequent runs, it validates the configuration and starts services.
         os.environ.update(env_vars)
         
         # Perform any configured reset actions before creating volumes/directories
-        reset_flags = env_vars.get('STARTWRAP_RESET_BEFORE_START', 'none')
+        reset_flags = env_vars.get('COMPINIT_RESET_BEFORE_START', 'none')
         if reset_state(env_vars, reset_flags, env_file):
             # env-active was deleted, restart script from the beginning
             python = sys.executable
@@ -978,7 +981,7 @@ On subsequent runs, it validates the configuration and starts services.
         # Prepare for Docker Compose operations
         step("Starting containers with Docker Compose")
         # Run pre-compose script if specified
-        pre_compose_script = env_vars.get('STARTWRAP_SCRIPT_BEFORE_COMPOSE_START')
+        pre_compose_script = env_vars.get('COMPINIT_SCRIPT_BEFORE_COMPOSE_START')
         if pre_compose_script:
             info(f"Running pre-compose script: {pre_compose_script}")
             try:
@@ -1022,8 +1025,8 @@ On subsequent runs, it validates the configuration and starts services.
                     info(f"Pre-compose script {pre_compose_script} executed and environment updated.")
             except Exception as e:
                 error(f"Failed to execute pre-compose script {pre_compose_script}: {e}")
-        compose_mode = env_vars.get('STARTWRAP_COMPOSE_START_MODE', 'abort-on-failure')
-        info(f"STARTWRAP_COMPOSE_START_MODE set to: {compose_mode}")
+        compose_mode = env_vars.get('COMPINIT_COMPOSE_START_MODE', 'abort-on-failure')
+        info(f"COMPINIT_COMPOSE_START_MODE set to: {compose_mode}")
         
         # Validate compose config and check env var usage
         config_yaml = check_compose_yaml(compose_file, env_vars, env_file)
