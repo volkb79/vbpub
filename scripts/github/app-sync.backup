@@ -120,10 +120,7 @@ info() {
 }
 
 verbose() {
-    if [[ "${VERBOSE:-}" == "true" ]]; then
-        log "[VERBOSE] $*"
-    fi
-    return 0
+    [[ "$VERBOSE" == "true" ]] && log "[VERBOSE] $*"
 }
 
 warn() {
