@@ -1,0 +1,61 @@
+# Test Docker Compose Configuration for compose-init-up.py
+# Minimal services with fast startup and health checks
+
+x-defaults: &service-defaults
+  labels:
+    - "project=${LABEL_PROJECT_NAME}"
+    - "${LABEL_PREFIX}.environment=${LABEL_ENV_TAG}"
+  user: "${UID:-0}:${GID:-0}"
+  environment:
+    - TEST_MODE=${GLOBAL_TEST_MODE}
+    - DEBUG_ENABLED=${GLOBAL_DEBUG_ENABLED}
+
+services:
+  # Ultra-lightweight service for fast testing
+  test-service:
+    <<: *service-defaults
+    image: busybox:1.36
+    command: sh -c "echo 'Test service starting...' && sleep 300"
+    labels:
+      - "${LABEL_PREFIX}.component=test-service"
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: ${HEALTHCHECK_INTERVAL}
+      timeout: ${HEALTHCHECK_TIMEOUT}
+      retries: ${HEALTHCHECK_RETRIES}
+      start_period: ${HEALTHCHECK_START_PERIOD}
+    environment:
+      - DB_PASSWORD=${DB_ADMIN_PASSWORD}
+      - API_SECRET=${API_SECRET_PASSWORD_ALNUM32}
+      - SERVICE_TOKEN=${SERVICE_AUTH_TOKEN_INTERNAL}
+
+  # Second lightweight service to test multi-container health
+  cache-service:
+    <<: *service-defaults
+    image: busybox:1.36
+    command: sh -c "echo 'Cache service starting...' && sleep 300"
+    labels:
+      - "${LABEL_PREFIX}.component=cache-service"
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: ${HEALTHCHECK_INTERVAL}
+      timeout: ${HEALTHCHECK_TIMEOUT}
+      retries: ${HEALTHCHECK_RETRIES}
+      start_period: ${HEALTHCHECK_START_PERIOD}
+    environment:
+      - CACHE_TOKEN=${CACHE_TOKEN_INTERNAL}
+      - SESSION_KEY=${SESSION_KEY_TOKEN_HEX32_INTERNAL}
+    depends_on:
+      - test-service
+
+# Optional named volumes for testing volume handling
+volumes:
+  test-data:
+    labels:
+      - "project=${LABEL_PROJECT_NAME}"
+
+# Networks for testing network creation
+networks:
+  default:
+    labels:
+      - "project=${LABEL_PROJECT_NAME}"
