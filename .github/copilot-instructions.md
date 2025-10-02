@@ -31,7 +31,7 @@ COPILOT_INSTRUCTIONS_AGENTS_REF: AGENTS.md
 - only use '.env.sample' as template, keep updated during refactoring and development
 - use environment vars and command substitution if needed to keep DRY and single point of truth
 - generated 'env.active' should contain as few changes as possible to 'env.sample'
-- mandatory variables: PUBLIC_FQDN, PUBLIC_TLS_KEY_PEM, PUBLIC_TLS_CRT_PEM, LABEL_ENV_TAG (formerly ENV_TAG), LABEL_PREFIX, LABEL_PROJECT_NAME, COMPINIT_COMPOSE_START_MODE, COMPINIT_RESET_BEFORE_START, COMPINIT_CHECK_IMAGE_ENABLED, COMPINIT_IMAGE_CHECK_CONTINUE_ON_ERROR, HEALTHCHECK_INTERVAL,HEALTHCHECK_TIMEOUT, HEALTHCHECK_RETRIES, HEALTHCHECK_START_PERIOD
+ - mandatory variables: PUBLIC_FQDN, PUBLIC_TLS_KEY_PEM, PUBLIC_TLS_CRT_PEM, LABEL_ENV_TAG (formerly ENV_TAG), LABEL_PREFIX, LABEL_PROJECT_NAME, COMPINIT_COMPOSE_START_MODE, COMPINIT_RESET_BEFORE_START, COMPINIT_CHECK_IMAGE_ENABLED, COMPINIT_IMAGE_CHECK_CONTINUE_ON_ERROR, HEALTHCHECK_INTERVAL,HEALTHCHECK_TIMEOUT, HEALTHCHECK_RETRIES, HEALTHCHECK_START_PERIOD
 - prefix variables per service with '<SERVICE>_' to avoid collisions
 
 ### secrets
@@ -42,7 +42,7 @@ COPILOT_INSTRUCTIONS_AGENTS_REF: AGENTS.md
 
 - example snippets
 ``` bash
-# Control flow for compose-init-up
+# --------- Control flow for compose-init-up -----------
 COMPINIT_COMPOSE_START_MODE=abort-on-failure
 COMPINIT_RESET_BEFORE_START=none  
 COMPINIT_CHECK_IMAGE_ENABLED=false
@@ -50,8 +50,9 @@ COMPINIT_IMAGE_CHECK_CONTINUE_ON_ERROR=0
 COMPINIT_MYREGISTRY_URL=https://RA-R2001.vxxu.de:5000/
 COMPINIT_PRECOMPOSEHOOK=
 COMPINIT_POSTCOMPOSEHOOK=
+COMPINIT_DEPENDENCIES="../whisper-trans,/home/vb/repos/vbpro/oobabooga-llm"
 
-# Infrastructure
+# ---------- global project Infrastructure ---------------------
 PUBLIC_FQDN=ra-r2001.vxxu.de
 PUBLIC_TLS_KEY_PEM=/etc/letsencrypt/live/${PUBLIC_FQDN}/privkey.pem
 PUBLIC_TLS_CRT_PEM=/etc/letsencrypt/live/${PUBLIC_FQDN}/fullchain.pem
@@ -71,7 +72,7 @@ HEALTHCHECK_TIMEOUT=5s
 HEALTHCHECK_RETRIES=3
 HEALTHCHECK_START_PERIOD=30s
 
-# example service-specific
+# ----------- Service-specific settings ---------------------
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=   # left empty to be dynamically generated
 POSTGRES_DB=postgres
@@ -81,30 +82,13 @@ POSTGRES_API_PASSWORD=   # left empty to be dynamically generated
 
 EXTSERVICE_API_TOKEN=  # left empty to be queried from user input
 
-# group all host-dir definitions from all services at the end of the file
+# -------- grouped bind volumes / host-dir definitions for all services at the end of the file -------------
 # var name and directory name follow pattern: `{SERVICE}_HOSTDIR_{VOLUME}` → `./vol-{service}-{volume}`
 # Git exclusion: Add `vol-*/` to `.gitignore`
 POSTGRES_HOSTDIR_DATA=./vol-postgres-data  
 API_HOSTDIR_LOGS=./vol-api-logs
 REDIS_HOSTDIR_DATA=./vol-redis-data
 
-# Greenfield migration policy (agents)
-
-This repository is treated as greenfield. Do NOT add compatibility code or
-fallbacks that support legacy variable, function, or class names. When you
-change configuration names or refactor behavior (for example to adopt
-`COMPINIT_STRICT_<NAME>`), perform a complete repository-wide replacement:
-
-- Replace all occurrences of the old names with the new canonical names (search
-  and replace across code, docs, and config). Do not write runtime fallbacks.
-- Update `.env.sample`, README, developer docs, tests, and CI in the same change.
-- Add tests (unit/integration) that assert the new canonical behavior and
-  prevent regressions.
-- If a migration script is needed, make it a one-time explicit script and
-  document its purpose; do not leave migration shims in production code.
-
-Agents and Copilot workflows should assume no production dependency on legacy
-names and may safely remove or replace them as part of an atomic refactor.
 
 # ----------- User and Group IDs for file permissions ---------
 # used for UID/GID the containers run as, to allow file access on host volumes
@@ -155,6 +139,24 @@ postgres:
 ```
 
 
+# Greenfield migration policy (agents)
+
+This repository is treated as greenfield. Do NOT add compatibility code or
+fallbacks that support legacy variable, function, or class names. When you
+change configuration names or refactor behavior, perform a complete repository-wide replacement:
+
+- Replace all occurrences of the old names with the new canonical names (search
+  and replace across code, docs, and config and comments). 
+- Do not write runtime fallbacks. Do not support old names anymore.
+- Update the '.env.sample.toml' config file, README, developer docs, tests, and CI in the same change.
+- Add tests (unit/integration) that assert the new canonical behavior and
+  prevent regressions.
+- If a migration script is needed, make it a one-time explicit script and
+  document its purpose; do not leave migration shims in production code.
+
+Agents and Copilot workflows should assume no production dependency on legacy
+names and may safely remove or replace them as part of an atomic refactor.
+
 ## 💻 Code Quality Standards
 
 ### Python Development
@@ -199,8 +201,8 @@ except Exception as e:
 ### Required Validation Steps
 ```bash
 # After any infrastructure changes:
-# 0. Ensure a clean start by setting COMPINIT_RESET_BEFORE_START appropriately
-1. ./compose-init-up.py  # Verify pre-compose hook execution
+# 0. Ensure a clean start by setting COMPINIT_RESET_BEFORE_START appropriately to delete state
+1. ./compose-init-up.py  # will create new .env.active and start services
 2. Check service health endpoints
 3. Validate generated configs (webhook-hooks.yml, etc.)
 4. Test SSL certificate mounting
@@ -208,6 +210,7 @@ except Exception as e:
 ```
 
 ### Environment Testing
-- Log current directory: Always log `pwd` and key env vars when running scripts
-- Dependency verification: Check external service connectivity
-- Configuration validation: Validate .env completeness before deployment
+- verbose output of found conditions and variables to allow debugging
+- Check external service availability (e.g., database, cache) and authentication
+- Validate read config files before deployment
+

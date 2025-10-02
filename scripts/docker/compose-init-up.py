@@ -123,6 +123,15 @@ import json
 import yaml
 from pathlib import Path
 
+# TOML configuration support
+try:
+    from .config_schema import ProjectConfig, VariableConfig, parse_toml_config, config_to_env_dict, validate_config
+except ImportError:
+    # Fallback for direct script execution
+    import sys
+    sys.path.append(os.path.dirname(__file__))
+    from config_schema import ProjectConfig, VariableConfig, parse_toml_config, config_to_env_dict, validate_config
+
 # --- Output helpers ---
 COLOR_RED = '\033[0;31m'
 COLOR_GREEN = '\033[0;32m'
@@ -158,12 +167,150 @@ def error(msg: str, show_stacktrace: bool = True) -> None:
     sys.exit(1)
 
 
-# --- Local configurables (maintainers: edit here) ---
-# DEFAULT_ENV_FILE is the name of the generated 'live' environment file.
-# We intentionally default to '.env' now that the live file will contain
-# final literal values (no command or variable substitutions). Change this
-# if you prefer a different filename for your project.
-DEFAULT_ENV_FILE = ".env"
+
+# --- Canonical file names and config variable definitions (maintainers: edit here) ---
+# All file names used by this script, for easy maintenance
+DEFAULT_ENV_ACTIVE_FILE = ".env"
+DEFAULT_ENV_SAMPLE_FILE = ".env.sample"
+DEFAULT_TOML_ACTIVE_FILE = ".env.toml"
+DEFAULT_TOML_SAMPLE_FILE = ".env.sample.toml"
+
+# Canonical config variable definitions: name, default, description, type
+CONFIG_VARIABLES = [
+    {
+        "name": "COMPINIT_COMPOSE_START_MODE",
+        "default": "abort-on-failure",
+        "description": "Control flow for compose-init-up (abort-on-failure, continue-on-error, etc.)",
+        "type": "string"
+    },
+    {
+        "name": "COMPINIT_RESET_BEFORE_START",
+        "default": "none",
+        "description": "Reset actions before starting (none, containers, named-volumes, hostdirs, all)",
+        "type": "string"
+    },
+    {
+        "name": "COMPINIT_CHECK_IMAGE_ENABLED",
+        "default": "false",
+        "description": "Enable/disable image availability checks before compose up",
+        "type": "bool"
+    },
+    {
+        "name": "COMPINIT_IMAGE_CHECK_CONTINUE_ON_ERROR",
+        "default": "0",
+        "description": "Continue on image check error (0/1)",
+        "type": "int"
+    },
+    {
+        "name": "COMPINIT_DEPENDENCIES",
+        "default": "",
+        "description": "Comma-separated list of dependency directories to start first",
+        "type": "string"
+    },
+    {
+        "name": "COMPINIT_HOOK_PRE_COMPOSE",
+        "default": "",
+        "description": "Python script to run before compose up",
+        "type": "string"
+    },
+    {
+        "name": "COMPINIT_HOOK_POST_COMPOSE",
+        "default": "",
+        "description": "Python script to run after compose up",
+        "type": "string"
+    },
+    {
+        "name": "COMPINIT_MYREGISTRY_URL",
+        "default": "",
+        "description": "Optional registry mirror URL",
+        "type": "string"
+    },
+    {
+        "name": "COMPINIT_STRICT_MODE",
+        "default": "",
+        "description": "Global strict mode toggle (1 to enable)",
+        "type": "int"
+    },
+    {
+        "name": "COMPINIT_ENABLE_ENV_EXPANSION",
+        "default": "false",
+        "description": "Enable $VAR and $(cmd) expansion in env values at runtime",
+        "type": "bool"
+    },
+    {
+        "name": "PUBLIC_FQDN",
+        "default": "example.local",
+        "description": "Public DNS name for service",
+        "type": "string"
+    },
+    {
+        "name": "PUBLIC_TLS_KEY_PEM",
+        "default": "/etc/letsencrypt/live/$PUBLIC_FQDN/privkey.pem",
+        "description": "Path to TLS private key PEM",
+        "type": "string"
+    },
+    {
+        "name": "PUBLIC_TLS_CRT_PEM",
+        "default": "/etc/letsencrypt/live/$PUBLIC_FQDN/fullchain.pem",
+        "description": "Path to TLS certificate PEM",
+        "type": "string"
+    },
+    {
+        "name": "HEALTHCHECK_INTERVAL",
+        "default": "10s",
+        "description": "Healthcheck interval",
+        "type": "string"
+    },
+    {
+        "name": "HEALTHCHECK_TIMEOUT",
+        "default": "5s",
+        "description": "Healthcheck timeout",
+        "type": "string"
+    },
+    {
+        "name": "HEALTHCHECK_RETRIES",
+        "default": "3",
+        "description": "Healthcheck retries",
+        "type": "int"
+    },
+    {
+        "name": "HEALTHCHECK_START_PERIOD",
+        "default": "30s",
+        "description": "Healthcheck start period",
+        "type": "string"
+    },
+    {
+        "name": "LABEL_PROJECT_NAME",
+        "default": "my-project",
+        "description": "Project name label",
+        "type": "string"
+    },
+    {
+        "name": "LABEL_ENV_TAG",
+        "default": "dev",
+        "description": "Environment tag (dev/staging/prod)",
+        "type": "string"
+    },
+    {
+        "name": "LABEL_PREFIX",
+        "default": "example.com",
+        "description": "Label prefix for project",
+        "type": "string"
+    },
+    {
+        "name": "UID",
+        "default": "$(id -u)",
+        "description": "User ID for container",
+        "type": "string"
+    },
+    {
+        "name": "GID",
+        "default": "$(id -g)",
+        "description": "Group ID for container",
+        "type": "string"
+    },
+    # Add more variables as needed
+]
 
 
 def handle_exception(exc_type: type, exc_value: Exception, exc_traceback: Any) -> None:
@@ -523,18 +670,29 @@ def parse_env_sample(sample_path: str, env_path: str) -> None:
                             key, val = orig.split('=', 1)
                             key = key.strip()
                             val = val.strip()
-                            if val.startswith('"') and val.endswith('"'):
-                                val = val[1:-1]
-                            elif val.startswith("'") and val.endswith("'"):
-                                val = val[1:-1]
+                            # Detect surrounding quotes and preserve them in the generated file.
+                            quote_char = None
+                            inner = val
+                            if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                                quote_char = val[0]
+                                inner = val[1:-1]
+
                             # Expand any $(...) or $VAR references now so the generated env
                             # contains literal values instead of runtime substitutions.
                             try:
-                                write_val = expand_vars(val, local_env)
+                                write_val = expand_vars(inner, local_env)
                             except Exception:
-                                write_val = val
-                            fout.write(f"{key}={write_val}\n")
-                            local_env[key] = write_val
+                                write_val = inner
+
+                            # If the original value was quoted, re-wrap it with the same quote
+                            # and escape any inner occurrence of that quote character.
+                            if quote_char:
+                                esc = write_val.replace(quote_char, '\\' + quote_char)
+                                fout.write(f"{key}={quote_char}{esc}{quote_char}\n")
+                                local_env[key] = esc
+                            else:
+                                fout.write(f"{key}={write_val}\n")
+                                local_env[key] = write_val
                         else:
                             fout.write(orig + '\n')
                         
@@ -549,6 +707,161 @@ def parse_env_sample(sample_path: str, env_path: str) -> None:
         error(f"I/O error processing environment files: {e}")
     except Exception as e:
         error(f"Unexpected error parsing environment file: {e}")
+
+def parse_toml_sample(toml_path: str, env_path: str) -> None:
+    """
+    Parse .env.toml file and generate .env with auto-generated passwords and tokens.
+    
+    This function reads a TOML configuration file and creates a traditional .env
+    file by:
+    - Auto-generating secure passwords for variables with type="password"
+    - Prompting for user input on variables with source="external" that are empty
+    - Processing hooks and dependencies
+    - Copying all other variables as-is
+    
+    Args:
+        toml_path: Path to the .env.toml file
+        env_path: Path to the .env file to create
+        
+    Raises:
+        FileNotFoundError: If toml_path doesn't exist
+        ValueError: If TOML configuration is invalid
+        IOError: If file operations fail
+    """
+    if not os.path.isfile(toml_path):
+        error(f"TOML configuration file '{toml_path}' not found")
+    
+    # Check if we can write to the target directory
+    target_dir = os.path.dirname(env_path) or '.'
+    if not os.access(target_dir, os.W_OK):
+        error(f"Cannot write to directory '{target_dir}' for file '{env_path}'")
+    
+    try:
+        # Parse TOML configuration
+        config = parse_toml_config(toml_path)
+        
+        # Validate configuration
+        validation_errors = validate_config(config)
+        if validation_errors:
+            error(f"TOML configuration validation failed:\n  - " + "\n  - ".join(validation_errors))
+        
+        info(f"Parsed TOML configuration for project: {config.project_name}")
+        
+        # Generate values for variables that need generation
+        generated_values = {}
+        local_env = dict(os.environ)
+        
+        for name, var_config in config.variables.items():
+            if var_config.source == "deferred":
+                generated_values[name] = ""  # Will be set by hooks
+                continue
+            
+            if var_config.type == "password" and not var_config.value:
+                info(f"Generating password for {name} (type={var_config.type}, length={var_config.length})")
+                generated_values[name] = gen_pw(var_config.length or 32, var_config.charset)
+            elif var_config.type == "token" and not var_config.value:
+                if var_config.source == "external":
+                    # Handle external tokens
+                    env_fallback = os.environ.get(name)
+                    if env_fallback:
+                        info(f"Using provided environment value for external token {name}")
+                        generated_values[name] = env_fallback
+                    else:
+                        # Prompt for external token or use strict mode handling
+                        strict = strict_flag(os.environ, 'EXTERNAL')
+                        if os.environ.get('COMPINIT_ASSUME_YES', '').lower() in ('1', 'true', 'yes') and strict:
+                            error(f"External token {name} requires input and COMPINIT_STRICT_EXTERNAL=1 enforces strict behavior")
+                        if os.environ.get('COMPINIT_ASSUME_YES', '').lower() in ('1', 'true', 'yes'):
+                            warn(f"{name} is marked external but no value provided; continuing with empty value")
+                            generated_values[name] = ''
+                        else:
+                            desc = var_config.description or f"External {var_config.type}"
+                            warn(f"{name} ({desc}) requires a value. Please enter:")
+                            try:
+                                generated_values[name] = input(f"{name}=").strip()
+                            except (EOFError, KeyboardInterrupt):
+                                error(f"User input required for {name} but not provided")
+                elif var_config.source == "internal":
+                    info(f"Generating internal token for {name} (length={var_config.length})")
+                    generated_values[name] = gen_pw(var_config.length or 64, var_config.charset)
+                else:
+                    generated_values[name] = var_config.value or ""
+            elif var_config.value is not None:
+                # Use provided value, potentially with expansion
+                try:
+                    expanded = expand_vars(var_config.value, local_env)
+                    generated_values[name] = expanded
+                    local_env[name] = expanded
+                except Exception:
+                    generated_values[name] = var_config.value
+                    local_env[name] = var_config.value
+            else:
+                generated_values[name] = ""
+        
+        # Convert config to env dict
+        env_dict = config_to_env_dict(config, generated_values)
+        
+        # Write .env file
+        with open(env_path, 'w', encoding='utf-8') as f:
+            f.write(f"# Generated from {toml_path}\n")
+            f.write(f"# Project: {config.project_name} ({config.env_tag})\n\n")
+            
+            # Write variables in logical groups
+            f.write("# Control flow\n")
+            for key in ['COMPINIT_COMPOSE_START_MODE', 'COMPINIT_RESET_BEFORE_START', 
+                       'COMPINIT_CHECK_IMAGE_ENABLED', 'COMPINIT_IMAGE_CHECK_CONTINUE_ON_ERROR']:
+                if key in env_dict:
+                    f.write(f"{key}={env_dict[key]}\n")
+            
+            f.write("\n# Project metadata\n")
+            for key in ['LABEL_PROJECT_NAME', 'LABEL_ENV_TAG', 'LABEL_PREFIX']:
+                if key in env_dict:
+                    f.write(f"{key}={env_dict[key]}\n")
+            
+            f.write("\n# Infrastructure\n")
+            for key in ['PUBLIC_FQDN', 'PUBLIC_TLS_KEY_PEM', 'PUBLIC_TLS_CRT_PEM']:
+                if key in env_dict:
+                    f.write(f"{key}={env_dict[key]}\n")
+            
+            f.write("\n# Dependencies and hooks\n")
+            for key in ['COMPINIT_DEPENDENCIES', 'COMPINIT_HOOK_PRE_COMPOSE', 'COMPINIT_HOOK_POST_COMPOSE']:
+                if key in env_dict:
+                    f.write(f"{key}={env_dict[key]}\n")
+            
+            f.write("\n# Health monitoring\n")
+            for key in ['HEALTHCHECK_INTERVAL', 'HEALTHCHECK_TIMEOUT', 'HEALTHCHECK_RETRIES', 'HEALTHCHECK_START_PERIOD']:
+                if key in env_dict:
+                    f.write(f"{key}={env_dict[key]}\n")
+            
+            f.write("\n# User variables\n")
+            for key in ['UID', 'GID']:
+                if key in env_dict:
+                    f.write(f"{key}={env_dict[key]}\n")
+            
+            f.write("\n# Project variables\n")
+            for name, var_config in config.variables.items():
+                value = generated_values.get(name, var_config.value or "")
+                if var_config.description:
+                    f.write(f"# {var_config.description}\n")
+                
+                # Preserve quotes for string values that need them
+                if var_config.type == "string" and value and (' ' in value or "'" in value):
+                    escaped = value.replace('"', '\\"')
+                    f.write(f'{name}="{escaped}"\n')
+                else:
+                    f.write(f"{name}={value}\n")
+            
+            f.write("\n# Additional variables\n")
+            for key, value in env_dict.items():
+                if key not in config.variables and not any(key.startswith(prefix) for prefix in 
+                    ['COMPINIT_', 'LABEL_', 'PUBLIC_', 'HEALTHCHECK_', 'UID', 'GID']):
+                    f.write(f"{key}={value}\n")
+        
+        info(f"Generated .env file from TOML configuration: {env_path}")
+        
+    except Exception as e:
+        error(f"Failed to process TOML configuration: {e}")
+
 
 def load_env_file(env_file: str) -> Tuple[Dict[str, str], List[str]]:
     """
@@ -664,38 +977,200 @@ def persist_env_vars(env_file: str, new_vars: Dict[str, str]) -> None:
         warn(f"Failed to persist variables into {env_file}: {e}")
 
 
+def resolve_dependencies(env_vars: Dict[str, str], current_dir: str, visited: Optional[Set[str]] = None) -> List[str]:
+    """
+    Resolve dependency chain from COMPINIT_DEPENDENCIES variable.
+    Returns list of absolute dependency paths in start order (dependencies first).
+    
+    Args:
+        env_vars: Environment variables containing COMPINIT_DEPENDENCIES
+        current_dir: Current project directory (absolute path)
+        visited: Set of visited directories for cycle detection
+        
+    Returns:
+        List of absolute paths to start in order
+        
+    Raises:
+        ValueError: If dependency cycle detected or invalid path
+    """
+    if visited is None:
+        visited = set()
+    
+    current_abs = os.path.abspath(current_dir)
+    if current_abs in visited:
+        error(f"Dependency cycle detected: {current_abs} is already in the dependency chain")
+    
+    visited.add(current_abs)
+    dependencies = []
+    
+    # Parse COMPINIT_DEPENDENCIES (comma or colon separated relative/absolute paths)
+    deps_str = env_vars.get('COMPINIT_DEPENDENCIES', '').strip()
+    if not deps_str:
+        return [current_abs]  # No dependencies, just return self
+    
+    dep_paths = [d.strip() for d in deps_str.replace(':', ',').split(',') if d.strip()]
+    
+    for dep_path in dep_paths:
+        # Convert relative paths to absolute (relative to current project)
+        if not os.path.isabs(dep_path):
+            dep_abs = os.path.abspath(os.path.join(current_dir, dep_path))
+        else:
+            dep_abs = os.path.abspath(dep_path)
+        
+        if not os.path.isdir(dep_abs):
+            error(f"Dependency directory does not exist: {dep_abs}")
+        
+        # Check for .env.sample in dependency
+        dep_sample = os.path.join(dep_abs, '.env.sample')
+        if not os.path.isfile(dep_sample):
+            warn(f"Dependency {dep_abs} has no .env.sample, skipping")
+            continue
+        
+        # Recursively resolve dependencies of this dependency
+        try:
+            # Load dependency's env to check for its own dependencies
+            dep_env_vars, _ = load_env_file(os.path.join(dep_abs, '.env.sample'))
+            sub_deps = resolve_dependencies(dep_env_vars, dep_abs, visited.copy())
+            dependencies.extend(sub_deps)
+        except Exception as e:
+            warn(f"Failed to resolve dependencies for {dep_abs}: {e}")
+            dependencies.append(dep_abs)
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    ordered_deps = []
+    for dep in dependencies:
+        if dep not in seen:
+            seen.add(dep)
+            ordered_deps.append(dep)
+    
+    # Add current directory last (after all dependencies)
+    if current_abs not in seen:
+        ordered_deps.append(current_abs)
+    
+    visited.remove(current_abs)
+    return ordered_deps
+
+
+def start_dependencies(dependency_paths: List[str], current_dir: str) -> None:
+    """
+    Start dependencies by recursively calling compose-init-up.py in each dependency directory.
+    
+    Args:
+        dependency_paths: List of absolute paths to dependency directories
+        current_dir: Current project directory (to skip when processing)
+    """
+    current_abs = os.path.abspath(current_dir)
+    script_path = os.path.abspath(__file__)
+    
+    for dep_path in dependency_paths:
+        if dep_path == current_abs:
+            continue  # Skip self, will be started by main flow
+        
+        step(f"Starting dependency: {dep_path}")
+        
+        # Check if dependency is already running (basic heuristic)
+        try:
+            dep_env_file = os.path.join(dep_path, '.env')
+            if os.path.isfile(dep_env_file):
+                dep_env, _ = load_env_file(dep_env_file)
+                # Try to detect if services are already running by checking common ports
+                # This is a basic check - could be enhanced with actual service health checks
+                info(f"Dependency {dep_path} has .env file, checking if already running...")
+        except Exception:
+            pass
+        
+        # Run compose-init-up.py in the dependency directory
+        cmd = f"python3 {script_path} -d {dep_path} -y"
+        try:
+            info(f"Executing: {cmd}")
+            result = subprocess.run(
+                shlex.split(cmd),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
+            info(f"Dependency {dep_path} started successfully")
+            if result.stdout:
+                info(f"Dependency output: {result.stdout.strip()}")
+        except subprocess.CalledProcessError as e:
+            error(f"Failed to start dependency {dep_path}: {e}\nStderr: {e.stderr}")
+        except subprocess.TimeoutExpired:
+            error(f"Timeout starting dependency {dep_path} (>5 minutes)")
+        except Exception as e:
+            error(f"Unexpected error starting dependency {dep_path}: {e}")
+
+
+
+def generate_skeleton_toml(toml_out: str) -> None:
+    """
+    Dynamically generate a minimal `.env.toml` skeleton from CONFIG_VARIABLES.
+    """
+    lines = [
+        "# Project configuration in TOML format",
+        "# This replaces .env.sample with better structure and metadata support",
+        "",
+        "[metadata]",
+        f"project_name = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='LABEL_PROJECT_NAME'), 'my-project')}\"",
+        f"env_tag = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='LABEL_ENV_TAG'), 'dev')}\"",
+        f"label_prefix = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='LABEL_PREFIX'), 'example.com')}\"",
+        "",
+        "[control]",
+        f"compose_start_mode = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='COMPINIT_COMPOSE_START_MODE'), 'abort-on-failure')}\"",
+        f"reset_before_start = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='COMPINIT_RESET_BEFORE_START'), 'none')}\"",
+        f"image_check_enabled = {str(next((v['default'] for v in CONFIG_VARIABLES if v['name']=='COMPINIT_CHECK_IMAGE_ENABLED'), 'false')).lower()}",
+    f"image_check_continue_on_error = {str(next((v['default'] for v in CONFIG_VARIABLES if v['name']=='COMPINIT_IMAGE_CHECK_CONTINUE_ON_ERROR'), '0'))}",
+        "",
+        "[infrastructure]",
+        f"public_fqdn = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='PUBLIC_FQDN'), 'example.local')}\"",
+        f"public_tls_key_pem = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='PUBLIC_TLS_KEY_PEM'), '/etc/letsencrypt/live/$PUBLIC_FQDN/privkey.pem')}\"",
+        f"public_tls_crt_pem = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='PUBLIC_TLS_CRT_PEM'), '/etc/letsencrypt/live/$PUBLIC_FQDN/fullchain.pem')}\"",
+        "",
+        "[health]",
+        f"interval = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='HEALTHCHECK_INTERVAL'), '10s')}\"",
+        f"timeout = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='HEALTHCHECK_TIMEOUT'), '5s')}\"",
+        f"retries = {next((v['default'] for v in CONFIG_VARIABLES if v['name']=='HEALTHCHECK_RETRIES'), '3')}",
+        f"start_period = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='HEALTHCHECK_START_PERIOD'), '30s')}\"",
+        "",
+        "[user]",
+        f"uid = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='UID'), '$(id -u)')}\"",
+        f"gid = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='GID'), '$(id -g)')}\"",
+        "",
+        "[dependencies]",
+        "paths = []",
+        "",
+        "[hooks]",
+        "pre_compose = []",
+        "post_compose = []",
+        "",
+        "[variables]",
+        "# Example variables with clean metadata",
+        "LOG_LEVEL = \"info\"",
+        "API_TOKEN = {type = \"token\", length = 64, charset = \"hex\", source = \"internal\"}",
+        "ADMIN_PASSWORD = {type = \"password\", length = 32, source = \"external\", description = \"Administrator password\"}",
+    ]
+    with open(toml_out, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+    info(f"Generated skeleton TOML configuration: {toml_out}")
+
+
+
 def generate_skeleton_env(sample_out: str) -> None:
     """
-    Generate a minimal `.env.sample` skeleton containing the canonical control
-    variables used by `compose-init-up.py`. This is useful to bootstrap a new
-    project with the expected COMPINIT_* variables.
+    Dynamically generate a minimal `.env.sample` skeleton from CONFIG_VARIABLES.
     """
-    contents = [
-        "# Generated minimal .env.sample by compose-init-up.py\n",
-        "# Edit and extend with your service-specific variables.\n\n",
-        "# Compose-init controls\n",
-        "COMPINIT_COMPOSE_START_MODE=abort-on-failure\n",
-        "COMPINIT_RESET_BEFORE_START=none\n",
-        "COMPINIT_IMAGE_CHECK_CONTINUE_ON_ERROR=0\n",
-        "COMPINIT_CHECK_IMAGE_ENABLED=false\n",
-    "COMPINIT_HOOK_PRE_COMPOSE=\n",
-    "COMPINIT_HOOK_POST_COMPOSE=\n",
-    "COMPINIT_MYREGISTRY_URL=\n\n",
-    "# Global strict mode: set COMPINIT_STRICT_MODE=1 to enable a set of stricter checks\n",
-    "# Use COMPINIT_STRICT_<NAME>=1 for specific strict toggles.\n",
-    "# Set COMPINIT_STRICT_MODE=1 to enable a curated set of stricter checks.\n",
-    "# required in .env.sample to toggle strict behavior across projects.\n",
-    "COMPINIT_STRICT_MODE=\n\n",
-    "# Optional: when true, expand $VAR and $(cmd) in loaded env values at runtime\n",
-    "# This is OFF by default to ensure generated live env file contains literal values.\n",
-    "COMPINIT_ENABLE_ENV_EXPANSION=false\n\n",
-        "# TLS / public access\n",
-        "PUBLIC_FQDN=example.local\n",
-        "PUBLIC_TLS_KEY_PEM=/etc/letsencrypt/live/$PUBLIC_FQDN/privkey.pem\n",
-        "PUBLIC_TLS_CRT_PEM=/etc/letsencrypt/live/$PUBLIC_FQDN/fullchain.pem\n",
+    lines = [
+        "# Generated minimal .env.sample by compose-init-up.py",
+        "# Edit and extend with your service-specific variables.\n"
     ]
+    for var in CONFIG_VARIABLES:
+        if var.get("description"):
+            lines.append(f"# {var['description']}")
+        lines.append(f"{var['name']}={var['default']}")
+    lines.append("")
     with open(sample_out, 'w', encoding='utf-8') as f:
-        f.writelines(contents)
+        f.write('\n'.join(lines))
     info(f"Wrote skeleton .env.sample to {sample_out}")
 
 
@@ -750,37 +1225,32 @@ def run(cmd: str, check: bool = True, capture_output: bool = False,
         error(f"Unexpected error running command '{cmd}': {e}")
 
 
+
 def usage_notes() -> str:
     """
-    Return extended usage notes and maintenance marker.
-
-    KEEP IN SYNC: When editing the usage/notes text, update the README and any
-    related docs. Search for the marker 'KEEP IN SYNC' in this file before
-    modifying the text. This function centralizes the long-form help so that
-    automated tools and humans can find and update it reliably.
+    Dynamically render usage notes and variable documentation from CONFIG_VARIABLES.
     """
-    return '''
-Extended usage notes for compose-init-up.py
-
-- Use COMPINIT_HOOK_PRE_COMPOSE to set a python script executed before compose.
-- Use COMPINIT_HOOK_POST_COMPOSE to set a python script executed after compose.
-- Use COMPINIT_IMAGE_CHECK_ENABLED to enable/disable image availability checks.
-- COMPINIT_MYREGISTRY_URL can be set to a local registry mirror to speed pulls.
-- COMPINIT_ASSUME_YES=1 will run non-interactively and skip prompts (useful in CI).
-- COMPINIT_EXTERNAL_STRICT=1 will make missing EXTERNAL tokens a hard error in non-interactive mode.
-- COMPINIT_ENABLE_ENV_EXPANSION controls whether $VAR and $(cmd) expansions are applied at runtime; by default generated .env contains literal expanded values where appropriate.
-
-- New: prefer COMPINIT_STRICT_<NAME> variables for per-feature strict toggles (e.g. COMPINIT_STRICT_EXTERNAL,
-  COMPINIT_STRICT_EXPANSION). Do NOT implement runtime fallbacks or compatibility shims that check for the
-  legacy COMPINIT_<NAME>_STRICT variables. When changing strict-related behavior, perform a repository-wide
-  refactor: update code, tests, documentation, and CI so only the canonical COMPINIT_STRICT_<NAME> names are used.
-
-Docker Hub rate-limiting and best practices:
-    See: https://docs.docker.com/docker-hub/usage/
-
-KEEP IN SYNC: When changing the list above, also update the .env.sample and
-docs that mention COMPINIT_* variable names.
-'''
+    notes = [
+        "Extended usage notes for compose-init-up.py\n",
+        "- Use .env.toml configuration format for new projects (recommended) or .env.sample (legacy).",
+        "- Use COMPINIT_HOOK_PRE_COMPOSE to set a python script executed before compose.",
+        "- Use COMPINIT_HOOK_POST_COMPOSE to set a python script executed after compose.",
+        "- Use COMPINIT_DEPENDENCIES to list dependency directories (comma-separated) that must be started first.",
+        "- Use COMPINIT_IMAGE_CHECK_ENABLED to enable/disable image availability checks.",
+        "- Use --init-toml to generate skeleton .env.toml, --init-sample for legacy .env.sample.",
+        "- COMPINIT_MYREGISTRY_URL can be set to a local registry mirror to speed pulls.",
+        "- COMPINIT_ASSUME_YES=1 will run non-interactively and skip prompts (useful in CI).",
+        "- COMPINIT_EXTERNAL_STRICT=1 will make missing EXTERNAL tokens a hard error in non-interactive mode.",
+        "- COMPINIT_ENABLE_ENV_EXPANSION controls whether $VAR and $(cmd) expansions are applied at runtime; by default generated .env contains literal expanded values where appropriate.",
+        "\n- New: prefer COMPINIT_STRICT_<NAME> variables for per-feature strict toggles (e.g. COMPINIT_STRICT_EXTERNAL, COMPINIT_STRICT_EXPANSION). Do NOT implement runtime fallbacks or compatibility shims that check for the legacy COMPINIT_<NAME>_STRICT variables. When changing strict-related behavior, perform a repository-wide refactor: update code, tests, documentation, and CI so only the canonical COMPINIT_STRICT_<NAME> names are used.",
+        "\nDocker Hub rate-limiting and best practices:",
+        "    See: https://docs.docker.com/docker-hub/usage/\n",
+        "\nCanonical config variables:\n"
+    ]
+    for var in CONFIG_VARIABLES:
+        notes.append(f"- {var['name']}: {var['description']} (default: {var['default']})")
+    notes.append("\nKEEP IN SYNC: When changing the list above, also update the .env.sample and docs that mention COMPINIT_* variable names.")
+    return '\n'.join(notes)
 
 
 def check_myregistry(url: str, env: Dict[str, str]) -> Tuple[bool, str]:
@@ -1493,13 +1963,15 @@ def main() -> None:
     )
     parser.add_argument(
         '-e', '--env', 
-        help=f"Environment file name (default: {DEFAULT_ENV_FILE})", 
-        default=DEFAULT_ENV_FILE,
+        help=f"Environment file name (default: {DEFAULT_ENV_ACTIVE_FILE})", 
+        default=DEFAULT_ENV_ACTIVE_FILE,
         metavar='ENV_FILE'
     )
     parser.add_argument('--notes', action='store_true', help='Print extended usage notes and exit')
     parser.add_argument('-y', '--yes', action='store_true', help='Assume yes / non-interactive: do not prompt after generating .env')
     parser.add_argument('--external-strict', action='store_true', help='Treat missing EXTERNAL tokens as fatal in non-interactive runs (equivalent to COMPINIT_STRICT_EXTERNAL=1)')
+    parser.add_argument('--init-toml', action='store_true', help='Generate a skeleton .env.toml file and exit')
+    parser.add_argument('--init-sample', action='store_true', help='Generate a skeleton .env.sample file and exit (legacy)')
     
     try:
         args = parser.parse_args()
@@ -1509,6 +1981,14 @@ def main() -> None:
 
     if getattr(args, 'notes', False):
         print(usage_notes())
+        sys.exit(0)
+    
+    if getattr(args, 'init_toml', False):
+        generate_skeleton_toml('.env.toml')
+        sys.exit(0)
+    
+    if getattr(args, 'init_sample', False):
+        generate_skeleton_env('.env.sample')
         sys.exit(0)
 
     # Propagate CLI flag to environment variable so existing logic can use it
@@ -1544,28 +2024,48 @@ def main() -> None:
     except OSError as e:
         error(f"Cannot change to working directory '{args.dir}': {e}")
     
-    # Define file paths
+    # Define file paths - check for TOML config first, then fall back to .env.sample
+    toml_file = ".env.toml"
     sample_file = ".env.sample"
     env_file = args.env
     compose_file = args.file
     
+    # Determine configuration format
+    use_toml = False
+    config_file = None
+    
+    if os.path.isfile(toml_file):
+        use_toml = True
+        config_file = toml_file
+        info(f"Using TOML configuration: {toml_file}")
+    elif os.path.isfile(sample_file):
+        use_toml = False
+        config_file = sample_file
+        info(f"Using legacy .env.sample configuration: {sample_file}")
+    else:
+        error(f"No configuration file found. Please create either {toml_file} or {sample_file}")
+    
     # Validate required files exist
-    if not os.path.isfile(sample_file):
-        error(f"{sample_file} file not found. Cannot continue.")
+    if not os.path.isfile(compose_file):
+        error(f"Intended docker-compose file '{compose_file}' not found. Cannot continue.")
     
     if not os.path.isfile(compose_file):
         error(f"Intended docker-compose file '{compose_file}' not found. Cannot continue.")
     
-    # First run: generate .env.active from .env.sample
+    # First run: generate .env from configuration file
     if not os.path.isfile(env_file) or os.path.getsize(env_file) == 0:
-        step(f"Generating '{env_file}' from '{sample_file}'")
-        parse_env_sample(sample_file, env_file)
+        step(f"Generating '{env_file}' from '{config_file}'")
+        if use_toml:
+            parse_toml_sample(config_file, env_file)
+        else:
+            parse_env_sample(config_file, env_file)
         # Allow non-interactive or CI runs to skip the manual confirmation
         if getattr(args, 'yes', False) or os.environ.get('COMPINIT_ASSUME_YES', '').lower() in ('1', 'true', 'yes'):
             info(f"Non-interactive mode: continuing after generating {env_file}")
         else:
-            info(f"Check and edit the generated {env_file}, then press any key to continue.")
-            input("Press any key to continue...")
+            warn(f"New {env_file} has been generated with defaults, please check it!")
+            #info(f"Check and edit the generated {env_file}, then press any key to continue.")
+            #input("Press any key to continue...")
         # Continue as if .env.active was present from the start
     
     while True:
@@ -1598,6 +2098,17 @@ def main() -> None:
 
         # Update current process environment
         os.environ.update(env_vars)
+        
+        # Process dependencies before starting this project
+        dependencies_str = env_vars.get('COMPINIT_DEPENDENCIES', '').strip()
+        if dependencies_str:
+            step(f"Resolving dependencies: {dependencies_str}")
+            try:
+                dependency_paths = resolve_dependencies(env_vars, os.getcwd())
+                info(f"Dependency resolution order: {' -> '.join([os.path.basename(p) for p in dependency_paths])}")
+                start_dependencies(dependency_paths, os.getcwd())
+            except Exception as e:
+                error(f"Failed to process dependencies: {e}")
         
     # Perform any configured reset actions before creating volumes/directories
         reset_flags = env_vars.get('COMPINIT_RESET_BEFORE_START', 'none')
