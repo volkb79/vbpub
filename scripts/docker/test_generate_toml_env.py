@@ -1,74 +1,79 @@
 #!/usr/bin/env python3
 """
-Test: generate live env from .env.toml and ensure correct file loading, skeleton creation, and active file creation.
-Checks:
-- .env.toml loads and parses without error
-- .env is generated and contains expected keys
-- All canonical variables are present
+Pytest-friendly test: generate live env from .env.toml and ensure correct file loading,
+skeleton creation, and active file creation.
 """
+
 import sys
-import os
 from pathlib import Path
 import importlib.util
 import tempfile
 
-ROOT = Path(__file__).resolve().parents[3]
-TOML = ROOT / '.env.toml'
-SCRIPT = ROOT / 'vbpub' / 'scripts' / 'docker' / 'compose-init-up.py'
 
-if not TOML.exists():
-    print(f"TOML file not found at {TOML}")
-    sys.exit(2)
-if not SCRIPT.exists():
-    print(f"compose-init-up.py not found at {SCRIPT}")
-    sys.exit(2)
+def run_generate_toml_env_test(toml_path: str = None) -> bool:
+    ROOT = Path(__file__).resolve().parents[3]
+    TOML = Path(toml_path) if toml_path else ROOT / '.env.toml'
+    SCRIPT = ROOT / 'vbpub' / 'scripts' / 'docker' / 'compose-init-up.py'
 
-spec = importlib.util.spec_from_file_location('compose_init', str(SCRIPT))
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
+    if not TOML.exists():
+        raise AssertionError(f"TOML file not found at {TOML}")
+    if not SCRIPT.exists():
+        raise AssertionError(f"compose-init-up.py not found at {SCRIPT}")
 
-with tempfile.NamedTemporaryFile('w+', delete=False) as tmp:
-    out_path = Path(tmp.name)
+    spec = importlib.util.spec_from_file_location('compose_init', str(SCRIPT))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
 
-try:
-    mod.parse_toml_sample(str(TOML), str(out_path))
-except Exception as e:
-    print(f"parse_toml_sample failed: {e}")
-    sys.exit(3)
+    with tempfile.NamedTemporaryFile('w+', delete=False) as tmp:
+        out_path = Path(tmp.name)
 
-toml_text = TOML.read_text(encoding='utf-8')
-out_text = out_path.read_text(encoding='utf-8')
+    try:
+        mod.parse_toml_sample(str(TOML), str(out_path))
+    except Exception as e:
+        raise AssertionError(f"parse_toml_sample failed: {e}")
 
-# Check for expected keys
-expected = [
-    "COMPINIT_COMPOSE_START_MODE",
-    "COMPINIT_RESET_BEFORE_START",
-    "COMPINIT_CHECK_IMAGE_ENABLED",
-    "COMPINIT_IMAGE_CHECK_CONTINUE_ON_ERROR",
-    "PUBLIC_FQDN",
-    "PUBLIC_TLS_KEY_PEM",
-    "PUBLIC_TLS_CRT_PEM",
-    "HEALTHCHECK_INTERVAL",
-    "HEALTHCHECK_TIMEOUT",
-    "HEALTHCHECK_RETRIES",
-    "HEALTHCHECK_START_PERIOD",
-    "LABEL_PROJECT_NAME",
-    "LABEL_ENV_TAG",
-    "LABEL_PREFIX",
-    "UID",
-    "GID"
-]
-missing = []
-for key in expected:
-    found = False
-    for line in out_text.splitlines():
-        if line.strip().startswith(f"{key}="):
-            found = True
-            break
-    if not found:
-        missing.append(key)
-if missing:
-    print(f"FAIL: Missing expected keys in generated env: {missing}")
-    sys.exit(4)
-print("PASS: TOML env generation produced all expected keys.")
-sys.exit(0)
+    out_text = out_path.read_text(encoding='utf-8')
+
+    expected = [
+        "COMPINIT_COMPOSE_START_MODE",
+        "COMPINIT_RESET_BEFORE_START",
+        "COMPINIT_CHECK_IMAGE_ENABLED",
+        "COMPINIT_IMAGE_CHECK_CONTINUE_ON_ERROR",
+        "PUBLIC_FQDN",
+        "PUBLIC_TLS_KEY_PEM",
+        "PUBLIC_TLS_CRT_PEM",
+        "HEALTHCHECK_INTERVAL",
+        "HEALTHCHECK_TIMEOUT",
+        "HEALTHCHECK_RETRIES",
+        "HEALTHCHECK_START_PERIOD",
+        "LABEL_PROJECT_NAME",
+        "LABEL_ENV_TAG",
+        "LABEL_PREFIX",
+        "UID",
+        "GID"
+    ]
+
+    missing = []
+    for key in expected:
+        if not any(line.strip().startswith(f"{key}=") for line in out_text.splitlines()):
+            missing.append(key)
+
+    if missing:
+        raise AssertionError(f"Missing expected keys in generated env: {missing}")
+
+    return True
+
+
+def test_generate_toml_env_default():
+    assert run_generate_toml_env_test()
+
+
+if __name__ == '__main__':
+    try:
+        ok = run_generate_toml_env_test()
+        if ok:
+            print('PASS: TOML env generation produced all expected keys.')
+            sys.exit(0)
+    except AssertionError as e:
+        print('FAIL:', e)
+        sys.exit(1)

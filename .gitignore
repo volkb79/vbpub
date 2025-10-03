@@ -210,4 +210,7 @@ __marimo__/
 # docker bind mounts (by convention we prefix them with "vol-" to avoid name clashes)
 vol-*/
 
+# compose-init active TOML (generated, should not be committed)
+compose.config.active.toml
+
 

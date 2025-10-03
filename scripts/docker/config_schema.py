@@ -49,6 +49,9 @@ class HookConfig:
     script: str
     description: Optional[str] = None
     env_exports: List[str] = field(default_factory=list)  # Variables this hook will set
+    env_reads: List[str] = field(default_factory=list)   # Variables the hook may read
+    env_writes: List[str] = field(default_factory=list)  # Variables the hook may create/write
+    env_modifies: List[str] = field(default_factory=list) # Variables the hook may modify
     required: bool = True
 
 
@@ -197,6 +200,9 @@ def parse_toml_config(toml_path: str) -> ProjectConfig:
                 script=hook_data['script'],
                 description=hook_data.get('description'),
                 env_exports=hook_data.get('env_exports', []),
+                env_reads=hook_data.get('env_reads', []),
+                env_writes=hook_data.get('env_writes', []),
+                env_modifies=hook_data.get('env_modifies', []),
                 required=hook_data.get('required', True)
             ))
     
@@ -213,6 +219,9 @@ def parse_toml_config(toml_path: str) -> ProjectConfig:
                 script=hook_data['script'],
                 description=hook_data.get('description'),
                 env_exports=hook_data.get('env_exports', []),
+                env_reads=hook_data.get('env_reads', []),
+                env_writes=hook_data.get('env_writes', []),
+                env_modifies=hook_data.get('env_modifies', []),
                 required=hook_data.get('required', True)
             ))
     

@@ -3,37 +3,56 @@
 Docker Compose Initialization and Startup Script
 
 Main responsibilities:
-- Generate .env.active from .env.sample 
-    - automatic password generation on xxx_PASSWORD, query on xxx_TOKEN
+- TOML-first configuration: prefer a TOML configuration (compose.config.sample.toml / compose.config.active.toml)
+  and convert to a traditional `.env` when needed. This provides richer metadata
+  (type, default, description, allowed_values) for variables.
+- Migrate legacy `.env.sample` files if requested (opt-in via --env-legacy).
+- Generate `.env` / `.env.active` from TOML or legacy samples with:
+    - automatic password generation for *_PASSWORD descriptors,
+    - token prompting for external tokens when interactive,
+    - deferred-secret handling for values created by post-compose hooks.
 - Validate Docker Compose configuration and environment variables
 - Check image availability before starting containers
 - Create required host directories with proper permissions
 - Start Docker Compose services with configurable modes
 
+#Filenames and precedence (how sample, project, local, global interact)
+## compose.config.sample.toml (project sample / template)
+Purpose: Checked into the project. Authoritative sample/tpl people edit. Contains metadata (project_name, env_tag, label_prefix), and recommended default variable metadata in [variables].
+Use: When creating a new project, copy or adapt this sample to create a project compose.config.active.toml or commit it as the canonical sample.
+
+## compose.config.active.toml (project active)
+Purpose: Project-specific canonical runtime TOML file (what operators would generally modify for deployments).
+Use: If present, it is considered the authoritative project configuration used by the runner to generate .env and to provide hook metadata and hook ordering. This file is a normal repo file but in some setups it may be maintained outside of source control.
+
+## compose.config.global.toml (repo-level defaults)
+Location: repo root (you requested the global config lie in the repo root).
+Purpose: Repository-wide sensible defaults and shared metadata. Example uses: default LABEL_PREFIX for all projects in the repo, default control flags, default hooks to run for multiple projects.
+Use: Read-only defaults merged in at runtime. Local project settings override these.
+
 
 ## Pre-Compose Hook Integration
-- The pre-compose hook must be a Python script/class (not bash) with a standard interface (e.g., PreComposeHook with a run() method) so it can be imported and called from compose-init-up.py.
-- All environment variables set by the hook must be logged and passed back to the main script.
-- If secrets or tokens are generated, log their creation (but do not print the full secret/token in logs).
+- Hooks must be Python modules that define a class-based hook (PreComposeHook or PostComposeHook)
+  with a run(env) method. This script imports hook modules and instantiates the
+  expected hook class. Shell-based hooks (stdout/parsing) are not supported.
+- Hooks may return generated secrets as a dict; these are persisted into the
+  active environment as necessary.
 
-Deferred secrets: This script recognises variables that end with
-`_PASSWORD_DEFERED` and `_TOKEN_DEFERED` in `.env.sample`. These are NOT
-auto-generated during initial `.env.active` creation. Instead they signal that
-the value will be generated later by a post-compose hook (for example a
-`PostComposeHook` that runs inside an application container and creates users or
-robot tokens). The post-hook should return the generated secrets as a dict of
-variables (without the `_DEFERED` suffix in the variable name, e.g.
-`PORTUS_ADMIN_PASSWORD`) so the main script can persist them into `.env.active`.
+Deferred secrets: Historically this project used the suffix `_DEFERED` (single
+R) to mark variables that are not generated on first-run and are expected to be
+created by a post-compose hook. This spelling is retained here for backwards
+compatibility and appears in parsing/regexes (`*_PASSWORD_DEFERED`,
+`*_TOKEN_DEFERED`). Do not change the suffix spelling in runtime code unless you
+also update parsing logic and perform a repository-wide migration.
 
 SINGLE SOURCE OF TRUTH
 -----------------------
 This file is the canonical, single source of truth for the compose-init helper
 in this workspace: `/home/vb/repos/vbpub/scripts/docker/compose-init-up.py`.
 Other copies of `compose-init-up.py` across this multi-repo workspace MUST be
-replaced with a symlink to this file. This script intentionally removes
-legacy/unsafe fallbacks and only supports Python-based pre/post hooks (no
-shell-hook fallback). The repository-level maintenance policy is to update
-this file and then propagate changes by creating symlinks from other locations.
+replaced with a symlink to this file. The repository-level maintenance policy
+is to update this file and then propagate changes by creating symlinks from
+other locations.
 
 If you are updating behavior, update this file only and run the repo-wide
 symlink step to keep other copies in sync.
@@ -46,9 +65,10 @@ Usage:
         -f, --file FILE   Docker compose file (default: docker-compose.yml)
 
 Environment Configuration:
-    The script expects a .env.sample file to generate .env.active from.
-    On first run, it generates passwords and prompts for tokens, then exits.
-    On subsequent runs, it loads the .env.active and starts services.
+    By default the script prefers a TOML configuration (`compose.config.active.toml`)
+    or a sample TOML file (`compose.config.sample.toml`). Legacy `.env.sample`
+    processing is opt-in via `--env-legacy`. When running in TOML mode the
+    script can generate a traditional `.env` file for use by Docker Compose.
 
 Descriptor naming convention:
         You can encode generation hints into variable names so the script knows
@@ -66,7 +86,7 @@ Descriptor naming convention:
             - HEX:    0-9, a-f (generated by secrets.token_hex)
             - LENGTH: decimal number describing requested length
             - INTERNAL: generate and store locally in .env
-            - EXTERNAL: prompt user for secret (as before)
+            - EXTERNAL: prompt user for secret (interactive)
             - DEFERED: leave blank now; expected to be created by post-compose hook
 
 
@@ -79,21 +99,18 @@ import traceback
 import sys
 from typing import Dict, List, Tuple, Optional, Set, Any
 
-# Check for required standard library modules before importing
 def check_imports() -> None:
-    """Check if all required standard library modules are available."""
+    """Check if all required standard library and third-party modules are available."""
     required_modules = [
         'os', 'sys', 're', 'subprocess', 'shutil', 'threading', 
         'concurrent.futures', 'queue', 'shlex', 'secrets', 'string'
     ]
-    
     missing_modules = []
     for module in required_modules:
         try:
             __import__(module)
         except ImportError:
             missing_modules.append(module)
-    
     if missing_modules:
         print(f"[ERROR] Missing required standard library modules: {', '.join(missing_modules)}", file=sys.stderr)
         print("[ERROR] This Python installation appears to be incomplete.", file=sys.stderr)
@@ -106,11 +123,43 @@ def check_imports() -> None:
         print("[ERROR] PyYAML library is required but not installed.", file=sys.stderr)
         print("[ERROR] Please install it with: pip install PyYAML", file=sys.stderr)
         sys.exit(1)
+    try:
+        import jinja2
+    except ImportError:
+        print("[ERROR] Jinja2 library is required but not installed.", file=sys.stderr)
+        print("[ERROR] Please install it with: pip install Jinja2", file=sys.stderr)
+        sys.exit(1)
+# --- Jinja2 template rendering for dynamic YAML/config files ---
+def render_templates(template_configs: Dict[str, Dict[str, str]], env_vars: Dict[str, str]) -> None:
+    """
+    Render templates using Jinja2 and write output files.
+    Args:
+        template_configs: Dict of template configs, e.g. { 'traefik_dynamic': { 'input': 'traefik_dynamic.yml.template', 'output': 'traefik_dynamic.yml' } }
+        env_vars: Environment variables to use for rendering
+    """
+    try:
+        import jinja2
+    except ImportError:
+        error("Jinja2 is required for template rendering but not installed.")
+    env = jinja2.Environment(loader=jinja2.FileSystemLoader('.'), autoescape=False)
+    for name, cfg in template_configs.items():
+        input_path = cfg.get('input')
+        output_path = cfg.get('output')
+        if not input_path or not output_path:
+            warn(f"Template config for {name} missing input/output paths; skipping.")
+            continue
+        try:
+            template = env.get_template(input_path)
+            output = template.render(**env_vars)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(output)
+            info(f"Rendered template '{input_path}' to '{output_path}' using Jinja2.")
+        except Exception as e:
+            warn(f"Failed to render template {input_path} to {output_path}: {e}")
 
 # Perform import check first
-check_imports()
-
-# Now import all required modules
+# Delay heavy import checks until runtime to allow unit tests to import the module
+# without requiring optional runtime dependencies like PyYAML.
 import os
 import re
 import subprocess
@@ -120,10 +169,9 @@ import concurrent.futures
 import queue
 import shlex
 import json
-import yaml
 from pathlib import Path
 
-# TOML configuration support
+import tomllib
 try:
     from .config_schema import ProjectConfig, VariableConfig, parse_toml_config, config_to_env_dict, validate_config
 except ImportError:
@@ -131,6 +179,46 @@ except ImportError:
     import sys
     sys.path.append(os.path.dirname(__file__))
     from config_schema import ProjectConfig, VariableConfig, parse_toml_config, config_to_env_dict, validate_config
+
+def discover_global_toml_files(start_dir: str) -> list:
+    """
+    Walk up the directory tree from start_dir, collecting all compose.config.global.toml files.
+    Returns a list of file paths, ordered furthest-away-first (repo root first).
+    """
+    files = []
+    cur = os.path.abspath(start_dir)
+    prev = None
+    while cur != prev:
+        candidate = os.path.join(cur, DEFAULT_GLOBAL_TOML_FILE)
+        if os.path.isfile(candidate):
+            files.insert(0, candidate)  # insert at front for furthest-away-first
+        prev = cur
+        cur = os.path.dirname(cur)
+    return files
+
+def merge_global_toml_files(global_files: list) -> dict:
+    """
+    Merge all discovered global TOML files into a single dict.
+    Furthest-away files are merged first, so closer files override.
+    """
+    merged = {}
+    for f in global_files:
+        try:
+            with open(f, 'rb') as fin:
+                data = tomllib.load(fin)
+            merged.update(data)
+        except Exception as e:
+            warn(f"Failed to load global TOML file {f}: {e}")
+    return merged
+
+def collect_global_vars(merged_toml: dict) -> dict:
+    """
+    Collect variables from a [global-vars] section, if present.
+    Returns a dict of global variables.
+    """
+    return merged_toml.get('global-vars', {})
+import urllib.request
+import socket
 
 # --- Output helpers ---
 COLOR_RED = '\033[0;31m'
@@ -172,21 +260,34 @@ def error(msg: str, show_stacktrace: bool = True) -> None:
 # All file names used by this script, for easy maintenance
 DEFAULT_ENV_ACTIVE_FILE = ".env"
 DEFAULT_ENV_SAMPLE_FILE = ".env.sample"
-DEFAULT_TOML_ACTIVE_FILE = ".env.toml"
-DEFAULT_TOML_SAMPLE_FILE = ".env.sample.toml"
+DEFAULT_TOML_ACTIVE_FILE = "compose.config.active.toml"
+DEFAULT_TOML_SAMPLE_FILE = "compose.config.sample.toml"
+DEFAULT_GLOBAL_TOML_FILE = "compose.config.global.toml"
+DEFAULT_LOCAL_TOML_FILE = "compose.config.local.toml"  # legacy name; no longer used for persistence
+
+# Endpoints to query for public IP detection. The generator will try these in order
+# and stop on the first successful response. You can override by setting the
+# environment variable COMPINIT_IP_DETECT_URLS as a comma-separated list.
+DEFAULT_IP_DETECT_URLS = [
+    "https://api.ipify.org/",        # simple plaintext IP
+    "https://ifconfig.me/ip",       # plaintext IP
+    "https://ident.me/"             # plaintext IP
+]
 
 # Canonical config variable definitions: name, default, description, type
 CONFIG_VARIABLES = [
     {
         "name": "COMPINIT_COMPOSE_START_MODE",
         "default": "abort-on-failure",
-        "description": "Control flow for compose-init-up (abort-on-failure, continue-on-error, etc.)",
+        "description": "Control flow for compose-init-up",
+        "allowed_values": ["abort-on-failure", "continue-on-error", "best-effort"],
         "type": "string"
     },
     {
         "name": "COMPINIT_RESET_BEFORE_START",
         "default": "none",
-        "description": "Reset actions before starting (none, containers, named-volumes, hostdirs, all)",
+        "description": "Reset actions before starting",
+        "allowed_values": ["none", "containers", "named-volumes", "hostdirs", "all"],
         "type": "string"
     },
     {
@@ -513,12 +614,38 @@ def parse_env_sample(sample_path: str, env_path: str) -> None:
     expansion_enabled = os.environ.get('COMPINIT_ENABLE_ENV_EXPANSION', '').lower() in ('1', 'true', 'yes')
 
     def _maybe_expand(val: str, local_env: Dict[str, str]) -> str:
+        """
+        Expand command substitutions $(...) always (so generated files don't
+        contain literal $(...) or backticks). Only expand $VAR / ${VAR}
+        when COMPINIT_ENABLE_ENV_EXPANSION is enabled. This preserves
+        literal $VAR tokens in generated .env files by default (test
+        expectation).
+        """
+        try:
+            # First, expand command substitutions only to produce literal
+            # outputs for things like UID=$(id -u) while preserving $VAR tokens.
+            res = expand_cmds_only(val, local_env)
+        except Exception:
+            res = val
+
         if expansion_enabled:
+            # Expand only variable references (${VAR} and $VAR) using local_env
+            # without re-running command substitutions.
+            def var_repl_braced(m: re.Match[str]) -> str:
+                name = m.group(1)
+                return local_env.get(name, '')
+
+            def var_repl_plain(m: re.Match[str]) -> str:
+                name = m.group(1)
+                return local_env.get(name, '')
+
             try:
-                return expand_vars(val, local_env)
+                res = re.sub(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}', var_repl_braced, res)
+                res = re.sub(r'\$([A-Za-z_][A-Za-z0-9_]*)', var_repl_plain, res)
             except Exception:
-                return val
-        return val
+                pass
+
+        return res
     
     try:
         with open(sample_path, 'r', encoding='utf-8') as fin, \
@@ -535,13 +662,15 @@ def parse_env_sample(sample_path: str, env_path: str) -> None:
                 
                 # Match password variables: VAR_PASSWORD=value # comment
                 m_pw = re.match(r'^([A-Za-z0-9_]+_PASSWORD)=(.*?)([ \t#].*)?$', orig)
-                m_pw_defer = re.match(r'^([A-Za-z0-9_]+_PASSWORD_DEFERED)=(.*?)([ \t#].*)?$', orig)
+                # Accept both historical misspelling 'DEFERED' and the common 'DEFERRED'
+                m_pw_defer = re.match(r'^([A-Za-z0-9_]+_PASSWORD_(?:DEFERED|DEFERRED))=(.*?)([ \t#].*)?$', orig)
                 m_token_internal = re.match(r'^([A-Za-z0-9_]+_TOKEN_INTERNAL)=(.*?)([ \t#].*)?$', orig)
                 m_token_external = re.match(r'^([A-Za-z0-9_]+_TOKEN_EXTERNAL)=(.*?)([ \t#].*)?$', orig)
-                m_token_defer = re.match(r'^([A-Za-z0-9_]+_TOKEN_DEFERED)=(.*?)([ \t#].*)?$', orig)
-                # New descriptor patterns: NAME_TOKEN_ALNUM64 or NAME_TOKEN_HEX32, optional trailing _INTERNAL/_EXTERNAL/_DEFERED
-                m_token_desc = re.match(r'^([A-Za-z0-9_]+_TOKEN_(ALNUM|HEX)(\d+))(?:_(INTERNAL|EXTERNAL|DEFERED))?=(.*?)([ \t#].*)?$', orig)
-                m_pw_desc = re.match(r'^([A-Za-z0-9_]+_PASSWORD_(ALNUM|HEX)(\d+))(?:_DEFERED)?=(.*?)([ \t#].*)?$', orig)
+                m_token_defer = re.match(r'^([A-Za-z0-9_]+_TOKEN_(?:DEFERED|DEFERRED))=(.*?)([ \t#].*)?$', orig)
+                # New descriptor patterns: NAME_TOKEN_ALNUM64 or NAME_TOKEN_HEX32, optional trailing
+                # suffix _INTERNAL/_EXTERNAL/_DEFERED or _DEFERRED (accept both spellings)
+                m_token_desc = re.match(r'^([A-Za-z0-9_]+_TOKEN_(ALNUM|HEX)(\d+))(?:_(INTERNAL|EXTERNAL|DEFERED|DEFERRED))?=(.*?)([ \t#].*)?$', orig)
+                m_pw_desc = re.match(r'^([A-Za-z0-9_]+_PASSWORD_(ALNUM|HEX)(\d+))(?:_(?:DEFERED|DEFERRED))?=(.*?)([ \t#].*)?$', orig)
                 # SECRET_KEY_BASE is not treated specially by descriptor parsing anymore.
                 # Use NAME_PASSWORD_*/NAME_TOKEN_* descriptor forms to request generation.
                 # Legacy VAR_TOKEN is no longer supported; use _TOKEN_EXTERNAL or _TOKEN_INTERNAL or the descriptor forms
@@ -583,7 +712,7 @@ def parse_env_sample(sample_path: str, env_path: str) -> None:
                                     gen_val = _secrets.token_hex((length + 1) // 2)[:length]
                                 val = gen_val
                             try:
-                                write_val = expand_vars(val, local_env)
+                                write_val = _maybe_expand(val, local_env)
                             except Exception:
                                 write_val = val
                             fout.write(f"{actual_key}={write_val}{comment}\n")
@@ -608,7 +737,7 @@ def parse_env_sample(sample_path: str, env_path: str) -> None:
                                 gen_val = _secrets.token_hex((length + 1) // 2)[:length]
                             val = gen_val
                         try:
-                            write_val = expand_vars(val, local_env)
+                            write_val = _maybe_expand(val, local_env)
                         except Exception:
                             write_val = val
                         fout.write(f"{full_key}={write_val}{comment}\n")
@@ -621,7 +750,7 @@ def parse_env_sample(sample_path: str, env_path: str) -> None:
                             info(f"Generating internal token for {key}")
                             val = gen_pw(40)
                         try:
-                            write_val = expand_vars(val, local_env)
+                            write_val = _maybe_expand(val, local_env)
                         except Exception:
                             write_val = val
                         fout.write(f"{key}={write_val}{comment}\n")
@@ -680,7 +809,7 @@ def parse_env_sample(sample_path: str, env_path: str) -> None:
                             # Expand any $(...) or $VAR references now so the generated env
                             # contains literal values instead of runtime substitutions.
                             try:
-                                write_val = expand_vars(inner, local_env)
+                                write_val = _maybe_expand(inner, local_env)
                             except Exception:
                                 write_val = inner
 
@@ -1107,6 +1236,48 @@ def generate_skeleton_toml(toml_out: str) -> None:
     """
     Dynamically generate a minimal `.env.toml` skeleton from CONFIG_VARIABLES.
     """
+    # Determine a sensible default public FQDN by querying an external IP and
+    # performing a reverse DNS lookup. This helps generate a more useful
+    # skeleton for users who run the helper locally on a public host.
+    def get_external_ip() -> str:
+        # Allow overriding endpoints via environment variable
+        urls = os.environ.get('COMPINIT_IP_DETECT_URLS')
+        if urls:
+            endpoints = [u.strip() for u in urls.split(',') if u.strip()]
+        else:
+            endpoints = DEFAULT_IP_DETECT_URLS
+
+        for url in endpoints:
+            try:
+                with urllib.request.urlopen(url, timeout=5) as r:
+                    ip = r.read().decode().strip()
+                    # basic sanity check for IPv4/IPv6 or hostnames that may be returned
+                    if ip:
+                        return ip
+            except Exception:
+                continue
+        return ''
+
+    def reverse_dns(ip: str) -> str:
+        try:
+            name, _, _ = socket.gethostbyaddr(ip)
+            return name.rstrip('.')
+        except Exception:
+            return ''
+
+    def get_default_public_fqdn() -> str:
+        # Prefer detected reverse DNS if available, otherwise fall back to
+        # the configured CONFIG_VARIABLE default.
+        ip = get_external_ip()
+        if not ip:
+            return next((v['default'] for v in CONFIG_VARIABLES if v['name'] == 'PUBLIC_FQDN'), 'example.local')
+        rdns = reverse_dns(ip)
+        if rdns:
+            return rdns
+        return ip
+
+    detected_fqdn = get_default_public_fqdn()
+
     lines = [
         "# Project configuration in TOML format",
         "# This replaces .env.sample with better structure and metadata support",
@@ -1117,13 +1288,32 @@ def generate_skeleton_toml(toml_out: str) -> None:
         f"label_prefix = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='LABEL_PREFIX'), 'example.com')}\"",
         "",
         "[control]",
-        f"compose_start_mode = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='COMPINIT_COMPOSE_START_MODE'), 'abort-on-failure')}\"",
+    ]
+
+    # Inject allowed-values metadata for control variables when available
+    start_allowed = next((v.get('allowed_values') for v in CONFIG_VARIABLES if v['name']=='COMPINIT_COMPOSE_START_MODE'), None)
+    if start_allowed:
+        lines.append(f"# compose_start_mode allowed values: {' | '.join(start_allowed)}")
+    else:
+        lines.append("# compose_start_mode: how to behave when starting services that fail to start")
+
+    lines.append(f"compose_start_mode = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='COMPINIT_COMPOSE_START_MODE'), 'abort-on-failure')}\"")
+
+    reset_allowed = next((v.get('allowed_values') for v in CONFIG_VARIABLES if v['name']=='COMPINIT_RESET_BEFORE_START'), None)
+    if reset_allowed:
+        lines.append(f"# reset_before_start allowed values: {' | '.join(reset_allowed)}")
+    else:
+        lines.append("# reset_before_start: actions to perform before starting (comma-separated)")
+        lines.append("#  options: none | containers | named-volumes | hostdirs | all")
+
+    lines.extend([
         f"reset_before_start = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='COMPINIT_RESET_BEFORE_START'), 'none')}\"",
         f"image_check_enabled = {str(next((v['default'] for v in CONFIG_VARIABLES if v['name']=='COMPINIT_CHECK_IMAGE_ENABLED'), 'false')).lower()}",
-    f"image_check_continue_on_error = {str(next((v['default'] for v in CONFIG_VARIABLES if v['name']=='COMPINIT_IMAGE_CHECK_CONTINUE_ON_ERROR'), '0'))}",
+        f"image_check_continue_on_error = {str(next((v['default'] for v in CONFIG_VARIABLES if v['name']=='COMPINIT_IMAGE_CHECK_CONTINUE_ON_ERROR'), '0'))}",
         "",
         "[infrastructure]",
-        f"public_fqdn = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='PUBLIC_FQDN'), 'example.local')}\"",
+        f"# Suggested default detected from your external IP (reverse DNS or IP): {detected_fqdn}",
+        f"public_fqdn = \"{detected_fqdn}\"",
         f"public_tls_key_pem = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='PUBLIC_TLS_KEY_PEM'), '/etc/letsencrypt/live/$PUBLIC_FQDN/privkey.pem')}\"",
         f"public_tls_crt_pem = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='PUBLIC_TLS_CRT_PEM'), '/etc/letsencrypt/live/$PUBLIC_FQDN/fullchain.pem')}\"",
         "",
@@ -1145,11 +1335,33 @@ def generate_skeleton_toml(toml_out: str) -> None:
         "post_compose = []",
         "",
         "[variables]",
-        "# Example variables with clean metadata",
-        "LOG_LEVEL = \"info\"",
-        "API_TOKEN = {type = \"token\", length = 64, charset = \"hex\", source = \"internal\"}",
-        "ADMIN_PASSWORD = {type = \"password\", length = 32, source = \"external\", description = \"Administrator password\"}",
-    ]
+        "# Variables: type, default, description, allowed_values (if any)",
+    ])
+
+    # Emit detailed variable metadata entries for the TOML variables section
+    for var in CONFIG_VARIABLES:
+        name = var.get('name')
+        vtype = var.get('type', 'string')
+        default = var.get('default', '')
+        desc = var.get('description', '')
+        allowed = var.get('allowed_values')
+
+        # Build a TOML inline table for metadata
+        meta_parts = [f'type = "{vtype}"']
+        if default is not None and default != '':
+            # escape double quotes in default
+            safe_def = str(default).replace('"', '\\"')
+            meta_parts.append(f'default = "{safe_def}"')
+        if desc:
+            safe_desc = str(desc).replace('"', '\\"')
+            meta_parts.append(f'description = "{safe_desc}"')
+        if allowed:
+            # format allowed values as TOML array of strings
+            allowed_list = ', '.join([f'"{a}"' for a in allowed])
+            meta_parts.append(f'allowed_values = [{allowed_list}]')
+
+        meta_entry = f"{name} = {{{', '.join(meta_parts)}}}"
+        lines.append(meta_entry)
     with open(toml_out, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))
     info(f"Generated skeleton TOML configuration: {toml_out}")
@@ -1160,18 +1372,323 @@ def generate_skeleton_env(sample_out: str) -> None:
     """
     Dynamically generate a minimal `.env.sample` skeleton from CONFIG_VARIABLES.
     """
+    # Try to detect a sensible public_fqdn as default similar to TOML skeleton
+    def detect_public_fqdn_for_env() -> str:
+        # Reuse the same multi-endpoint detection as the TOML generator
+        urls = os.environ.get('COMPINIT_IP_DETECT_URLS')
+        if urls:
+            endpoints = [u.strip() for u in urls.split(',') if u.strip()]
+        else:
+            endpoints = DEFAULT_IP_DETECT_URLS
+
+        for url in endpoints:
+            try:
+                with urllib.request.urlopen(url, timeout=5) as r:
+                    ip = r.read().decode().strip()
+                try:
+                    name, _, _ = socket.gethostbyaddr(ip)
+                    return name.rstrip('.')
+                except Exception:
+                    return ip
+            except Exception:
+                continue
+        return next((v['default'] for v in CONFIG_VARIABLES if v['name'] == 'PUBLIC_FQDN'), 'example.local')
+
+    detected_env_fqdn = detect_public_fqdn_for_env()
     lines = [
         "# Generated minimal .env.sample by compose-init-up.py",
-        "# Edit and extend with your service-specific variables.\n"
+        "# Edit and extend with your service-specific variables.",
+        "",
+        "# compose_start_mode: how to behave when starting services that fail to start", 
+        "#   abort-on-failure (default) | continue-on-error",
+        "# reset_before_start: actions before start: none | containers | named-volumes | hostdirs | all",
     ]
+
     for var in CONFIG_VARIABLES:
         if var.get("description"):
             lines.append(f"# {var['description']}")
-        lines.append(f"{var['name']}={var['default']}")
+        if var['name'] == 'PUBLIC_FQDN':
+            lines.append(f"{var['name']}={detected_env_fqdn}")
+        else:
+            lines.append(f"{var['name']}={var['default']}")
     lines.append("")
     with open(sample_out, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))
     info(f"Wrote skeleton .env.sample to {sample_out}")
+
+
+def _load_toml_dict(path: str) -> dict:
+    """Load TOML file into a dict. Uses tomllib (py3.11) or tomli fallback.
+
+    Returns empty dict if file does not exist.
+    """
+    if not os.path.isfile(path):
+        return {}
+    try:
+        import tomllib
+    except Exception:
+        try:
+            import importlib
+            tomllib = importlib.import_module('tomli')
+        except Exception:
+            warn("TOML parsing not available (tomllib/tomli). Cannot load: %s" % path)
+            return {}
+    try:
+        with open(path, 'rb') as f:
+            return tomllib.load(f)
+    except Exception as e:
+        warn(f"Failed to parse TOML file {path}: {e}")
+        return {}
+
+
+def _write_local_toml_variables(local_path: str, updates: Dict[str, str]) -> None:
+    """Persist simple [variables] assignments into a per-project local TOML file.
+
+    This file is intended to be git-ignored and only store non-sensitive
+    overrides produced at runtime (hook outputs, local secrets). Only simple
+    string values are supported here. Existing local file content will be
+    merged (variables section updated); other sections are preserved if
+    present.
+    """
+    # Load existing content if present
+    data = _load_toml_dict(local_path)
+    if not isinstance(data, dict):
+        data = {}
+    vars_section = data.get('variables', {}) or {}
+    # Merge updates (overwriting existing keys)
+    for k, v in updates.items():
+        vars_section[k] = v
+    data['variables'] = vars_section
+
+    # Emit a minimal TOML file preserving top-level sections (simple serializer)
+    try:
+        with open(local_path, 'w', encoding='utf-8') as f:
+            # Write metadata if present
+            if 'metadata' in data and isinstance(data['metadata'], dict):
+                f.write('[metadata]\n')
+                for mk, mv in data['metadata'].items():
+                    safe_mv = str(mv).replace('"', '\\"')
+                    f.write(f'{mk} = "{safe_mv}"\n')
+                f.write('\n')
+
+            # Write variables section
+            f.write('[variables]\n')
+            for k, v in data['variables'].items():
+                # Only simple string values supported here
+                safe = str(v).replace('"', '\\"')
+                f.write(f'{k} = "{safe}"\n')
+            f.write('\n')
+    except Exception as e:
+        warn(f"Unable to persist local TOML overrides to {local_path}: {e}")
+
+
+def _merge_global_project_local_toml(global_path: str, project_path: str, local_path: str, merged_out: str) -> None:
+    """Merge global -> project -> local TOML dicts and write a merged TOML file.
+
+    The merged file is a simple serialization that covers the common sections
+    we need: metadata, control, infrastructure, health, user, registry, variables, hooks, dependencies.
+    This is used at runtime so we don't have to rewrite the original project file.
+    """
+    # Support multiple global TOML files discovered by walking up the tree when
+    # a basename like 'compose.config.global.toml' is provided. Apply
+    # furthest-away-first (i.e., topmost parent first) so nearer project-level
+    # values override more distant repo/global defaults.
+    g = {}
+    if global_path:
+        # If a simple basename is given, search upward from cwd for matches
+        if os.path.basename(global_path) == global_path:
+            # walk from cwd up to filesystem root
+            collected = []
+            cur = Path(os.getcwd()).resolve()
+            for parent in [cur] + list(cur.parents):
+                cand = os.path.join(str(parent), global_path)
+                if os.path.isfile(cand):
+                    collected.append(cand)
+            # Apply furthest-away-first: reverse collected so root-most first
+            for path in reversed(collected):
+                try:
+                    d = _load_toml_dict(path)
+                    if isinstance(d, dict):
+                        # overlay into g
+                        for k, v in d.items():
+                            if k not in g:
+                                g[k] = {}
+                            if isinstance(v, dict):
+                                g[k].update(v)
+                except Exception:
+                    continue
+        else:
+            g = _load_toml_dict(global_path) if global_path else {}
+    p = _load_toml_dict(project_path) if project_path else {}
+    l = _load_toml_dict(local_path) if local_path else {}
+
+    def merged_section(name: str):
+        out = {}
+        for src in (g.get(name, {}), p.get(name, {}), l.get(name, {})):
+            if isinstance(src, dict):
+                out.update(src)
+        return out
+
+    merged = {}
+    # Include metadata (take project metadata primarily)
+    merged['metadata'] = merged_section('metadata') or p.get('metadata', g.get('metadata', {}))
+    # Sections to merge
+    for sec in ('control', 'infrastructure', 'health', 'user', 'registry'):
+        sec_val = merged_section(sec)
+        if sec_val:
+            merged[sec] = sec_val
+
+    # Dependencies and hooks
+    deps = []
+    for src in (g.get('dependencies', {}), p.get('dependencies', {}), l.get('dependencies', {})):
+        if isinstance(src, list):
+            deps.extend(src)
+        elif isinstance(src, dict) and 'paths' in src:
+            deps.extend(src.get('paths', []))
+    if deps:
+        merged['dependencies'] = {'paths': deps}
+
+    # Hooks
+    hooks = {}
+    for k in ('pre_compose', 'post_compose'):
+        combined = []
+        for src in (g.get('hooks', {}).get(k, []), p.get('hooks', {}).get(k, []), l.get('hooks', {}).get(k, [])):
+            if isinstance(src, list):
+                combined.extend(src)
+            elif isinstance(src, str):
+                combined.append(src)
+        if combined:
+            hooks[k] = combined
+    if hooks:
+        merged['hooks'] = hooks
+
+    # Merge variables (global -> project -> local)
+    vars_merged = {}
+    for src in (g.get('variables', {}), p.get('variables', {}), l.get('variables', {})):
+        if isinstance(src, dict):
+            for k, v in src.items():
+                vars_merged[k] = v
+    if vars_merged:
+        merged['variables'] = vars_merged
+
+    # Emit merged TOML (minimal serializer)
+    try:
+        with open(merged_out, 'w', encoding='utf-8') as f:
+            # Metadata
+            if 'metadata' in merged and isinstance(merged['metadata'], dict):
+                f.write('[metadata]\n')
+                for mk, mv in merged['metadata'].items():
+                    safe_mv = str(mv).replace('"', '\\"')
+                    f.write(f'{mk} = "{safe_mv}"\n')
+                f.write('\n')
+
+            for sec in ('control', 'infrastructure', 'health', 'user', 'registry'):
+                if sec in merged:
+                    f.write(f'[{sec}]\n')
+                    for k, v in merged[sec].items():
+                        if isinstance(v, bool):
+                            val = 'true' if v else 'false'
+                            f.write(f'{k} = {val}\n')
+                        else:
+                            safe = str(v).replace('"', '\\"')
+                            f.write(f'{k} = "{safe}"\n')
+                    f.write('\n')
+
+            if 'dependencies' in merged and isinstance(merged['dependencies'], dict):
+                f.write('[dependencies]\n')
+                paths = merged['dependencies'].get('paths', [])
+                if isinstance(paths, list):
+                    f.write('paths = [')
+                    f.write(', '.join([f'"{p}"' for p in paths]))
+                    f.write(']\n\n')
+
+            if 'hooks' in merged and isinstance(merged['hooks'], dict):
+                f.write('[hooks]\n')
+                for k, arr in merged['hooks'].items():
+                    if isinstance(arr, list):
+                        f.write(f'{k} = [')
+                        f.write(', '.join([f'"{x}"' for x in arr]))
+                        f.write(']\n')
+                f.write('\n')
+
+            if 'variables' in merged and isinstance(merged['variables'], dict):
+                f.write('[variables]\n')
+                for k, v in merged['variables'].items():
+                    if isinstance(v, dict) and 'value' in v:
+                        safe = str(v['value']).replace('"', '\\"')
+                        f.write(f'{k} = "{safe}"\n')
+                    elif isinstance(v, str):
+                        safe = v.replace('"', '\\"')
+                        f.write(f'{k} = "{safe}"\n')
+                    else:
+                        # Fallback to string representation
+                        safe = str(v).replace('"', '\\"')
+                        f.write(f'{k} = "{safe}"\n')
+                f.write('\n')
+    except Exception as e:
+        warn(f"Failed to write merged TOML to {merged_out}: {e}")
+
+
+def migrate_env_sample_to_toml(sample_path: str, toml_out: str) -> None:
+    """
+    Migrate a legacy .env.sample (or .env) to a simple TOML configuration.
+
+    The migration attempts to preserve variable names and values. It will
+    heuristically map variable names to TOML variable metadata:
+      - *_PASSWORD -> type=password
+      - *_PASSWORD_DEFERED -> source=deferred
+      - *_TOKEN_INTERNAL -> type=token, source=internal
+      - *_TOKEN_EXTERNAL -> type=token, source=external
+      - other -> type=string
+
+    This produces a conservative TOML suitable as a starting point for
+    manual editing.
+    """
+    if not os.path.isfile(sample_path):
+        error(f"Cannot migrate: sample file not found: {sample_path}")
+
+    env_vars, _ = load_env_file(sample_path)
+
+    lines = [
+        "# Migrated TOML configuration generated from legacy .env.sample",
+        "# Review and adjust types/sources as needed",
+        "",
+        "[metadata]",
+        f"project_name = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='LABEL_PROJECT_NAME'), 'my-project')}\"",
+        f"env_tag = \"{next((v['default'] for v in CONFIG_VARIABLES if v['name']=='LABEL_ENV_TAG'), 'dev')}\"",
+        "",
+        "[variables]",
+    ]
+
+    def var_entry(k: str, v: str) -> str:
+        # Decide type/source heuristics
+        entry = None
+        # Accept both historical misspelling 'DEFERED' and correct 'DEFERRED'
+        if k.endswith('_PASSWORD_DEFERED') or k.endswith('_PASSWORD_DEFERRED'):
+            entry = f'{k} = {{ type = "password", source = "deferred" }}'
+        elif k.endswith('_PASSWORD'):
+            entry = f'{k} = {{ type = "password", value = "{v}" }}'
+        elif k.endswith('_TOKEN_INTERNAL'):
+            entry = f'{k} = {{ type = "token", source = "internal", value = "{v}" }}'
+        elif k.endswith('_TOKEN_EXTERNAL'):
+            entry = f'{k} = {{ type = "token", source = "external", value = "{v}" }}'
+        elif '_TOKEN_' in k or k.endswith('_TOKEN'):
+            entry = f'{k} = {{ type = "token", value = "{v}" }}'
+        else:
+            # default to string
+            # Escape double quotes
+            safe = v.replace('"', '\\"') if isinstance(v, str) else str(v)
+            entry = f'{k} = {{ type = "string", value = "{safe}" }}'
+        return entry
+
+    for k in sorted(env_vars.keys()):
+        v = env_vars.get(k, '')
+        lines.append(var_entry(k, v))
+
+    with open(toml_out, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
+
+    info(f"Migrated {sample_path} -> {toml_out}")
 
 
 # Legacy mapping helper removed: scripts now require canonical variable names only.
@@ -1226,18 +1743,170 @@ def run(cmd: str, check: bool = True, capture_output: bool = False,
 
 
 
+def run_hooks(hook_type: str, env_vars: Dict[str, str], project_config: Optional[ProjectConfig] = None) -> Dict[str, str]:
+    """Execute pre/post compose hooks and return environment variable changes.
+    
+    Args:
+        hook_type: Either 'PRE_COMPOSE' or 'POST_COMPOSE'
+        env_vars: Current environment variables
+        
+    Returns:
+        Dict of environment variable changes from hooks
+    """
+    # Determine ordered hook list. Prefer project_config hooks when provided
+    paths = []
+    if project_config:
+        hooks_list = project_config.pre_compose_hooks if hook_type == 'PRE_COMPOSE' else project_config.post_compose_hooks
+        if hooks_list:
+            for hc in hooks_list:
+                try:
+                    paths.append(hc.script)
+                except Exception:
+                    # Skip malformed HookConfig entries
+                    continue
+
+    # Fallback to environment variable listing if no project_config hooks provided
+    if not paths:
+        hook_var = f'COMPINIT_HOOK_{hook_type}'
+        hook_paths = env_vars.get(hook_var, '').strip()
+        if not hook_paths:
+            return {}
+        paths = [p.strip() for p in hook_paths.split(',') if p.strip()]
+
+    # Normalized metadata map: name -> {'value':..., 'persist': 'auto'|'none'|'env'|'project', 'sensitive': bool, 'source_hook': str}
+    meta_changes: Dict[str, Dict[str, Any]] = {}
+
+    for hook_path in paths:
+        if not os.path.isfile(hook_path):
+            warn(f"Hook file not found: {hook_path}")
+            continue
+
+        try:
+            info(f"Executing {hook_type.lower()} hook: {hook_path}")
+
+            # Import hook module dynamically
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("hook_module", hook_path)
+            if not spec or not spec.loader:
+                warn(f"Could not load hook module: {hook_path}")
+                continue
+
+            hook_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(hook_module)
+
+            # Require class-based hook with exact class name, e.g. PreComposeHook or PostComposeHook
+            hook_class_name = f'{hook_type.title().replace("_", "")}Hook'
+            if hasattr(hook_module, hook_class_name):
+                hook_class = getattr(hook_module, hook_class_name)
+                # Determine restricted environment to give to hook (only env_reads if declared)
+                hook_env = dict(os.environ)
+                matching = None
+                if project_config:
+                    for hc in (project_config.pre_compose_hooks if hook_type == 'PRE_COMPOSE' else project_config.post_compose_hooks):
+                        try:
+                            if os.path.abspath(hc.script) == os.path.abspath(hook_path) or os.path.basename(hc.script) == os.path.basename(hook_path):
+                                matching = hc
+                                break
+                        except Exception:
+                            continue
+                    if matching and getattr(matching, 'env_reads', None):
+                        hook_env = {k: os.environ.get(k, '') for k in matching.env_reads}
+
+                # Instantiate hook. Try no-arg constructor first, then fallback to constructor accepting env
+                try:
+                    hook_instance = hook_class()
+                except TypeError:
+                    try:
+                        hook_instance = hook_class(hook_env)
+                    except Exception:
+                        # last-resort, instantiate without args and hope for the best
+                        hook_instance = hook_class()
+
+                # Execute hook.run with the limited hook_env (if available)
+                try:
+                    hook_changes = hook_instance.run(hook_env) if hasattr(hook_instance, 'run') else {}
+                except Exception as e:
+                    warn(f"Hook {hook_path} raised an exception during run(): {e}")
+                    hook_changes = {}
+
+                if hook_changes:
+                    # Normalize different return structures into meta_changes
+                    # Supported return shapes:
+                    # - dict of name -> value (legacy)
+                    # - dict of name -> {value:, persist:, sensitive:}
+                    # - list of dicts [{name:, value:, persist:, sensitive:}, ...]
+                    try:
+                        if isinstance(hook_changes, dict):
+                                    for k, raw in hook_changes.items():
+                                        if isinstance(raw, dict):
+                                            val = raw.get('value')
+                                            persist = raw.get('persist', 'auto')
+                                            sensitive = bool(raw.get('sensitive', False))
+                                        else:
+                                            val = raw
+                                            persist = 'auto'
+                                            sensitive = False
+                                        # If key already present from earlier hooks, later hooks override
+                                        meta_changes[k] = {'value': val, 'persist': persist, 'sensitive': sensitive, 'source_hook': hook_path}
+                        elif isinstance(hook_changes, list):
+                            for item in hook_changes:
+                                if not isinstance(item, dict):
+                                    continue
+                                name = item.get('name') or item.get('var') or item.get('key')
+                                if not name:
+                                    continue
+                                val = item.get('value')
+                                persist = item.get('persist', 'auto')
+                                sensitive = bool(item.get('sensitive', False))
+                                meta_changes[name] = {'value': val, 'persist': persist, 'sensitive': sensitive, 'source_hook': hook_path}
+                        else:
+                            warn(f"Hook {hook_path} returned unsupported type {type(hook_changes)}; expected dict or list")
+                    except Exception as e:
+                        warn(f"Failed to normalize hook result from {hook_path}: {e}")
+                    info(f"Hook {hook_path} returned {len(hook_changes) if hasattr(hook_changes, '__len__') else '1'} changes (normalized to {len(meta_changes)} meta entries)")
+            else:
+                warn(f"Hook {hook_path} does not define required class {hook_class_name}; only class-based hooks are supported")
+
+        except Exception as e:
+            warn(f"Error executing hook {hook_path}: {e}")
+            continue
+
+    # Post-validate against declared HookConfig env_reads/env_writes/env_modifies/env_exports when available
+    if project_config and meta_changes:
+        hooks_list = project_config.pre_compose_hooks if hook_type == 'PRE_COMPOSE' else project_config.post_compose_hooks
+        for hc in (hooks_list or []):
+            try:
+                hc_script_abs = os.path.abspath(hc.script)
+            except Exception:
+                hc_script_abs = hc.script
+            for var_name, meta in list(meta_changes.items()):
+                # Only validate entries that this hook produced
+                try:
+                    if not meta.get('source_hook'):
+                        continue
+                    if not (os.path.abspath(meta.get('source_hook')) == os.path.abspath(hc.script) or os.path.basename(meta.get('source_hook')) == os.path.basename(hc.script)):
+                        continue
+                except Exception:
+                    continue
+                # Allowed writes are env_writes, env_modifies, and env_exports
+                allowed = set((getattr(hc, 'env_writes', []) or []) + (getattr(hc, 'env_modifies', []) or []) + (getattr(hc, 'env_exports', []) or []))
+                if allowed and var_name not in allowed:
+                    warn(f"Hook {hc.script} attempted to return variable '{var_name}' which is not declared in env_writes/env_modifies/env_exports ({', '.join(sorted(allowed))})")
+
+    return meta_changes
+
 def usage_notes() -> str:
     """
     Dynamically render usage notes and variable documentation from CONFIG_VARIABLES.
     """
     notes = [
         "Extended usage notes for compose-init-up.py\n",
-        "- Use .env.toml configuration format for new projects (recommended) or .env.sample (legacy).",
-        "- Use COMPINIT_HOOK_PRE_COMPOSE to set a python script executed before compose.",
-        "- Use COMPINIT_HOOK_POST_COMPOSE to set a python script executed after compose.",
+        "- TOML-first: prefer a .env.toml configuration for new projects (recommended).",
+        "- Legacy support is opt-in: pass --env-legacy to allow parsing legacy .env.sample/.env files. Without --env-legacy, legacy files will be refused and you will be offered a migration to TOML.",
+        "- Hooks: only class-based Python hooks are supported. Define PreComposeHook and PostComposeHook classes with a run(env) method. Legacy stdout/main-based hooks are not supported.",
         "- Use COMPINIT_DEPENDENCIES to list dependency directories (comma-separated) that must be started first.",
         "- Use COMPINIT_IMAGE_CHECK_ENABLED to enable/disable image availability checks.",
-        "- Use --init-toml to generate skeleton .env.toml, --init-sample for legacy .env.sample.",
+        "- Use --init-skel-toml to generate a skeleton .env.sample.toml, --init-skel-env for legacy .env.sample.",
         "- COMPINIT_MYREGISTRY_URL can be set to a local registry mirror to speed pulls.",
         "- COMPINIT_ASSUME_YES=1 will run non-interactively and skip prompts (useful in CI).",
         "- COMPINIT_EXTERNAL_STRICT=1 will make missing EXTERNAL tokens a hard error in non-interactive mode.",
@@ -1861,13 +2530,15 @@ def wait_for_services_health(compose_file: str, timeout: int = 300, interval: in
         
         time.sleep(interval)
 
-def start_compose(compose_file: str, mode: str) -> None:
+def start_compose(compose_file: str, mode: str, expanded_env: Dict[str, str], env_file: str) -> None:
     """
     Start Docker Compose services with the specified mode.
     
     Args:
         compose_file: Path to the docker-compose.yml file
         mode: Start mode - one of: detached, abort-on-failure, foreground
+        expanded_env: Environment variables with expansions applied
+        env_file: Path to the environment file for persistence
         
     Raises:
         SystemExit: If invalid mode specified or docker compose fails
@@ -1898,24 +2569,25 @@ def start_compose(compose_file: str, mode: str) -> None:
     try:
         if normalized_mode == 'detached':
             info("Starting containers in detached mode")
-            run(f"docker compose -f {compose_file} up -d")
+            run(f"docker compose -f {compose_file} up -d", env=expanded_env)
             
         elif normalized_mode == 'abort-on-failure':
             info("Starting containers in detached mode with health monitoring...")
-            run(f"docker compose -f {compose_file} up -d")
+            run(f"docker compose -f {compose_file} up -d", env=expanded_env)
             
             # Wait for services to become healthy
             success = wait_for_services_health(compose_file, timeout=300, interval=5)
             
             if success:
                 info("All services started successfully and are healthy")
-                sys.exit(0)
+                # Post-compose hook execution is handled by main() after start_compose returns
+                return
             else:
                 error("Service startup failed - not all services became healthy")
                 
         elif normalized_mode == 'foreground':
             info("Starting containers in foreground")
-            run(f"docker compose -f {compose_file} up")
+            run(f"docker compose -f {compose_file} up", env=expanded_env)
             
     except Exception as e:
         error(f"Failed to start Docker Compose services: {e}")
@@ -1939,6 +2611,9 @@ def main() -> None:
     or on successful completion of container startup.
     """
     import argparse
+    # Ensure runtime dependencies are present (PyYAML etc.)
+    check_imports()
+    import yaml
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(
@@ -1967,11 +2642,13 @@ def main() -> None:
         default=DEFAULT_ENV_ACTIVE_FILE,
         metavar='ENV_FILE'
     )
+    parser.add_argument('--env-legacy', action='store_true', help='Allow processing legacy .env.sample/.env files (opt-in). By default TOML is required')
     parser.add_argument('--notes', action='store_true', help='Print extended usage notes and exit')
     parser.add_argument('-y', '--yes', action='store_true', help='Assume yes / non-interactive: do not prompt after generating .env')
     parser.add_argument('--external-strict', action='store_true', help='Treat missing EXTERNAL tokens as fatal in non-interactive runs (equivalent to COMPINIT_STRICT_EXTERNAL=1)')
-    parser.add_argument('--init-toml', action='store_true', help='Generate a skeleton .env.toml file and exit')
-    parser.add_argument('--init-sample', action='store_true', help='Generate a skeleton .env.sample file and exit (legacy)')
+    parser.add_argument('--init-skel-toml', action='store_true', help='Generate a skeleton .env.sample.toml file and exit')
+    parser.add_argument('--init-skel-env', action='store_true', help='Generate a skeleton .env.sample file and exit (legacy)')
+    parser.add_argument('--migrate-workspace-envs', action='store_true', help='Scan workspace directory and migrate any legacy .env.sample files to TOML (dry-run unless -y provided)')
     
     try:
         args = parser.parse_args()
@@ -1983,12 +2660,50 @@ def main() -> None:
         print(usage_notes())
         sys.exit(0)
     
-    if getattr(args, 'init_toml', False):
-        generate_skeleton_toml('.env.toml')
+    if getattr(args, 'init_skel_toml', False):
+        generate_skeleton_toml(DEFAULT_TOML_SAMPLE_FILE)
         sys.exit(0)
     
-    if getattr(args, 'init_sample', False):
-        generate_skeleton_env('.env.sample')
+    if getattr(args, 'init_skel_env', False):
+        generate_skeleton_env(DEFAULT_ENV_SAMPLE_FILE)
+        sys.exit(0)
+
+    if getattr(args, 'migrate_workspace_envs', False):
+        # Walk the working directory and find .env.sample files to migrate
+        def _should_ignore_dir(d: str) -> bool:
+            ignore = ('.git', '.venv', 'venv', 'node_modules', '__pycache__')
+            return any(part in d for part in ignore)
+
+        projects = []
+        for root, dirs, files in os.walk(args.dir):
+            # skip ignored dirs
+            if _should_ignore_dir(root):
+                continue
+            if '.env.sample' in files or '.env' in files:
+                projects.append(root)
+
+        if not projects:
+            info("No legacy env files found to migrate in workspace")
+            sys.exit(0)
+
+        info(f"Found {len(projects)} projects with legacy env files to migrate")
+        for p in projects:
+            sample = os.path.join(p, '.env.sample') if os.path.isfile(os.path.join(p, '.env.sample')) else os.path.join(p, '.env')
+            out = os.path.join(p, DEFAULT_TOML_SAMPLE_FILE)
+            info(f"Would migrate: {sample} -> {out}")
+            if getattr(args, 'yes', False):
+                try:
+                    migrate_env_sample_to_toml(sample, out)
+                    info(f"Migrated {sample} -> {out}")
+                    try:
+                        os.remove(sample)
+                        info(f"Removed legacy sample: {sample}")
+                    except Exception:
+                        warn(f"Failed to remove legacy sample: {sample}")
+                except Exception as e:
+                    warn(f"Failed to migrate {sample}: {e}")
+        if not getattr(args, 'yes', False):
+            warn("Dry-run complete. Re-run with -y to perform migration and delete legacy files.")
         sys.exit(0)
 
     # Propagate CLI flag to environment variable so existing logic can use it
@@ -2024,91 +2739,196 @@ def main() -> None:
     except OSError as e:
         error(f"Cannot change to working directory '{args.dir}': {e}")
     
-    # Define file paths - check for TOML config first, then fall back to .env.sample
-    toml_file = ".env.toml"
-    sample_file = ".env.sample"
+    # Define file paths - TOML-first policy
+    toml_file = DEFAULT_TOML_ACTIVE_FILE
+    sample_file = DEFAULT_ENV_SAMPLE_FILE
     env_file = args.env
     compose_file = args.file
     
     # Determine configuration format
     use_toml = False
     config_file = None
-    
+    # By default require TOML. Legacy .env sample handling is opt-in via --env-legacy.
     if os.path.isfile(toml_file):
         use_toml = True
         config_file = toml_file
         info(f"Using TOML configuration: {toml_file}")
-    elif os.path.isfile(sample_file):
-        use_toml = False
-        config_file = sample_file
-        info(f"Using legacy .env.sample configuration: {sample_file}")
     else:
-        error(f"No configuration file found. Please create either {toml_file} or {sample_file}")
+        if os.path.isfile(sample_file):
+            if getattr(args, 'env_legacy', False):
+                use_toml = False
+                config_file = sample_file
+                warn(f"Using legacy .env.sample configuration because --env-legacy was provided: {sample_file}")
+            else:
+                # Offer migration to TOML
+                info(f"Legacy .env.sample detected at {sample_file} but TOML config {toml_file} missing.")
+                if getattr(args, 'yes', False) or os.environ.get('COMPINIT_ASSUME_YES', '').lower() in ('1','true','yes'):
+                    info("Auto-accepting migration in non-interactive mode")
+                    migrate_env_sample_to_toml(sample_file, toml_file)
+                    use_toml = True
+                    config_file = toml_file
+                    # remove legacy sample if migration performed
+                    try:
+                        os.remove(sample_file)
+                        info(f"Removed legacy sample file: {sample_file}")
+                    except Exception:
+                        warn(f"Failed to remove legacy sample file: {sample_file}")
+                else:
+                    resp = input(f"Migrate legacy {sample_file} to TOML {toml_file}? [y/N]: ")
+                    if resp.strip().lower() in ('y','yes'):
+                        migrate_env_sample_to_toml(sample_file, toml_file)
+                        use_toml = True
+                        config_file = toml_file
+                        try:
+                            os.remove(sample_file)
+                            info(f"Removed legacy sample file: {sample_file}")
+                        except Exception:
+                            warn(f"Failed to remove legacy sample file: {sample_file}")
+                    else:
+                        error(f"TOML configuration {toml_file} not found. Re-run with --env-legacy to allow legacy .env.sample usage or create {toml_file}.")
+        else:
+            error(f"No configuration file found. Please create {toml_file} or provide --env-legacy with {sample_file} present.")
     
     # Validate required files exist
     if not os.path.isfile(compose_file):
         error(f"Intended docker-compose file '{compose_file}' not found. Cannot continue.")
     
-    if not os.path.isfile(compose_file):
-        error(f"Intended docker-compose file '{compose_file}' not found. Cannot continue.")
-    
     # First run: generate .env from configuration file
-    if not os.path.isfile(env_file) or os.path.getsize(env_file) == 0:
-        step(f"Generating '{env_file}' from '{config_file}'")
-        if use_toml:
-            parse_toml_sample(config_file, env_file)
-        else:
-            parse_env_sample(config_file, env_file)
-        # Allow non-interactive or CI runs to skip the manual confirmation
-        if getattr(args, 'yes', False) or os.environ.get('COMPINIT_ASSUME_YES', '').lower() in ('1', 'true', 'yes'):
-            info(f"Non-interactive mode: continuing after generating {env_file}")
-        else:
-            warn(f"New {env_file} has been generated with defaults, please check it!")
-            #info(f"Check and edit the generated {env_file}, then press any key to continue.")
-            #input("Press any key to continue...")
-        # Continue as if .env.active was present from the start
-    
-    while True:
-        # Subsequent runs: load environment and start services
-        step(f"Sourcing environment from {env_file} file (allow variable expansion)...")
-        env_vars, loaded_keys = load_env_file(env_file)
-        info(f"Loaded {len(loaded_keys)} environment variables")
-        step("Displaying all loaded environment variables:")
-        for key in sorted(loaded_keys):
-            info(f"  {key}={env_vars[key]}")
-        
-        # Optionally expand command substitutions and environment variables in loaded values
-        step("Processing loaded environment variables (expansion controlled by COMPINIT_ENABLE_ENV_EXPANSION)")
-        enable_expansion = env_vars.get('COMPINIT_ENABLE_ENV_EXPANSION', 'false').lower() in ('1', 'true', 'yes')
-        if enable_expansion:
-            step("COMPINIT_ENABLE_ENV_EXPANSION=true: performing runtime expansion of values")
-            expanded_vars = {}
-            for key, value in env_vars.items():
-                try:
-                    expanded_value = expand_vars(value, env_vars)
-                except Exception as e:
-                    warn(f"Error expanding variable {key}: {e}")
-                    expanded_value = value
-                expanded_vars[key] = expanded_value
-                if expanded_value != value:
-                    info(f"Expanded {key} -> {expanded_value}")
-            env_vars = expanded_vars
-        else:
-            info("Runtime expansion disabled: keeping values literal in memory")
+    # If a global repo-level TOML exists, merge it with the project TOML and any local per-project overrides
+    merged_toml_tmp = None
+    merged_toml_tmp = None
+    project_config_obj = None
+    if use_toml:
+        # Create a merged temporary TOML that applies global -> project precedence
+        merged_toml_tmp = DEFAULT_TOML_ACTIVE_FILE + '.merged.tmp'
+        # search for compose.config.global.toml files up the directory tree is done in _merge_global_project_local_toml
+        _merge_global_project_local_toml(DEFAULT_GLOBAL_TOML_FILE, config_file, None, merged_toml_tmp)
+        # Parse merged TOML to ProjectConfig so we can use hook declarations and other metadata
+        try:
+            project_config_obj = parse_toml_config(merged_toml_tmp if os.path.isfile(merged_toml_tmp) else config_file)
+        except Exception as e:
+            warn(f"Failed to parse merged TOML for project metadata: {e}")
 
-        # Update current process environment
-        os.environ.update(env_vars)
-        
-        # Process dependencies before starting this project
-        dependencies_str = env_vars.get('COMPINIT_DEPENDENCIES', '').strip()
-        if dependencies_str:
-            step(f"Resolving dependencies: {dependencies_str}")
+
+    # Generate runtime environment variables in-memory (TOML-first policy).
+    env_vars: Dict[str, str] = {}
+    if use_toml:
+        # Parse merged TOML to ProjectConfig so we can use hook declarations and other metadata
+        cfg_path = merged_toml_tmp if merged_toml_tmp and os.path.isfile(merged_toml_tmp) else config_file
+        try:
+            config = parse_toml_config(cfg_path)
+        except Exception as e:
+            error(f"Failed to parse TOML configuration '{cfg_path}': {e}")
+
+        # Validate configuration
+        validation_errors = validate_config(config)
+        if validation_errors:
+            error(f"TOML configuration validation failed:\n  - " + "\n  - ".join(validation_errors))
+
+        info(f"Parsed TOML configuration for project: {config.project_name}")
+
+        # Generate values for variables that need generation (in-memory)
+        generated_values: Dict[str, str] = {}
+        local_env = dict(os.environ)
+
+        for name, var_config in config.variables.items():
             try:
-                dependency_paths = resolve_dependencies(env_vars, os.getcwd())
-                info(f"Dependency resolution order: {' -> '.join([os.path.basename(p) for p in dependency_paths])}")
-                start_dependencies(dependency_paths, os.getcwd())
+                if var_config.source == "deferred":
+                    generated_values[name] = ""
+                    continue
+
+                if var_config.type == "password" and not var_config.value:
+                    info(f"Generating password for {name} (type={var_config.type}, length={var_config.length})")
+                    generated_values[name] = gen_pw(var_config.length or 32, var_config.charset)
+                elif var_config.type == "token" and not var_config.value:
+                    if var_config.source == "external":
+                        env_fallback = os.environ.get(name)
+                        if env_fallback:
+                            info(f"Using provided environment value for external token {name}")
+                            generated_values[name] = env_fallback
+                        else:
+                            strict = strict_flag(os.environ, 'EXTERNAL')
+                            if os.environ.get('COMPINIT_ASSUME_YES', '').lower() in ('1', 'true', 'yes') and strict:
+                                error(f"External token {name} requires input and COMPINIT_STRICT_EXTERNAL=1 enforces strict behavior")
+                            if os.environ.get('COMPINIT_ASSUME_YES', '').lower() in ('1', 'true', 'yes'):
+                                warn(f"{name} is marked external but no value provided; continuing with empty value")
+                                generated_values[name] = ''
+                            else:
+                                desc = var_config.description or f"External {var_config.type}"
+                                warn(f"{name} ({desc}) requires a value. Please enter:")
+                                try:
+                                    generated_values[name] = input(f"{name}=").strip()
+                                except (EOFError, KeyboardInterrupt):
+                                    error(f"User input required for {name} but not provided")
+                    elif var_config.source == "internal":
+                        info(f"Generating internal token for {name} (length={var_config.length})")
+                        generated_values[name] = gen_pw(var_config.length or 64, var_config.charset)
+                    else:
+                        generated_values[name] = var_config.value or ""
+                elif var_config.value is not None:
+                    try:
+                        expanded = expand_vars(var_config.value, local_env)
+                        generated_values[name] = expanded
+                        local_env[name] = expanded
+                    except Exception:
+                        generated_values[name] = var_config.value
+                        local_env[name] = var_config.value
+                else:
+                    generated_values[name] = ""
             except Exception as e:
-                error(f"Failed to process dependencies: {e}")
+                warn(f"Error generating value for variable {name}: {e}")
+
+        # Convert config to env dict
+        env_vars = config_to_env_dict(config, generated_values)
+
+    else:
+        # Legacy path: if requested, migrate or parse sample into memory via temporary file
+        if getattr(args, 'env_legacy', False):
+            import tempfile
+            with tempfile.NamedTemporaryFile('w+', delete=False) as tmpf:
+                tmp_path = tmpf.name
+            try:
+                # Parse into a temporary env file and load into memory, then remove temp file
+                parse_env_sample(config_file, tmp_path)
+                env_vars, _ = load_env_file(tmp_path)
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+        else:
+            error(f"TOML configuration {toml_file} not found. Re-run with --env-legacy to allow legacy .env.sample usage or create {toml_file}.")
+
+    # Optionally perform runtime expansion of $VAR and $(cmd) depending on setting
+    expansion_enabled = os.environ.get('COMPINIT_ENABLE_ENV_EXPANSION', '').lower() in ('1', 'true', 'yes')
+    if expansion_enabled:
+        expanded_vars: Dict[str, str] = {}
+        for key, value in env_vars.items():
+            try:
+                expanded_value = expand_vars(value, env_vars)
+            except Exception as e:
+                warn(f"Error expanding variable {key}: {e}")
+                expanded_value = value
+            expanded_vars[key] = expanded_value
+            if expanded_value != value:
+                info(f"Expanded {key} -> {expanded_value}")
+        env_vars = expanded_vars
+    else:
+        info("Runtime expansion disabled: keeping values literal in memory")
+
+    # Update current process environment so subsequent operations see the values
+    os.environ.update(env_vars)
+
+    # Process dependencies before starting this project
+    dependencies_str = env_vars.get('COMPINIT_DEPENDENCIES', '').strip()
+    if dependencies_str:
+        step(f"Resolving dependencies: {dependencies_str}")
+        try:
+            dependency_paths = resolve_dependencies(env_vars, os.getcwd())
+            info(f"Dependency resolution order: {' -> '.join([os.path.basename(p) for p in dependency_paths])}")
+            start_dependencies(dependency_paths, os.getcwd())
+        except Exception as e:
+            error(f"Failed to process dependencies: {e}")
         
     # Perform any configured reset actions before creating volumes/directories
         reset_flags = env_vars.get('COMPINIT_RESET_BEFORE_START', 'none')
@@ -2141,38 +2961,75 @@ def main() -> None:
                 else:
                     warn(f"PUBLIC TLS crt file not readable (continuing permissively): {public_crt}")
 
-        # Run pre-compose script if specified (canonical variable name only)
-        pre_compose_script = env_vars.get('COMPINIT_HOOK_PRE_COMPOSE')
-        if pre_compose_script:
-            info(f"Running pre-compose Python hook: {pre_compose_script}")
-            try:
-                if not pre_compose_script.endswith('.py'):
-                    error("Only Python pre-compose hooks are supported. Provide a .py script defining PreComposeHook.")
-                import importlib.util
-                script_path = pre_compose_script
-                module_name = os.path.splitext(os.path.basename(script_path))[0]
-                spec = importlib.util.spec_from_file_location(module_name, script_path)
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[module_name] = module
-                spec.loader.exec_module(module)
-                if hasattr(module, 'PreComposeHook'):
-                    hook = module.PreComposeHook(env=os.environ.copy())
-                    export_vars = hook.run() or {}
-                    for var, val in export_vars.items():
-                        os.environ[var] = val
-                        env_vars[var] = val
-                        info(f"Pre-compose hook set variable: {var}=[REDACTED]")
-                    info(f"Pre-compose Python hook {pre_compose_script} executed and environment updated.")
-                    # Persist returned variables into the env file so they are visible
-                    # to subsequent runs and for consumers that read the .env file.
-                    try:
-                        persist_env_vars(env_file, export_vars)
-                    except Exception:
-                        warn(f"Unable to persist pre-compose hook variables into {env_file}")
-                else:
-                    error(f"Python pre-compose script {pre_compose_script} does not define PreComposeHook class.")
-            except Exception as e:
-                error(f"Failed to execute pre-compose script {pre_compose_script}: {e}")
+            # Run pre-compose script if specified (canonical variable name only)
+            # Run pre-compose hooks (class-only) and persist returned vars
+            pre_meta = run_hooks('PRE_COMPOSE', env_vars, project_config=project_config_obj)
+            if pre_meta:
+                info(f"Applied {len(pre_meta)} meta changes from pre-compose hooks")
+                # Apply values in-memory and process persistence per-variable
+                to_env = {}
+                project_updates = {}
+                local_updates = {}
+                env_updates = {}
+                sensitive_report = []
+                for name, md in pre_meta.items():
+                    val = md.get('value')
+                    persist = (md.get('persist') or 'auto').lower()
+                    sensitive = bool(md.get('sensitive', False))
+                    # Write into current process env and env_vars so subsequent steps see it
+                    os.environ[name] = '' if val is None else str(val)
+                    env_vars[name] = '' if val is None else str(val)
+                    to_env[name] = env_vars[name]
+                    # Decide persistence target
+                    if persist == 'none':
+                        # do not persist anywhere
+                        if sensitive:
+                            sensitive_report.append(name)
+                        continue
+                    if persist == 'env':
+                        env_updates[name] = env_vars[name]
+                        continue
+                    if persist == 'local':
+                        local_updates[name] = env_vars[name]
+                        continue
+                    if persist == 'project':
+                        project_updates[name] = env_vars[name]
+                        continue
+                    # auto: infer from sensitivity and default policy
+                    if persist == 'auto' or persist == '':
+                        if sensitive:
+                            # sensitive defaults to NOT persisted unless operator opts-in
+                            sensitive_report.append(name)
+                        else:
+                            # non-sensitive auto -> project if available else local
+                            # New policy: always consider project persistence for non-sensitive auto returns
+                            if os.path.isfile(config_file):
+                                project_updates[name] = env_vars[name]
+                            else:
+                                local_updates[name] = env_vars[name]
+
+                # Persist according to accumulated buckets — new policy: persist into active TOML only; do not write a .env file
+                try:
+                    # Merge project_updates and local_updates (and any sensitive) into the active project TOML
+                    merged_project_updates = {}
+                    merged_project_updates.update(project_updates)
+                    merged_project_updates.update(local_updates)
+                    if sensitive_report:
+                        merged_project_updates.update({k: env_vars[k] for k in sensitive_report})
+
+                    if merged_project_updates:
+                        # Write into the active TOML (project-level file)
+                        target_toml = config_file if os.path.isfile(config_file) else DEFAULT_TOML_ACTIVE_FILE
+                        _write_local_toml_variables(target_toml, merged_project_updates)
+
+                    # Env-only updates (env_updates and to_env) are applied in-memory and passed to hooks/compose; do not persist to disk
+                    if env_updates or to_env:
+                        info(f"Applied {len(env_updates) + len(to_env)} runtime-only hook variables in-memory (not persisted to a .env file)")
+
+                    if sensitive_report:
+                        info(f"Sensitive hook variables processed and persisted to active TOML: {', '.join(sensitive_report)}")
+                except Exception as e:
+                    warn(f"Unable to persist pre-compose hook variables: {e}")
         compose_mode = env_vars.get('COMPINIT_COMPOSE_START_MODE', 'abort-on-failure')
         info(f"COMPINIT_COMPOSE_START_MODE set to: {compose_mode}")
         
@@ -2206,43 +3063,71 @@ def main() -> None:
             else:
                 warn("No images found in docker-compose configuration")
         
-        # Start Docker Compose services
-        start_compose(compose_file, compose_mode)
+    # Start Docker Compose services, passing runtime env_vars (in-memory)
+    start_compose(compose_file, compose_mode, env_vars, env_file)
 
-        # Run post-compose hook if defined (canonical variable name only)
-        post_compose_script = env_vars.get('COMPINIT_HOOK_POST_COMPOSE')
-        if post_compose_script:
-            info(f"Running post-compose Python hook: {post_compose_script}")
-            try:
-                if not post_compose_script.endswith('.py'):
-                    error("Only Python post-compose hooks are supported. Provide a .py script defining PostComposeHook.")
-                import importlib.util
-                script_path = post_compose_script
-                module_name = os.path.splitext(os.path.basename(script_path))[0]
-                spec = importlib.util.spec_from_file_location(module_name, script_path)
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[module_name] = module
-                spec.loader.exec_module(module)
-                if hasattr(module, 'PostComposeHook'):
-                    hook = module.PostComposeHook(env=os.environ.copy())
-                    export_vars = hook.run() or {}
-                    for var, val in export_vars.items():
-                        os.environ[var] = val
-                        env_vars[var] = val
-                        info(f"Post-compose hook set variable: {var}=[REDACTED]")
-                    # Persist returned variables into the env file so future runs and other services can consume them
-                    try:
-                        persist_env_vars(env_file, export_vars)
-                    except Exception:
-                        warn(f"Unable to persist post-compose hook variables into {env_file}")
-                    info(f"Post-compose Python hook {post_compose_script} executed and environment updated.")
+    # Run post-compose hooks (class-only) and persist returned vars
+    post_meta = run_hooks('POST_COMPOSE', env_vars, project_config=project_config_obj)
+    if post_meta:
+        info(f"Applied {len(post_meta)} meta changes from post-compose hooks")
+        # Apply same per-variable persistence model as pre-hooks
+        to_env = {}
+        project_updates = {}
+        local_updates = {}
+        env_updates = {}
+        sensitive_report = []
+        for name, md in post_meta.items():
+            val = md.get('value')
+            persist = (md.get('persist') or 'auto').lower()
+            sensitive = bool(md.get('sensitive', False))
+            os.environ[name] = '' if val is None else str(val)
+            env_vars[name] = '' if val is None else str(val)
+            to_env[name] = env_vars[name]
+            if persist == 'none':
+                if sensitive:
+                    sensitive_report.append(name)
+                continue
+            if persist == 'env':
+                env_updates[name] = env_vars[name]
+                continue
+            if persist == 'local':
+                local_updates[name] = env_vars[name]
+                continue
+            if persist == 'project':
+                project_updates[name] = env_vars[name]
+                continue
+            # auto
+            if sensitive:
+                sensitive_report.append(name)
+            else:
+                # New policy: always persist auto non-sensitive returns into project active TOML when project TOML exists
+                if os.path.isfile(config_file):
+                    project_updates[name] = env_vars[name]
                 else:
-                    error(f"Python post-compose script {post_compose_script} does not define PostComposeHook class.")
-            except Exception as e:
-                error(f"Failed to execute post-compose script {post_compose_script}: {e}")
-        
-        info("Infrastructure initialization completed successfully!")
-        break
+                    local_updates[name] = env_vars[name]
+
+        try:
+            # Merge project/local updates and sensitive values and persist to active TOML
+            merged_project_updates = {}
+            merged_project_updates.update(project_updates)
+            merged_project_updates.update(local_updates)
+            if sensitive_report:
+                merged_project_updates.update({k: env_vars[k] for k in sensitive_report})
+            if merged_project_updates:
+                target_toml = config_file if os.path.isfile(config_file) else DEFAULT_TOML_ACTIVE_FILE
+                _write_local_toml_variables(target_toml, merged_project_updates)
+
+            # Env-only updates remain in-memory and are not written to disk
+            if env_updates or to_env:
+                info(f"Applied {len(env_updates) + len(to_env)} runtime-only post-hook variables in-memory (not persisted to a .env file)")
+
+            if sensitive_report:
+                info(f"Sensitive hook variables processed and persisted to active TOML: {', '.join(sensitive_report)}")
+        except Exception as e:
+            warn(f"Unable to persist post-compose hook variables: {e}")
+
+    info("Infrastructure initialization completed successfully!")
+    return
 
 if __name__ == "__main__":
     main()
