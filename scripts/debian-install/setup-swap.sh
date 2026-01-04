@@ -222,7 +222,7 @@ install_dependencies() {
     # Essential packages
     local packages=(
         util-linux
-        bc
+        gawk
         sysstat
         curl
     )
