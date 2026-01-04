@@ -5,13 +5,27 @@
 #
 # Supported Disk Layouts for Partition-Based Swap:
 # 1. MINIMAL ROOT: Small root partition (~9GB) with remaining unallocated space
-#    - Simply appends swap partition to free space
-#    - No filesystem resizing needed
+#    - Goal: Use FULL disk - extend root partition, place swap at END of disk
+#    - Process: Extend root to use most of disk, reserve space at end for swap
+#    - Can use either dump-modify-write OR classic partition editing
+#    - No filesystem resizing needed (only extension)
 # 2. FULL ROOT: Root partition uses entire disk
 #    - Shrinks root partition (partition table + filesystem)
-#    - Adds swap partition to reclaimed space
+#    - Adds swap partition to reclaimed space at END of disk
 #    - Requires filesystem that supports shrinking (ext4, btrfs)
 #    - XFS not supported (cannot shrink)
+#
+# Swap Backing Storage Options:
+# - Direct swap partitions: Format partition as swap (type 82/Linux swap)
+# - Ext4-backed swap: Format partition as ext4, mount, create swap file on it
+#   (provides flexibility but adds filesystem overhead)
+#
+# ZSWAP Multi-Device I/O:
+# - ZSWAP automatically uses ALL configured swap devices for writeback
+# - Kernel swap subsystem distributes I/O across devices with EQUAL priority
+# - Multiple swap files/partitions = natural I/O striping (round-robin)
+# - No special ZSWAP configuration needed - works automatically
+# - Benefit: Multiple I/O streams improve concurrency and throughput
 #
 # Partition Management Notes:
 # - Uses sfdisk for scripted partition operations
@@ -39,6 +53,7 @@ TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 USE_PARTITION="${USE_PARTITION:-no}"  # yes/no - use partition instead of files
 SWAP_PARTITION_SIZE_GB="${SWAP_PARTITION_SIZE_GB:-auto}"  # Size for partition-based swap
+SWAP_BACKING="${SWAP_BACKING:-direct}"  # direct (native swap) or ext4 (filesystem-backed)
 EXTEND_ROOT="${EXTEND_ROOT:-yes}"  # yes/no - extend root partition after creating swap
 
 # Directories
@@ -766,57 +781,134 @@ create_swap_partition() {
         return 1
     fi
     
-    # Format as swap
-    # Note: Each mkswap call generates a new UUID for the swap device
-    log_info "Formatting ${SWAP_PARTITION} as swap..."
-    if mkswap --verbose "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
-        log_success "Swap partition formatted successfully"
-    else
-        log_error "Failed to format swap partition"
-        return 1
-    fi
-    
-    # Get PARTUUID for fstab (more stable than UUID which changes on each mkswap)
-    # PARTUUID is the partition UUID, UUID is the filesystem/swap UUID
-    SWAP_PARTUUID=$(blkid "$SWAP_PARTITION" | sed -E 's/.*(PARTUUID="[^"]+").*/\1/' | tr -d '"')
-    
-    if [ -z "$SWAP_PARTUUID" ]; then
-        log_warn "Could not get PARTUUID, using device path"
-        SWAP_PARTUUID="$SWAP_PARTITION"
-    else
-        log_info "Swap PARTUUID: $SWAP_PARTUUID"
-    fi
-    
-    # Activate swap
-    log_info "Activating swap partition..."
-    if swapon --verbose -p "$SWAP_PRIORITY" "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
-        log_success "Swap partition activated"
-    else
-        log_error "Failed to activate swap partition"
-        return 1
-    fi
-    
-    # Add to fstab using PARTUUID (more stable than UUID which changes on mkswap)
-    log_info "Adding swap to /etc/fstab..."
-    if echo "$SWAP_PARTUUID" | grep -q "^/dev/"; then
-        # Using device path as fallback
-        if ! grep -q "$SWAP_PARTITION" /etc/fstab 2>/dev/null; then
-            echo "$SWAP_PARTITION none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
-            log_success "Added to /etc/fstab using device path"
+    # Format and activate based on backing type
+    if [ "$SWAP_BACKING" = "ext4" ]; then
+        # Ext4-backed swap: format as ext4, mount, create swap files
+        log_info "Using ext4-backed swap (filesystem with swap files)"
+        
+        # Format as ext4
+        log_info "Formatting ${SWAP_PARTITION} as ext4..."
+        if mkfs.ext4 -L "swap-backing" "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
+            log_success "Ext4 filesystem created successfully"
         else
-            log_info "Already in /etc/fstab"
+            log_error "Failed to create ext4 filesystem"
+            return 1
         fi
-    else
-        # Using PARTUUID
-        if ! grep -q "$SWAP_PARTUUID" /etc/fstab 2>/dev/null; then
-            echo "PARTUUID=$SWAP_PARTUUID none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
-            log_success "Added to /etc/fstab using PARTUUID"
+        
+        # Create mount point
+        SWAP_MOUNT="/mnt/swap-backing"
+        mkdir -p "$SWAP_MOUNT"
+        
+        # Mount the partition
+        log_info "Mounting ${SWAP_PARTITION} at ${SWAP_MOUNT}..."
+        if mount "$SWAP_PARTITION" "$SWAP_MOUNT" 2>&1 | tee -a "$LOG_FILE"; then
+            log_success "Partition mounted successfully"
         else
-            log_info "Already in /etc/fstab"
+            log_error "Failed to mount partition"
+            return 1
         fi
+        
+        # Add to fstab for persistent mount
+        SWAP_PARTUUID=$(blkid "$SWAP_PARTITION" | sed -E 's/.*(PARTUUID="[^"]+").*/\1/' | tr -d '"')
+        if [ -n "$SWAP_PARTUUID" ] && ! grep -q "$SWAP_PARTUUID" /etc/fstab 2>/dev/null; then
+            echo "PARTUUID=$SWAP_PARTUUID ${SWAP_MOUNT} ext4 defaults 0 2" >> /etc/fstab
+            log_success "Added mount to /etc/fstab"
+        fi
+        
+        # Create swap files on the ext4 partition
+        log_info "Creating ${SWAP_FILES} swap files on ext4 partition..."
+        local SWAP_FILE_SIZE_GB=$((SWAP_PARTITION_SIZE_GB / SWAP_FILES))
+        
+        for i in $(seq 1 "$SWAP_FILES"); do
+            local swapfile="${SWAP_MOUNT}/swapfile${i}"
+            
+            log_info "Creating ${swapfile} (${SWAP_FILE_SIZE_GB}GB)..."
+            
+            # Use fallocate for speed
+            if fallocate -l "${SWAP_FILE_SIZE_GB}G" "$swapfile" 2>/dev/null; then
+                log_debug "Used fallocate for $swapfile"
+            else
+                # Fallback to dd if fallocate not supported
+                log_debug "Using dd for $swapfile (slower)..."
+                dd if=/dev/zero of="$swapfile" bs=1M count=$((SWAP_FILE_SIZE_GB * 1024)) status=progress 2>&1 | tee -a "$LOG_FILE"
+            fi
+            
+            # Set permissions
+            chmod 600 "$swapfile"
+            
+            # Format as swap
+            mkswap "$swapfile" 2>&1 | tee -a "$LOG_FILE"
+            
+            # Activate with same priority (enables round-robin I/O striping)
+            swapon -p "$SWAP_PRIORITY" "$swapfile" 2>&1 | tee -a "$LOG_FILE"
+            
+            # Add to fstab
+            if ! grep -q "$swapfile" /etc/fstab 2>/dev/null; then
+                echo "$swapfile none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+            fi
+            
+            log_success "Swap file ${i}/${SWAP_FILES} created and activated"
+        done
+        
+        log_success "Ext4-backed swap setup complete: ${SWAP_FILES} files on ${SWAP_PARTITION}"
+        log_info "Note: All swap files have equal priority (${SWAP_PRIORITY}) for I/O striping"
+        
+    else
+        # Direct swap: format partition as native swap
+        log_info "Using direct swap (native swap partition)"
+        
+        # Format as swap
+        # Note: Each mkswap call generates a new UUID for the swap device
+        log_info "Formatting ${SWAP_PARTITION} as swap..."
+        if mkswap --verbose "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
+            log_success "Swap partition formatted successfully"
+        else
+            log_error "Failed to format swap partition"
+            return 1
+        fi
+        
+        # Get PARTUUID for fstab (more stable than UUID which changes on each mkswap)
+        # PARTUUID is the partition UUID, UUID is the filesystem/swap UUID
+        SWAP_PARTUUID=$(blkid "$SWAP_PARTITION" | sed -E 's/.*(PARTUUID="[^"]+").*/\1/' | tr -d '"')
+        
+        if [ -z "$SWAP_PARTUUID" ]; then
+            log_warn "Could not get PARTUUID, using device path"
+            SWAP_PARTUUID="$SWAP_PARTITION"
+        else
+            log_info "Swap PARTUUID: $SWAP_PARTUUID"
+        fi
+        
+        # Activate swap
+        log_info "Activating swap partition..."
+        if swapon --verbose -p "$SWAP_PRIORITY" "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
+            log_success "Swap partition activated"
+        else
+            log_error "Failed to activate swap partition"
+            return 1
+        fi
+        
+        # Add to fstab using PARTUUID (more stable than UUID which changes on mkswap)
+        log_info "Adding swap to /etc/fstab..."
+        if echo "$SWAP_PARTUUID" | grep -q "^/dev/"; then
+            # Using device path as fallback
+            if ! grep -q "$SWAP_PARTITION" /etc/fstab 2>/dev/null; then
+                echo "$SWAP_PARTITION none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+                log_success "Added to /etc/fstab using device path"
+            else
+                log_info "Already in /etc/fstab"
+            fi
+        else
+            # Using PARTUUID
+            if ! grep -q "$SWAP_PARTUUID" /etc/fstab 2>/dev/null; then
+                echo "PARTUUID=$SWAP_PARTUUID none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+                log_success "Added to /etc/fstab using PARTUUID"
+            else
+                log_info "Already in /etc/fstab"
+            fi
+        fi
+        
+        log_success "Direct swap partition setup complete: ${SWAP_PARTITION} (${SWAP_PARTITION_SIZE_GB}GB)"
     fi
-    
-    log_success "Swap partition setup complete: ${SWAP_PARTITION} (${SWAP_PARTITION_SIZE_GB}GB)"
     
     return 0
 }

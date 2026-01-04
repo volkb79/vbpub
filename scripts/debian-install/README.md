@@ -204,6 +204,7 @@ SWAP_ARCH=7 USE_PARTITION=yes EXTEND_ROOT=yes ./setup-swap.sh
 | `ZFS_POOL` | `tank` | ZFS pool name for zvol (arch 5 & 6) |
 | `USE_PARTITION` | `no` | Use partition instead of files (yes/no) |
 | `SWAP_PARTITION_SIZE_GB` | `auto` | Size for swap partition |
+| `SWAP_BACKING` | `direct` | Swap backing: `direct` (native swap) or `ext4` (filesystem-backed) |
 | `EXTEND_ROOT` | `yes` | Extend root partition after creating swap (yes/no) |
 | `TELEGRAM_BOT_TOKEN` | - | Telegram bot token for notifications |
 | `TELEGRAM_CHAT_ID` | - | Telegram chat ID for notifications |
@@ -218,6 +219,52 @@ Examples:
 - `SWAP_TOTAL_GB=8 SWAP_FILES=4` → 4 files of 2GB each
 
 **Why 8 files?** Enables concurrent I/O operations across multiple swap devices, improving performance under high memory pressure. The kernel uses round-robin allocation across equal-priority devices.
+
+### Swap Backing Options
+
+When using partition-based swap (`USE_PARTITION=yes`), you can choose between two backing types:
+
+**Direct Swap (`SWAP_BACKING=direct`)** - Default
+- Partition formatted as native swap (type 82/Linux swap)
+- Most efficient - no filesystem overhead
+- Single partition or multiple partitions
+- Best for most use cases
+
+**Ext4-Backed Swap (`SWAP_BACKING=ext4`)**
+- Partition formatted as ext4 filesystem
+- Multiple swap files created on the ext4 partition
+- Provides flexibility (can mix swap and other data)
+- Adds filesystem overhead but enables advanced features
+- Useful for dynamic swap management
+
+**Example:**
+```bash
+# Direct swap (single native swap partition)
+SWAP_ARCH=3 USE_PARTITION=yes SWAP_BACKING=direct ./setup-swap.sh
+
+# Ext4-backed (multiple swap files on ext4 partition)
+SWAP_ARCH=3 USE_PARTITION=yes SWAP_BACKING=ext4 SWAP_FILES=8 ./setup-swap.sh
+```
+
+### ZSWAP and Multi-Device I/O Striping
+
+**Important:** ZSWAP automatically benefits from multiple swap devices!
+
+- **ZSWAP uses ALL configured swap devices** for writeback when its compressed pool fills
+- **Kernel swap subsystem handles I/O distribution** across devices with equal priority
+- **Multiple swap files/partitions = automatic I/O striping** (round-robin)
+- **No special ZSWAP configuration needed** - it works transparently
+- **Equal priority is key**: All swap devices with the same priority get round-robin I/O
+
+**Performance benefit:**
+- 8 swap files/partitions with equal priority → 8 parallel I/O streams
+- Improves throughput and reduces latency under memory pressure
+- ZSWAP compressed pool + striped backing storage = optimal performance
+
+**Technical details:**
+- ZSWAP has no configurable I/O threads - it uses kernel's swap I/O subsystem
+- I/O striping happens at the kernel swap layer, transparent to ZSWAP
+- Works with files, partitions, or mixed configurations
 
 ### Dynamic Sizing
 
@@ -464,11 +511,15 @@ The toolkit includes full partition management supporting two common VM disk lay
 ### Supported Disk Layouts
 
 **1. Minimal Root Layout** (e.g., 9GB root with 500GB free)
-- Root partition uses only a small portion of disk
-- Plenty of unallocated space after root partition
-- **Strategy:** Simply append swap partition to free space
-- **Advantages:** No filesystem resizing needed, safe and fast
+- **Starting point:** Root partition uses only a small portion of disk (e.g., 9GB)
+- **Goal:** Use FULL disk - extend root partition, place swap at END
+- **Strategy:** 
+  - Option A: Extend root to use most of disk, reserve space at end for swap
+  - Option B: Simply append swap to free space, optionally extend root later
+- **Methods:** Dump-modify-write OR classic partition editing (both supported)
+- **Advantages:** No filesystem shrinking needed (only extension), safe and fast
 - **Example:** Debian minimal install with "small layout for individual use"
+- **Result:** Root partition expanded, swap partitions at end of disk
 
 **2. Full Root Layout** (root uses entire disk)
 - Root partition takes all available disk space
@@ -503,14 +554,20 @@ The script automatically detects the layout and applies the appropriate strategy
 ### Partition Management Examples
 
 ```bash
-# Minimal root layout - append swap to free space
-sudo SWAP_ARCH=3 USE_PARTITION=yes SWAP_PARTITION_SIZE_GB=16 ./setup-swap.sh
+# Direct swap partition (native swap, most efficient)
+sudo SWAP_ARCH=3 USE_PARTITION=yes SWAP_BACKING=direct SWAP_PARTITION_SIZE_GB=16 ./setup-swap.sh
+
+# Ext4-backed swap (multiple files on ext4 partition)
+sudo SWAP_ARCH=3 USE_PARTITION=yes SWAP_BACKING=ext4 SWAP_PARTITION_SIZE_GB=32 SWAP_FILES=8 ./setup-swap.sh
+
+# Minimal root layout - extend root and add swap at end
+sudo SWAP_ARCH=3 USE_PARTITION=yes SWAP_PARTITION_SIZE_GB=16 EXTEND_ROOT=yes ./setup-swap.sh
 
 # Full root layout - shrink root and add swap (ext4/btrfs only)
 sudo SWAP_ARCH=3 USE_PARTITION=yes SWAP_PARTITION_SIZE_GB=32 ./setup-swap.sh
 
-# Architecture 7: ZRAM + partition overflow
-sudo SWAP_ARCH=7 USE_PARTITION=yes SWAP_PARTITION_SIZE_GB=16 ./setup-swap.sh
+# Architecture 7: ZRAM + partition overflow with ext4-backed swap
+sudo SWAP_ARCH=7 USE_PARTITION=yes SWAP_BACKING=ext4 SWAP_FILES=4 ./setup-swap.sh
 ```
 
 ### Safety Features
