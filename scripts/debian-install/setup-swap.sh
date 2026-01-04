@@ -44,7 +44,8 @@ log_step() { echo -e "${BLUE}[STEP]${NC} $*"; }
 
 # Get system identification
 get_system_id() {
-    local hostname=$(hostname)
+    # Get FQDN (fully qualified domain name)
+    local hostname=$(hostname -f 2>/dev/null || hostname)
     local ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "unknown")
     echo "${hostname} (${ip})"
 }
@@ -55,7 +56,9 @@ telegram_send() {
     [ -z "$TELEGRAM_CHAT_ID" ] && return 0
     local msg="$1"
     local system_id=$(get_system_id)
-    local prefixed_msg="<b>${system_id}</b>\n${msg}"
+    # Use actual newline in string, not \n escape
+    local prefixed_msg="<b>${system_id}</b>
+${msg}"
     curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
         -d "chat_id=${TELEGRAM_CHAT_ID}" \
         -d "text=${prefixed_msg}" \

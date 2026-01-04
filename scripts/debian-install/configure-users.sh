@@ -36,15 +36,9 @@ log_step() {
     echo ""
 }
 
-# Configure nano for a user
-configure_nano() {
-    local target_user="$1"
-    local target_home="$2"
-    local nanorc="${target_home}/.nanorc"
-    
-    log_info "Configuring nano for ${target_user}..."
-    
-    cat > "$nanorc" <<'EOF'
+# Nano configuration content
+get_nanorc_content() {
+    cat <<'EOF'
 # Nano Configuration
 # Visual width of tab
 set tabsize 4
@@ -73,26 +67,11 @@ set boldtext
 # Enable syntax highlighting
 include /usr/share/nano/*.nanorc
 EOF
-    
-    chown "${target_user}:${target_user}" "$nanorc" 2>/dev/null || true
-    chmod 644 "$nanorc"
-    
-    log_success "Nano configured for ${target_user}"
 }
 
-# Configure Midnight Commander for a user
-configure_mc() {
-    local target_user="$1"
-    local target_home="$2"
-    local mc_dir="${target_home}/.config/mc"
-    
-    log_info "Configuring Midnight Commander for ${target_user}..."
-    
-    # Create MC config directory
-    mkdir -p "$mc_dir"
-    
-    # Main MC configuration
-    cat > "${mc_dir}/ini" <<'EOF'
+# MC ini configuration content
+get_mc_ini_content() {
+    cat <<'EOF'
 [Midnight-Commander]
 skin=modarin256-defbg-thin
 shadows=false
@@ -131,9 +110,11 @@ source_codepage=Other_8_bit
 clipboard_store=
 clipboard_paste=
 EOF
-    
-    # Panel configuration
-    cat > "${mc_dir}/panels.ini" <<'EOF'
+}
+
+# MC panels configuration content
+get_mc_panels_content() {
+    cat <<'EOF'
 [New Left Panel]
 display=listing
 reverse=false
@@ -163,22 +144,11 @@ list_format=user
 [Dirs]
 current_is_left=true
 EOF
-    
-    chown -R "${target_user}:${target_user}" "$mc_dir" 2>/dev/null || true
-    chmod -R 755 "$mc_dir"
-    
-    log_success "Midnight Commander configured for ${target_user}"
 }
 
-# Configure iftop for a user
-configure_iftop() {
-    local target_user="$1"
-    local target_home="$2"
-    local iftoprc="${target_home}/.iftoprc"
-    
-    log_info "Configuring iftop for ${target_user}..."
-    
-    cat > "$iftoprc" <<'EOF'
+# iftop configuration content
+get_iftoprc_content() {
+    cat <<'EOF'
 # iftop Configuration
 # Show bar graphs
 show-bars: yes
@@ -207,24 +177,11 @@ port-display: on
 # Number of bars in histogram
 num-lines: 10
 EOF
-    
-    chown "${target_user}:${target_user}" "$iftoprc" 2>/dev/null || true
-    chmod 644 "$iftoprc"
-    
-    log_success "iftop configured for ${target_user}"
 }
 
-# Configure htop for a user
-configure_htop() {
-    local target_user="$1"
-    local target_home="$2"
-    local htop_dir="${target_home}/.config/htop"
-    
-    log_info "Configuring htop for ${target_user}..."
-    
-    mkdir -p "$htop_dir"
-    
-    cat > "${htop_dir}/htoprc" <<'EOF'
+# htop configuration content
+get_htoprc_content() {
+    cat <<'EOF'
 # htop Configuration
 fields=0 48 17 18 38 39 40 2 46 47 49 1
 sort_key=46
@@ -269,11 +226,71 @@ tree_view=0
 tree_view_always_by_pid=0
 all_branches_collapsed=0
 EOF
+}
+
+# Bash aliases content
+get_bash_aliases_content() {
+    cat <<'EOF'
+# Custom bash aliases
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+alias ls='ls --color=auto'
+alias grep='grep --color=auto'
+alias fgrep='fgrep --color=auto'
+alias egrep='egrep --color=auto'
+alias df='df -h'
+alias du='du -h'
+alias free='free -h'
+EOF
+}
+
+# Configure nano for a user/directory
+configure_nano() {
+    local target_dir="$1"
+    local nanorc="${target_dir}/.nanorc"
     
-    chown -R "${target_user}:${target_user}" "$htop_dir" 2>/dev/null || true
+    get_nanorc_content > "$nanorc"
+    chmod 644 "$nanorc"
+}
+
+# Configure Midnight Commander for a user/directory
+configure_mc() {
+    local target_dir="$1"
+    local mc_dir="${target_dir}/.config/mc"
+    
+    mkdir -p "$mc_dir"
+    get_mc_ini_content > "${mc_dir}/ini"
+    get_mc_panels_content > "${mc_dir}/panels.ini"
+    chmod -R 755 "$mc_dir"
+}
+
+# Configure iftop for a user/directory
+configure_iftop() {
+    local target_dir="$1"
+    local iftoprc="${target_dir}/.iftoprc"
+    
+    get_iftoprc_content > "$iftoprc"
+    chmod 644 "$iftoprc"
+}
+
+# Configure htop for a user/directory
+configure_htop() {
+    local target_dir="$1"
+    local htop_dir="${target_dir}/.config/htop"
+    
+    mkdir -p "$htop_dir"
+    get_htoprc_content > "${htop_dir}/htoprc"
     chmod -R 755 "$htop_dir"
+}
+
+# Configure bash aliases for a user/directory
+configure_bash_aliases() {
+    local target_dir="$1"
+    local bash_aliases="${target_dir}/.bash_aliases"
     
-    log_success "htop configured for ${target_user}"
+    get_bash_aliases_content > "$bash_aliases"
+    chmod 644 "$bash_aliases"
 }
 
 # Configure all tools for a user
@@ -288,10 +305,18 @@ configure_user() {
         return 1
     fi
     
-    configure_nano "$target_user" "$target_home"
-    configure_mc "$target_user" "$target_home"
-    configure_iftop "$target_user" "$target_home"
-    configure_htop "$target_user" "$target_home"
+    configure_nano "$target_home"
+    configure_mc "$target_home"
+    configure_iftop "$target_home"
+    configure_htop "$target_home"
+    configure_bash_aliases "$target_home"
+    
+    # Set ownership for user configs
+    if [ "$target_user" != "skel" ]; then
+        chown -R "${target_user}:${target_user}" "$target_home/.nanorc" \
+            "$target_home/.config" "$target_home/.iftoprc" \
+            "$target_home/.bash_aliases" 2>/dev/null || true
+    fi
     
     log_success "User ${target_user} configuration complete"
 }
@@ -302,66 +327,12 @@ configure_skel() {
     
     local skel_dir="/etc/skel"
     
-    # Configure nano
-    cat > "${skel_dir}/.nanorc" <<'EOF'
-set tabsize 4
-set softwrap
-set tabstospaces
-set mouse
-set linenumbers
-set smooth
-set autoindent
-set boldtext
-include /usr/share/nano/*.nanorc
-EOF
-    
-    # Configure MC
-    mkdir -p "${skel_dir}/.config/mc"
-    
-    cat > "${skel_dir}/.config/mc/ini" <<'EOF'
-[Midnight-Commander]
-skin=modarin256-defbg-thin
-shadows=false
-use_internal_view=true
-use_internal_edit=true
-EOF
-    
-    cat > "${skel_dir}/.config/mc/panels.ini" <<'EOF'
-[New Left Panel]
-list_format=user
-user_format=half type name | size | owner | group | perm | atime
-
-[New Right Panel]
-list_format=user
-user_format=half type name | size | owner | group | perm | atime
-
-[Dirs]
-current_is_left=true
-EOF
-    
-    # Configure iftop
-    cat > "${skel_dir}/.iftoprc" <<'EOF'
-show-bars: yes
-port-resolution: yes
-dns-resolution: no
-show-totals: yes
-sort: 2bit
-line-display: two-line
-port-display: on
-EOF
-    
-    # Configure htop
-    mkdir -p "${skel_dir}/.config/htop"
-    cat > "${skel_dir}/.config/htop/htoprc" <<'EOF'
-fields=0 48 17 18 38 39 40 2 46 47 49 1
-sort_key=46
-sort_direction=-1
-hide_kernel_threads=1
-show_program_path=1
-highlight_base_name=1
-enable_mouse=1
-color_scheme=0
-EOF
+    # Use the same configuration functions
+    configure_nano "$skel_dir"
+    configure_mc "$skel_dir"
+    configure_iftop "$skel_dir"
+    configure_htop "$skel_dir"
+    configure_bash_aliases "$skel_dir"
     
     log_success "/etc/skel configured for new users"
 }

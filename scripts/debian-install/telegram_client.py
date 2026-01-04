@@ -30,8 +30,16 @@ class TelegramClient:
         self.system_id = self._get_system_id()
     
     def _get_system_id(self):
-        """Get system identification (hostname + IP)"""
-        hostname = socket.gethostname()
+        """Get system identification (FQDN + IP)"""
+        # Get FQDN (fully qualified domain name)
+        try:
+            hostname = socket.getfqdn()
+            # If getfqdn() returns localhost or similar, fall back to gethostname()
+            if hostname in ('localhost', 'localhost.localdomain', ''):
+                hostname = socket.gethostname()
+        except:
+            hostname = socket.gethostname()
+        
         try:
             # Get primary IP
             result = subprocess.run(
