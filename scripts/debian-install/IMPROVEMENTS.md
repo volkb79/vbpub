@@ -250,6 +250,56 @@ ${msg}"
 6. **Ease of Use:** Bash aliases, comprehensive documentation
 7. **Flexibility:** Modular scripts can be run independently
 8. **Production Ready:** All syntax errors fixed, proper error handling
+9. **Intelligent Partitioning:** Auto-detects disk layout, handles both scenarios safely
+
+## Disk Layout Support
+
+### Two Supported Scenarios
+
+**Scenario 1: Minimal Root Layout** (~9GB root, 500GB+ free)
+- **Detection:** Free space after root >= 10GB
+- **Strategy:** Simply append swap partition to free space
+- **Method:** `sfdisk --append`
+- **Safety:** No filesystem resizing needed - safest approach
+- **Use case:** Debian minimal install with "small layout for individual use"
+
+**Scenario 2: Full Root Layout** (root uses entire 512GB disk)
+- **Detection:** Free space after root < 10GB
+- **Strategy:** Dump-modify-write partition table, then shrink filesystem
+- **Method:**
+  1. `sfdisk --dump` saves current partition table
+  2. Parse and modify dump file (shrink root size, add swap entry)
+  3. `sfdisk --force --no-reread < modified.dump` writes entire table
+  4. `partprobe` updates kernel
+  5. `resize2fs` or filesystem-specific tool shrinks filesystem
+- **Supported filesystems:** ext4, ext3, ext2, btrfs
+- **Not supported:** XFS (cannot shrink - script refuses to proceed)
+- **Why this method:** Most reliable for complex changes on in-use disk
+
+### Implementation Details
+
+**Full root dump-modify-write process:**
+```bash
+# 1. Dump current partition table
+sfdisk --dump /dev/vda > current.dump
+
+# 2. Modify the dump (script does this programmatically):
+#    - Parse header lines (label, device, unit, etc.)
+#    - Keep non-root partitions unchanged
+#    - Modify root partition: change size= value
+#    - Add new swap partition entry with calculated start and size
+
+# 3. Write modified table
+sfdisk --force --no-reread /dev/vda < modified.dump
+
+# 4. Update kernel
+partprobe /dev/vda
+
+# 5. Shrink filesystem
+resize2fs /dev/vda3  # for ext4
+```
+
+This approach is safer than incremental modifications because it handles the entire partition table as an atomic operation.
 
 ## Compatibility
 

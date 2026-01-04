@@ -598,9 +598,10 @@ create_swap_partition() {
         
     else
         # Scenario 2: Full root - need to shrink root and add swap
+        # Best practice: Dump partition table, modify it, write it back as a complete unit
         log_info "Layout: Full root - shrinking root partition and adding swap"
         
-        # Calculate new root size (total - start - swap space - 1 for rounding)
+        # Calculate new root size (total - start - swap space - 2048 sectors buffer)
         SWAP_SIZE_SECTORS=$((SWAP_SIZE_MIB * 2048))
         NEW_ROOT_SIZE_SECTORS=$((DISK_SIZE_SECTORS - ROOT_START - SWAP_SIZE_SECTORS - 2048))
         NEW_ROOT_SIZE_MIB=$((NEW_ROOT_SIZE_SECTORS / 2048))
@@ -631,30 +632,64 @@ create_swap_partition() {
                 ;;
         esac
         
-        # First, resize the root partition in partition table
-        log_info "Step 1: Resizing root partition in partition table..."
-        if echo ",${NEW_ROOT_SIZE_MIB}M" | sfdisk --force --no-reread "/dev/$ROOT_DISK" -N"${ROOT_PART_NUM}" 2>&1 | tee -a "$LOG_FILE"; then
-            log_info "Root partition resized in partition table (ioctl error is expected)"
-        else
-            log_error "Failed to resize root partition"
-            return 1
-        fi
+        # Dump current partition table
+        log_info "Step 1: Dumping current partition table..."
+        PTABLE_DUMP="/tmp/ptable-current-$(date +%s).dump"
+        sfdisk --dump "/dev/$ROOT_DISK" > "$PTABLE_DUMP"
+        log_info "Current partition table saved to: $PTABLE_DUMP"
         
-        # Verify partition table
-        if ! sfdisk --verify "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
-            log_error "Partition table verification failed after root resize"
-            return 1
-        fi
+        # Create modified partition table
+        log_info "Step 2: Creating modified partition table..."
+        PTABLE_NEW="/tmp/ptable-new-$(date +%s).dump"
         
-        # Second, append swap partition
-        log_info "Step 2: Appending swap partition..."
-        SWAP_PART_NUM=$((ROOT_PART_NUM + 1))
+        # Parse and modify the partition table
+        # Keep header and non-root partitions, modify root partition, add swap partition
+        {
+            # Copy header lines (label, device, unit, etc.)
+            grep -E "^(label|label-id|device|unit|first-lba|last-lba|sector-size):" "$PTABLE_DUMP"
+            echo ""
+            
+            # Process partition entries
+            SWAP_PART_NUM=$((ROOT_PART_NUM + 1))
+            SWAP_START=$((ROOT_START + NEW_ROOT_SIZE_SECTORS))
+            
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^/dev/ ]]; then
+                    # Extract partition number from line
+                    PART_NUM=$(echo "$line" | grep -oE '[0-9]+' | head -1)
+                    
+                    if [ "$PART_NUM" = "$ROOT_PART_NUM" ]; then
+                        # Modify root partition - change size
+                        echo "$line" | sed -E "s/size= *[0-9]+/size=${NEW_ROOT_SIZE_SECTORS}/"
+                    else
+                        # Keep other partitions as-is
+                        echo "$line"
+                    fi
+                fi
+            done < "$PTABLE_DUMP"
+            
+            # Add swap partition
+            # Format: /dev/vdaN : start=X, size=Y, type=swap-uuid
+            SWAP_TYPE="0657FD6D-A4AB-43C4-84E5-0933C84B4F4F"  # Linux swap GUID
+            echo "${ROOT_PARTITION%[0-9]*}${SWAP_PART_NUM} : start=${SWAP_START}, size=${SWAP_SIZE_SECTORS}, type=${SWAP_TYPE}"
+            
+        } > "$PTABLE_NEW"
+        
+        log_info "Modified partition table saved to: $PTABLE_NEW"
+        log_info "Changes:"
+        log_info "  - Root partition (${ROOT_PART_NUM}): shrunk to ${NEW_ROOT_SIZE_SECTORS} sectors"
+        log_info "  - Swap partition (${SWAP_PART_NUM}): added at sector ${SWAP_START}, ${SWAP_SIZE_SECTORS} sectors"
+        
+        # Write modified partition table
+        log_info "Step 3: Writing modified partition table..."
         SWAP_PARTITION="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
         
-        if echo ",,S" | sfdisk --force --no-reread --append "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
-            log_info "Swap partition added to partition table"
+        if sfdisk --force --no-reread "/dev/$ROOT_DISK" < "$PTABLE_NEW" 2>&1 | tee -a "$LOG_FILE"; then
+            log_info "Modified partition table written (ioctl error is expected)"
         else
-            log_error "Failed to add swap partition"
+            log_error "Failed to write modified partition table"
+            log_error "Backup available at: $BACKUP_FILE"
+            log_info "To restore: sfdisk --force /dev/$ROOT_DISK < $BACKUP_FILE"
             return 1
         fi
     fi

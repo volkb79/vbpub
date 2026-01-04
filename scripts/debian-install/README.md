@@ -473,13 +473,15 @@ The toolkit includes full partition management supporting two common VM disk lay
 **2. Full Root Layout** (root uses entire disk)
 - Root partition takes all available disk space
 - No free space after root partition
-- **Strategy:** Shrink root partition, then add swap partition
-- **Process:**
-  1. Resize root partition in partition table
-  2. Append swap partition
-  3. Shrink root filesystem to match new partition size
+- **Strategy:** Dump partition table → modify → write back
+  1. Dump current partition table to file
+  2. Modify in-memory: shrink root partition size, add swap partition entry
+  3. Write entire modified table back to disk
+  4. Update kernel with partprobe
+  5. Shrink root filesystem to match new partition size
 - **Requirements:** Filesystem must support shrinking (ext4, btrfs)
 - **Not Supported:** XFS (cannot shrink)
+- **Why dump-modify-write:** Most reliable method for rewriting partition table on in-use disk
 
 The script automatically detects the layout and applies the appropriate strategy.
 
@@ -527,6 +529,11 @@ sudo SWAP_ARCH=7 USE_PARTITION=yes SWAP_PARTITION_SIZE_GB=16 ./setup-swap.sh
 - Always reports: "Re-reading the partition table failed: Device or resource busy"
 - This is **expected behavior** when disk is mounted
 - Kernel partition table updated with `partprobe` or `partx --update` after
+- **For full root scenario:** Uses dump-modify-write approach:
+  1. `sfdisk --dump` to save current table
+  2. Modify the dump file (change sizes, add partitions)
+  3. `sfdisk --force --no-reread < modified.dump` to write entire table
+  4. Most reliable for complex changes on in-use disk
 
 **PARTUUID vs UUID:**
 - PARTUUID: Partition UUID (stable, doesn't change)
