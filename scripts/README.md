@@ -9,6 +9,7 @@ scripts/
 ├── github/          # GitHub App authentication and repository management
 ├── utils/           # General-purpose utilities and tools
 ├── docker/          # Docker and container-related scripts
+├── debian-install/  # Debian swap configuration toolkit
 └── legacy/          # Legacy scripts with unique functionality (7 scripts)
 ```
 
@@ -183,6 +184,52 @@ compose-init-up.py --env-only --file docker-compose.yml
 - ✅ Host directory creation with proper permissions
 - ✅ Pre-compose hook integration
 - ✅ Comprehensive error handling and rollback
+
+### Debian Install Tools (`debian-install/`)
+
+#### Comprehensive Swap Configuration Toolkit
+**Purpose:** Production-ready swap configuration for Debian 12/13 systems with multiple architecture options.
+
+```bash
+# Quick start
+cd debian-install
+./bootstrap.sh        # Initial system setup
+./setup-swap.sh       # Configure swap (ZSWAP + files by default)
+./swap-monitor.sh     # Real-time monitoring
+```
+
+**Key Features:**
+- ✅ 7 swap architectures (ZRAM, ZSWAP, ZRAM writeback, traditional)
+- ✅ Comprehensive system analysis with KSM testing
+- ✅ Real-time monitoring with correct swap metrics
+- ✅ Benchmarking tools for performance comparison
+- ✅ Memory profiling with DAMON integration
+- ✅ Telegram notifications for system info and Geekbench
+- ✅ Complete technical documentation
+
+**Architecture Options:**
+- `zram` - Compressed swap in RAM
+- `zram-files` - ZRAM + disk swap (priority tiering)
+- `zram-writeback` - ZRAM with automatic disk overflow
+- `zswap` - Compressed cache + disk swap (RECOMMENDED)
+- `files` - Traditional swap files only
+- `zfs` - ZFS zvol with compression
+- `hybrid` - ZRAM + ZFS zvol
+
+**Scripts:**
+- `bootstrap.sh` - Initial VPS setup
+- `setup-swap.sh` - Main configuration script
+- `swap-monitor.sh` - Real-time monitoring
+- `analyze-memory.sh` - Quick memory analysis
+- `analyze-running-system.sh` - Comprehensive analysis
+- `benchmark.py` - Performance benchmarking
+- `sysinfo-notify.py` - Telegram notifications
+
+**Documentation:**
+- `README.md` - Quick start and usage guide
+- `SWAP_ARCHITECTURE.md` - Complete technical reference (1500+ lines)
+
+See [debian-install/README.md](debian-install/README.md) for complete documentation.
 
 ## 🔧 Configuration
 
