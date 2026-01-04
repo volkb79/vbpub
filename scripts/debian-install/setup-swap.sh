@@ -307,6 +307,11 @@ setup_zram() {
     log_info "ZRAM setup complete (priority: $ZRAM_PRIORITY)"
     
     # Add to systemd for persistence
+    # Use actual values at service creation time
+    local comp="$ZRAM_COMPRESSOR"
+    local size="$zram_size_bytes"
+    local prio="$ZRAM_PRIORITY"
+    
     cat > /etc/systemd/system/zram-swap.service <<EOF
 [Unit]
 Description=ZRAM Swap
@@ -315,7 +320,7 @@ After=local-fs.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/bash -c 'modprobe zram && echo ${ZRAM_COMPRESSOR} > /sys/block/zram0/comp_algorithm && echo ${zram_size_bytes} > /sys/block/zram0/disksize && mkswap /dev/zram0 && swapon -p ${ZRAM_PRIORITY} /dev/zram0'
+ExecStart=/bin/bash -c 'modprobe zram && echo $comp > /sys/block/zram0/comp_algorithm && echo $size > /sys/block/zram0/disksize && mkswap /dev/zram0 && swapon -p $prio /dev/zram0'
 ExecStop=/bin/bash -c 'swapoff /dev/zram0 && rmmod zram'
 
 [Install]

@@ -62,7 +62,7 @@ print_ksm_stats() {
     if [ "$pages_shared" -gt 0 ] && [ "$pages_sharing" -gt 0 ]; then
         local saved_pages=$((pages_sharing - pages_shared))
         local saved_kb=$((saved_pages * 4))
-        local saved_mb=$(echo "scale=2; $saved_kb / 1024" | bc)
+        local saved_mb=$(awk "BEGIN {printf \"%.2f\", $saved_kb / 1024}")
         
         echo ""
         echo -e "  ${GREEN}Memory saved: ${saved_mb} MB${NC}"

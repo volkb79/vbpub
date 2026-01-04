@@ -206,8 +206,8 @@ display_human() {
     # ZRAM status
     if [ "$ZRAM_ACTIVE" -eq 1 ]; then
         echo -e "${BOLD}ZRAM Status${NC}"
-        printf "  Original:   %'15d bytes (%.2f GB)\n" $ZRAM_ORIG_SIZE $(echo "scale=2; $ZRAM_ORIG_SIZE / 1024 / 1024 / 1024" | bc)
-        printf "  Compressed: %'15d bytes (%.2f GB)\n" $ZRAM_COMPR_SIZE $(echo "scale=2; $ZRAM_COMPR_SIZE / 1024 / 1024 / 1024" | bc)
+        printf "  Original:   %'15d bytes (%.2f GB)\n" $ZRAM_ORIG_SIZE $(awk "BEGIN {printf \"%.2f\", $ZRAM_ORIG_SIZE / 1024 / 1024 / 1024}")
+        printf "  Compressed: %'15d bytes (%.2f GB)\n" $ZRAM_COMPR_SIZE $(awk "BEGIN {printf \"%.2f\", $ZRAM_COMPR_SIZE / 1024 / 1024 / 1024}")
         printf "  Ratio:      %.2fx compression\n" $ZRAM_RATIO
         echo ""
     fi
@@ -238,7 +238,7 @@ display_human() {
     echo -e "${BOLD}Memory Pressure (PSI)${NC}"
     printf "  Some tasks stalled: %s%%\n" $PSI_SOME_AVG10
     printf "  All tasks stalled:  %s%%\n" $PSI_FULL_AVG10
-    if (( $(echo "$PSI_FULL_AVG10 > 0" | bc -l) )); then
+    if (( $(awk "BEGIN {print ($PSI_FULL_AVG10 > 0)}") )); then
         echo -e "  ${RED}⚠ Memory pressure detected!${NC}"
     fi
     echo ""
