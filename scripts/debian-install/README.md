@@ -7,10 +7,12 @@ A comprehensive toolkit for Debian 12/13 system initialization including swap co
 - **7 Swap Architectures**: ZRAM, ZSWAP, swap files/partitions, ZFS zvol, and combinations
 - **Intelligent Detection**: Automatic RAM, disk, and storage type detection with dynamic sizing
 - **Partition Management**: Create swap partitions at end of disk, extend root partition  
-- **User Configuration**: Automated setup for nano, Midnight Commander, iftop, htop
+- **User Configuration**: Automated setup for nano, Midnight Commander, iftop, htop, bash aliases
+- **APT Management**: Modern deb822 format with backports (priority 600) and testing repositories
+- **System Configuration**: Journald log retention, Docker installation with modern settings
 - **Performance Testing**: Geekbench integration and comprehensive swap benchmarking
 - **Real-time Monitoring**: Correct metrics (pgmajfault, writeback ratio, PSI)
-- **Telegram Integration**: Automated notifications with source attribution
+- **Telegram Integration**: Automated notifications with FQDN, file attachments, proper formatting
 
 ## Quick Start
 
@@ -202,6 +204,7 @@ SWAP_ARCH=7 USE_PARTITION=yes EXTEND_ROOT=yes ./setup-swap.sh
 | `ZFS_POOL` | `tank` | ZFS pool name for zvol (arch 5 & 6) |
 | `USE_PARTITION` | `no` | Use partition instead of files (yes/no) |
 | `SWAP_PARTITION_SIZE_GB` | `auto` | Size for swap partition |
+| `SWAP_BACKING` | `direct` | Swap backing: `direct` (native swap) or `ext4` (filesystem-backed) |
 | `EXTEND_ROOT` | `yes` | Extend root partition after creating swap (yes/no) |
 | `TELEGRAM_BOT_TOKEN` | - | Telegram bot token for notifications |
 | `TELEGRAM_CHAT_ID` | - | Telegram chat ID for notifications |
@@ -216,6 +219,52 @@ Examples:
 - `SWAP_TOTAL_GB=8 SWAP_FILES=4` → 4 files of 2GB each
 
 **Why 8 files?** Enables concurrent I/O operations across multiple swap devices, improving performance under high memory pressure. The kernel uses round-robin allocation across equal-priority devices.
+
+### Swap Backing Options
+
+When using partition-based swap (`USE_PARTITION=yes`), you can choose between two backing types:
+
+**Direct Swap (`SWAP_BACKING=direct`)** - Default
+- Partition formatted as native swap (type 82/Linux swap)
+- Most efficient - no filesystem overhead
+- Single partition or multiple partitions
+- Best for most use cases
+
+**Ext4-Backed Swap (`SWAP_BACKING=ext4`)**
+- Partition formatted as ext4 filesystem
+- Multiple swap files created on the ext4 partition
+- Provides flexibility (can mix swap and other data)
+- Adds filesystem overhead but enables advanced features
+- Useful for dynamic swap management
+
+**Example:**
+```bash
+# Direct swap (single native swap partition)
+SWAP_ARCH=3 USE_PARTITION=yes SWAP_BACKING=direct ./setup-swap.sh
+
+# Ext4-backed (multiple swap files on ext4 partition)
+SWAP_ARCH=3 USE_PARTITION=yes SWAP_BACKING=ext4 SWAP_FILES=8 ./setup-swap.sh
+```
+
+### ZSWAP and Multi-Device I/O Striping
+
+**Important:** ZSWAP automatically benefits from multiple swap devices!
+
+- **ZSWAP uses ALL configured swap devices** for writeback when its compressed pool fills
+- **Kernel swap subsystem handles I/O distribution** across devices with equal priority
+- **Multiple swap files/partitions = automatic I/O striping** (round-robin)
+- **No special ZSWAP configuration needed** - it works transparently
+- **Equal priority is key**: All swap devices with the same priority get round-robin I/O
+
+**Performance benefit:**
+- 8 swap files/partitions with equal priority → 8 parallel I/O streams
+- Improves throughput and reduces latency under memory pressure
+- ZSWAP compressed pool + striped backing storage = optimal performance
+
+**Technical details:**
+- ZSWAP has no configurable I/O threads - it uses kernel's swap I/O subsystem
+- I/O striping happens at the kernel swap layer, transparent to ZSWAP
+- Works with files, partitions, or mixed configurations
 
 ### Dynamic Sizing
 
@@ -243,7 +292,10 @@ The bootstrap script orchestrates complete system setup beyond just swap configu
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RUN_USER_CONFIG` | `yes` | Configure nano, mc, iftop, htop for all users |
+| `RUN_USER_CONFIG` | `yes` | Configure nano, mc, iftop, htop, bash aliases for all users |
+| `RUN_APT_CONFIG` | `yes` | Configure APT with deb822 format, backports, testing repos |
+| `RUN_JOURNALD_CONFIG` | `yes` | Configure journald log retention (200M max, 12 months) |
+| `RUN_DOCKER_INSTALL` | `no` | Install Docker from official repository with modern settings |
 | `RUN_GEEKBENCH` | `no` | Run Geekbench 6 and upload results (5-10 min) |
 | `RUN_BENCHMARKS` | `no` | Run comprehensive swap benchmarks |
 | `SEND_SYSINFO` | `yes` | Send system info to Telegram if configured |
@@ -256,19 +308,36 @@ The bootstrap script orchestrates complete system setup beyond just swap configu
    - Install nano, mc, iftop, htop
    - Configure for root and existing users
    - Set /etc/skel defaults for future users
-4. **Geekbench** (if RUN_GEEKBENCH=yes)
+   - Add bash aliases (ll, la, l, colored ls/grep)
+4. **APT configuration** (if RUN_APT_CONFIG=yes)
+   - Configure sources with deb822 format
+   - Add main, contrib, non-free, non-free-firmware
+   - Add backports with priority 600 (preferred by default)
+   - Add testing with priority 100 (visibility only)
+   - Configure APT settings (Debug::pkgPolicy, Show-Versions, AutomaticRemove)
+5. **Journald configuration** (if RUN_JOURNALD_CONFIG=yes)
+   - Set SystemMaxUse=200M, SystemKeepFree=500M
+   - Set SystemMaxFileSize=100M
+   - Set retention: 12 months, rotation: 1 month
+6. **Docker installation** (if RUN_DOCKER_INSTALL=yes)
+   - Add Docker official repository
+   - Install docker-ce, docker-compose-plugin, buildx
+   - Configure daemon.json with log-driver: local
+7. **Geekbench** (if RUN_GEEKBENCH=yes)
    - Download latest version for architecture
    - Run CPU and compute benchmarks
    - Upload to Geekbench Browser
    - Extract result URL and claim URL
-5. **Swap benchmarks** (if RUN_BENCHMARKS=yes)
+8. **Swap benchmarks** (if RUN_BENCHMARKS=yes)
    - Test block sizes, compression algorithms, allocators
    - Test concurrency scaling
    - Export optimal configuration
-6. **System info report** (if SEND_SYSINFO=yes)
+9. **System info report** (if SEND_SYSINFO=yes)
    - Collect hardware specs
    - Compile configuration details
    - Send formatted report via Telegram
+   - Attach detailed system info as file
+   - Attach bootstrap log as file
 
 ### Example: Complete System Setup
 
@@ -278,10 +347,104 @@ curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-i
   SWAP_ARCH=3 \
   SWAP_TOTAL_GB=16 \
   RUN_USER_CONFIG=yes \
+  RUN_APT_CONFIG=yes \
+  RUN_JOURNALD_CONFIG=yes \
+  RUN_DOCKER_INSTALL=yes \
   RUN_GEEKBENCH=yes \
   TELEGRAM_BOT_TOKEN=110201543:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw \
   TELEGRAM_CHAT_ID=123456789 \
   bash
+```
+
+## System Configuration
+
+### APT Configuration
+
+The `configure-apt.sh` script sets up APT sources using modern deb822 format with proper priorities:
+
+```bash
+# Run APT configuration
+sudo ./configure-apt.sh
+```
+
+**Features:**
+- **Main repository (stable)**: Priority 500 (default)
+  - Components: main, contrib, non-free, non-free-firmware
+  - Includes security updates
+- **Backports**: Priority 600 (preferred by default)
+  - Packages from backports are automatically used when available
+  - No need for `-t backports` flag
+- **Testing**: Priority 100 (visibility only)
+  - Available for checking upcoming versions
+  - Requires explicit `-t testing` to install
+- **APT settings**: `/etc/apt/apt.conf.d/99-custom.conf`
+  - Debug::pkgPolicy - Show repository priorities
+  - APT::Get::Show-Versions - Display version info
+  - APT::Get::AutomaticRemove - Clean up unused dependencies
+
+**Usage:**
+```bash
+# Install normally - will use backports if newer version available
+apt-get install package-name
+
+# Check which repository provides a package
+apt-cache policy package-name
+
+# Explicitly install from testing
+apt-get install -t testing package-name
+```
+
+### Journald Configuration
+
+The `configure-journald.sh` script sets up systemd journal log retention:
+
+```bash
+# Run journald configuration
+sudo ./configure-journald.sh
+```
+
+**Settings:**
+- SystemMaxUse=200M - Maximum disk space for logs
+- SystemKeepFree=500M - Minimum free space to maintain
+- SystemMaxFileSize=100M - Maximum size per log file
+- MaxRetentionSec=12month - Keep logs for 12 months
+- MaxFileSec=1month - Rotate logs monthly
+
+**Benefits:**
+- Prevents runaway log growth
+- Ensures disk space availability
+- Automatic rotation and cleanup
+
+### Docker Installation
+
+The `install-docker.sh` script installs Docker from official repositories:
+
+```bash
+# Run Docker installation
+sudo ./install-docker.sh
+```
+
+**Features:**
+- Official Docker repository (not distro packages)
+- Includes: docker-ce, docker-compose-plugin, buildx-plugin
+- Modern daemon.json configuration:
+  - log-driver: local (efficient, rotating logs)
+  - Max log size: 10M per container
+  - Max log files: 3 per container
+  - storage-driver: overlay2
+  - live-restore: enabled
+  - BuildKit: enabled
+  - Metrics endpoint: 127.0.0.1:9323
+
+**Post-install:**
+```bash
+# Add user to docker group (requires logout/login)
+sudo usermod -aG docker username
+
+# Verify installation
+docker --version
+docker compose version
+docker run --rm hello-world
 ```
 
 ## User Configuration
@@ -318,6 +481,13 @@ The `configure-users.sh` script sets up consistent environments for command-line
 - Tree view available
 - Mouse support enabled
 
+**bash** - Shell aliases
+- `ll` - ls -alF (detailed list)
+- `la` - ls -A (show hidden)
+- `l` - ls -CF (compact)
+- Colored ls, grep, fgrep, egrep
+- Human-readable df, du, free
+
 ### Application Scope
 
 - **Immediate:** Configures root and all existing users (UID ≥ 1000)
@@ -336,28 +506,96 @@ ls -la ~/.nanorc ~/.config/mc/ ~/.iftoprc ~/.config/htop/
 
 ## Partition Management
 
-The toolkit includes full partition management for systems with unallocated disk space.
+The toolkit includes full partition management supporting two common VM disk layouts.
+
+### Supported Disk Layouts
+
+**1. Minimal Root Layout** (e.g., 9GB root with 500GB free)
+- **Starting point:** Root partition uses only a small portion of disk (e.g., 9GB)
+- **Goal:** Use FULL disk - extend root partition, place swap at END
+- **Strategy:** 
+  - Option A: Extend root to use most of disk, reserve space at end for swap
+  - Option B: Simply append swap to free space, optionally extend root later
+- **Methods:** Dump-modify-write OR classic partition editing (both supported)
+- **Advantages:** No filesystem shrinking needed (only extension), safe and fast
+- **Example:** Debian minimal install with "small layout for individual use"
+- **Result:** Root partition expanded, swap partitions at end of disk
+
+**2. Full Root Layout** (root uses entire disk)
+- Root partition takes all available disk space
+- No free space after root partition
+- **Strategy:** Dump partition table → modify → write back
+  1. Dump current partition table to file
+  2. Modify in-memory: shrink root partition size, add swap partition entry
+  3. Write entire modified table back to disk
+  4. Update kernel with partprobe
+  5. Shrink root filesystem to match new partition size
+- **Requirements:** Filesystem must support shrinking (ext4, btrfs)
+- **Not Supported:** XFS (cannot shrink)
+- **Why dump-modify-write:** Most reliable method for rewriting partition table on in-use disk
+
+The script automatically detects the layout and applies the appropriate strategy.
 
 ### Supported Operations
 
 1. **Create swap partition at end of disk**
-   - Uses sfdisk for scripted partition creation
-   - Calculates proper sizes in MiB
+   - Auto-detects disk layout (minimal root vs. full root)
+   - For minimal root: Appends to free space
+   - For full root: Shrinks root, then appends
+   - Uses sfdisk for scripted operations
    - Formats as swap with mkswap
    - Activates and adds to /etc/fstab using PARTUUID
 
-2. **Extend root partition**
-   - Resizes partition table entry
-   - Extends filesystem (ext4/xfs/btrfs)
-   - Safe online resizing where supported
+2. **Filesystem resizing** (for full root layout)
+   - ext4/ext3/ext2: Supports online shrinking with resize2fs
+   - btrfs: Supports online resizing
+   - XFS: **Not supported** (cannot shrink, must use minimal root layout)
 
-### Partition Management Example
+### Partition Management Examples
 
 ```bash
-# Architecture 7: ZRAM + partition overflow with root extension
-sudo SWAP_ARCH=7 USE_PARTITION=yes EXTEND_ROOT=yes \
-  SWAP_PARTITION_SIZE_GB=16 ./setup-swap.sh
+# Direct swap partition (native swap, most efficient)
+sudo SWAP_ARCH=3 USE_PARTITION=yes SWAP_BACKING=direct SWAP_PARTITION_SIZE_GB=16 ./setup-swap.sh
+
+# Ext4-backed swap (multiple files on ext4 partition)
+sudo SWAP_ARCH=3 USE_PARTITION=yes SWAP_BACKING=ext4 SWAP_PARTITION_SIZE_GB=32 SWAP_FILES=8 ./setup-swap.sh
+
+# Minimal root layout - extend root and add swap at end
+sudo SWAP_ARCH=3 USE_PARTITION=yes SWAP_PARTITION_SIZE_GB=16 EXTEND_ROOT=yes ./setup-swap.sh
+
+# Full root layout - shrink root and add swap (ext4/btrfs only)
+sudo SWAP_ARCH=3 USE_PARTITION=yes SWAP_PARTITION_SIZE_GB=32 ./setup-swap.sh
+
+# Architecture 7: ZRAM + partition overflow with ext4-backed swap
+sudo SWAP_ARCH=7 USE_PARTITION=yes SWAP_BACKING=ext4 SWAP_FILES=4 ./setup-swap.sh
 ```
+
+### Safety Features
+
+- **Automatic layout detection:** Script detects which scenario applies
+- **Partition table backup:** Saved before any changes
+- **Verification:** Partition table verified after changes
+- **PARTUUID usage:** Stable across mkswap calls (UUID changes each time)
+- **Error handling:** Detailed error messages and rollback guidance
+- **XFS protection:** Refuses to proceed with full root + XFS
+
+### Technical Notes
+
+**sfdisk on in-use disk:**
+- Uses `--force --no-reread` flags together
+- Always reports: "Re-reading the partition table failed: Device or resource busy"
+- This is **expected behavior** when disk is mounted
+- Kernel partition table updated with `partprobe` or `partx --update` after
+- **For full root scenario:** Uses dump-modify-write approach:
+  1. `sfdisk --dump` to save current table
+  2. Modify the dump file (change sizes, add partitions)
+  3. `sfdisk --force --no-reread < modified.dump` to write entire table
+  4. Most reliable for complex changes on in-use disk
+
+**PARTUUID vs UUID:**
+- PARTUUID: Partition UUID (stable, doesn't change)
+- UUID: Filesystem/swap UUID (changes on each mkswap)
+- Use PARTUUID in /etc/fstab for swap partitions
 
 ### Manual Partition Operations
 
@@ -415,7 +653,35 @@ If sending to a channel:
 2. Use channel username with @ prefix: `@yourchannel`
 3. Or use numeric channel ID (negative number): `-1001234567890`
 
-### Configuration
+### Telegram Notification Improvements
+
+**FQDN Support**: System identification now uses Fully Qualified Domain Names
+```
+Before: v1001 (152.53.166.181)
+After:  v1001.example.com (152.53.166.181)
+```
+
+**Proper Newlines**: Messages now display correctly formatted with line breaks
+```
+Before: v1001 (152.53.166.181)\n🚀 Starting system setup
+After:  v1001.example.com (152.53.166.181)
+        🚀 Starting system setup
+```
+
+**File Attachments**: System information and logs are sent as downloadable files
+- Detailed system info JSON
+- Bootstrap execution logs
+- Easy archival and sharing
+
+### Logging
+
+All logs are stored in `/var/log/debian-install/`:
+```
+/var/log/debian-install/
+  ├── bootstrap-20260104-221645.log
+  ├── bootstrap-20260104-223012.log
+  └── ...
+```
 
 ```bash
 export TELEGRAM_BOT_TOKEN="110201543:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"
@@ -642,12 +908,20 @@ See [SWAP_ARCHITECTURE.md](SWAP_ARCHITECTURE.md) for comprehensive technical doc
 | `README.md` | This user guide |
 | `SWAP_ARCHITECTURE.md` | Technical deep-dive documentation |
 | `bootstrap.sh` | Minimal bootstrap script (<10KB) |
-| `setup-swap.sh` | Main installation and configuration orchestrator |
+| `setup-swap.sh` | Main swap installation and configuration |
+| `configure-users.sh` | User environment setup (nano, mc, htop, iftop, bash aliases) |
+| `configure-apt.sh` | APT repository configuration (deb822, backports, testing) |
+| `configure-journald.sh` | Journald log retention settings |
+| `install-docker.sh` | Docker installation from official repository |
 | `analyze-memory.sh` | Pre-installation system analysis |
 | `benchmark.py` | Performance testing and comparison |
 | `swap-monitor.sh` | Real-time monitoring with correct metrics |
 | `sysinfo-notify.py` | System info and Telegram notifications |
+| `system_info.py` | System information collection module |
+| `telegram_client.py` | Telegram messaging client with FQDN and file attachments |
+| `geekbench_runner.py` | Geekbench benchmark runner |
 | `ksm-trial.sh` | KSM effectiveness testing |
+| `test-improvements.sh` | Test suite for verifying improvements |
 
 ## References
 

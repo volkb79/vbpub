@@ -2,6 +2,38 @@
 # Debian Swap Configuration Setup Script
 # Comprehensive swap orchestrator supporting 7 architectures
 # Requires: Debian 12/13, root privileges
+#
+# Supported Disk Layouts for Partition-Based Swap:
+# 1. MINIMAL ROOT: Small root partition (~9GB) with remaining unallocated space
+#    - Goal: Use FULL disk - extend root partition, place swap at END of disk
+#    - Process: Extend root to use most of disk, reserve space at end for swap
+#    - Can use either dump-modify-write OR classic partition editing
+#    - No filesystem resizing needed (only extension)
+# 2. FULL ROOT: Root partition uses entire disk
+#    - Shrinks root partition (partition table + filesystem)
+#    - Adds swap partition to reclaimed space at END of disk
+#    - Requires filesystem that supports shrinking (ext4, btrfs)
+#    - XFS not supported (cannot shrink)
+#
+# Swap Backing Storage Options:
+# - Direct swap partitions: Format partition as swap (type 82/Linux swap)
+# - Ext4-backed swap: Format partition as ext4, mount, create swap file on it
+#   (provides flexibility but adds filesystem overhead)
+#
+# ZSWAP Multi-Device I/O:
+# - ZSWAP automatically uses ALL configured swap devices for writeback
+# - Kernel swap subsystem distributes I/O across devices with EQUAL priority
+# - Multiple swap files/partitions = natural I/O striping (round-robin)
+# - No special ZSWAP configuration needed - works automatically
+# - Benefit: Multiple I/O streams improve concurrency and throughput
+#
+# Partition Management Notes:
+# - Uses sfdisk for scripted partition operations
+# - When disk is in-use, sfdisk with --force --no-reread will succeed but report:
+#   "Re-reading the partition table failed: Device or resource busy"
+#   This is expected behavior, partprobe/partx updates kernel after
+# - PARTUUID is used in fstab for swap (stable across mkswap calls)
+# - UUID changes on each mkswap call, PARTUUID does not
 
 set -euo pipefail
 
@@ -21,11 +53,13 @@ TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 USE_PARTITION="${USE_PARTITION:-no}"  # yes/no - use partition instead of files
 SWAP_PARTITION_SIZE_GB="${SWAP_PARTITION_SIZE_GB:-auto}"  # Size for partition-based swap
+SWAP_BACKING="${SWAP_BACKING:-direct}"  # direct (native swap) or ext4 (filesystem-backed)
 EXTEND_ROOT="${EXTEND_ROOT:-yes}"  # yes/no - extend root partition after creating swap
 
 # Directories
 SWAP_DIR="/var/swap"
 SYSCTL_CONF="/etc/sysctl.d/99-swap.conf"
+LOG_FILE="${LOG_FILE:-/dev/null}"  # Fallback if not set by bootstrap
 
 # Colors
 RED='\033[0;31m'
@@ -37,6 +71,7 @@ NC='\033[0m'
 
 # Logging functions
 log_info() { echo -e "${GREEN}[INFO]${NC} $*"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 log_debug() { echo -e "${CYAN}[DEBUG]${NC} $*"; }
@@ -44,7 +79,8 @@ log_step() { echo -e "${BLUE}[STEP]${NC} $*"; }
 
 # Get system identification
 get_system_id() {
-    local hostname=$(hostname)
+    # Get FQDN (fully qualified domain name)
+    local hostname=$(hostname -f 2>/dev/null || hostname)
     local ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "unknown")
     echo "${hostname} (${ip})"
 }
@@ -55,7 +91,9 @@ telegram_send() {
     [ -z "$TELEGRAM_CHAT_ID" ] && return 0
     local msg="$1"
     local system_id=$(get_system_id)
-    local prefixed_msg="<b>${system_id}</b>\n${msg}"
+    # Use actual newline in string, not \n escape
+    local prefixed_msg="<b>${system_id}</b>
+${msg}"
     curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
         -d "chat_id=${TELEGRAM_CHAT_ID}" \
         -d "text=${prefixed_msg}" \
@@ -473,7 +511,7 @@ setup_zfs_zvol() {
     log_info "ZFS zvol swap setup complete"
 }
 
-# Detect disk layout
+# Detect disk layout and determine strategy
 detect_disk_layout() {
     log_step "Detecting disk layout"
     
@@ -502,11 +540,20 @@ detect_disk_layout() {
     
     log_info "Root partition: start=$ROOT_START, size=$ROOT_SIZE sectors"
     
-    # Calculate free space
+    # Calculate free space after root partition
     FREE_SECTORS=$((DISK_SIZE_SECTORS - ROOT_START - ROOT_SIZE))
     FREE_GB=$((FREE_SECTORS / 2048 / 1024))
     
     log_info "Free space after root: ${FREE_GB}GB (${FREE_SECTORS} sectors)"
+    
+    # Determine disk layout type
+    if [ "$FREE_GB" -ge 10 ]; then
+        DISK_LAYOUT="minimal_root"
+        log_info "Disk layout: MINIMAL ROOT (root partition uses partial disk, ${FREE_GB}GB free)"
+    else
+        DISK_LAYOUT="full_root"
+        log_info "Disk layout: FULL ROOT (root partition uses entire disk, need to shrink)"
+    fi
     
     return 0
 }
@@ -531,34 +578,135 @@ create_swap_partition() {
     
     log_info "Creating ${SWAP_PARTITION_SIZE_GB}GB (${SWAP_SIZE_MIB}MiB) swap partition"
     
-    # Check if we have enough free space
-    FREE_MIB=$((FREE_SECTORS / 2048))
-    if [ "$FREE_MIB" -lt "$SWAP_SIZE_MIB" ]; then
-        log_error "Not enough free space: ${FREE_MIB}MiB available, ${SWAP_SIZE_MIB}MiB needed"
-        return 1
-    fi
-    
-    # Find next partition number
-    LAST_PART_NUM=$(lsblk -n -o NAME "/dev/$ROOT_DISK" | grep -oE '[0-9]+$' | sort -n | tail -1)
-    SWAP_PART_NUM=$((LAST_PART_NUM + 1))
-    SWAP_PARTITION="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
-    
-    log_info "Creating partition ${SWAP_PART_NUM} as ${SWAP_PARTITION}"
-    
     # Backup current partition table
     BACKUP_FILE="/tmp/ptable-backup-$(date +%s).dump"
     sfdisk --dump "/dev/$ROOT_DISK" > "$BACKUP_FILE"
     log_info "Partition table backed up to: $BACKUP_FILE"
     
-    # Create swap partition using sfdisk
-    # Format: ",,S" means: start=next available, size=remaining, type=swap
-    # Or: ",,${SWAP_SIZE_MIB}M,S" for specific size
-    log_info "Adding swap partition with sfdisk..."
-    
-    if echo ",,${SWAP_SIZE_MIB}M,S" | sfdisk --force --append "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
-        log_success "Swap partition created successfully"
+    # Handle based on disk layout type
+    if [ "$DISK_LAYOUT" = "minimal_root" ]; then
+        # Scenario 1: Minimal root with free space
+        # Just append swap partition to the free space
+        log_info "Layout: Minimal root - appending swap to free space"
+        
+        # Check if we have enough free space
+        FREE_MIB=$((FREE_SECTORS / 2048))
+        if [ "$FREE_MIB" -lt "$SWAP_SIZE_MIB" ]; then
+            log_error "Not enough free space: ${FREE_MIB}MiB available, ${SWAP_SIZE_MIB}MiB needed"
+            return 1
+        fi
+        
+        # Find next partition number
+        LAST_PART_NUM=$(lsblk -n -o NAME "/dev/$ROOT_DISK" | grep -oE '[0-9]+$' | sort -n | tail -1)
+        SWAP_PART_NUM=$((LAST_PART_NUM + 1))
+        SWAP_PARTITION="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
+        
+        log_info "Creating partition ${SWAP_PART_NUM} as ${SWAP_PARTITION}"
+        
+        # Append swap partition using sfdisk
+        # Format: ",,<size>M,S" for specific size or ",,S" for all remaining space
+        if echo ",,${SWAP_SIZE_MIB}M,S" | sfdisk --force --no-reread --append "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
+            log_info "Partition table updated (ioctl error is expected for in-use disk)"
+        else
+            log_warn "sfdisk reported errors - checking partition table"
+        fi
+        
     else
-        log_warn "sfdisk reported errors (may be normal - checking partition table)"
+        # Scenario 2: Full root - need to shrink root and add swap
+        # Best practice: Dump partition table, modify it, write it back as a complete unit
+        log_info "Layout: Full root - shrinking root partition and adding swap"
+        
+        # Calculate new root size (total - start - swap space - 2048 sectors buffer)
+        SWAP_SIZE_SECTORS=$((SWAP_SIZE_MIB * 2048))
+        NEW_ROOT_SIZE_SECTORS=$((DISK_SIZE_SECTORS - ROOT_START - SWAP_SIZE_SECTORS - 2048))
+        NEW_ROOT_SIZE_MIB=$((NEW_ROOT_SIZE_SECTORS / 2048))
+        
+        log_info "Shrinking root partition from ${ROOT_SIZE} to ${NEW_ROOT_SIZE_SECTORS} sectors"
+        log_info "New root size: ${NEW_ROOT_SIZE_MIB}MiB"
+        
+        # Get filesystem type to check if we can shrink
+        FS_TYPE=$(findmnt -n -o FSTYPE /)
+        log_info "Root filesystem: $FS_TYPE"
+        
+        # Check if filesystem supports online shrinking
+        case "$FS_TYPE" in
+            ext4|ext3|ext2)
+                log_info "Filesystem supports online/offline resizing"
+                ;;
+            xfs)
+                log_error "XFS does not support shrinking - cannot proceed"
+                log_info "Recommendation: Use minimal root layout or backup/reinstall"
+                return 1
+                ;;
+            btrfs)
+                log_info "Btrfs supports online resizing"
+                ;;
+            *)
+                log_warn "Unknown filesystem type: $FS_TYPE"
+                log_warn "Proceeding with caution..."
+                ;;
+        esac
+        
+        # Dump current partition table
+        log_info "Step 1: Dumping current partition table..."
+        PTABLE_DUMP="/tmp/ptable-current-$(date +%s).dump"
+        sfdisk --dump "/dev/$ROOT_DISK" > "$PTABLE_DUMP"
+        log_info "Current partition table saved to: $PTABLE_DUMP"
+        
+        # Create modified partition table
+        log_info "Step 2: Creating modified partition table..."
+        PTABLE_NEW="/tmp/ptable-new-$(date +%s).dump"
+        
+        # Parse and modify the partition table
+        # Keep header and non-root partitions, modify root partition, add swap partition
+        {
+            # Copy header lines (label, device, unit, etc.)
+            grep -E "^(label|label-id|device|unit|first-lba|last-lba|sector-size):" "$PTABLE_DUMP"
+            echo ""
+            
+            # Process partition entries
+            SWAP_PART_NUM=$((ROOT_PART_NUM + 1))
+            SWAP_START=$((ROOT_START + NEW_ROOT_SIZE_SECTORS))
+            
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^/dev/ ]]; then
+                    # Extract partition number from line
+                    PART_NUM=$(echo "$line" | grep -oE '[0-9]+' | head -1)
+                    
+                    if [ "$PART_NUM" = "$ROOT_PART_NUM" ]; then
+                        # Modify root partition - change size
+                        echo "$line" | sed -E "s/size= *[0-9]+/size=${NEW_ROOT_SIZE_SECTORS}/"
+                    else
+                        # Keep other partitions as-is
+                        echo "$line"
+                    fi
+                fi
+            done < "$PTABLE_DUMP"
+            
+            # Add swap partition
+            # Format: /dev/vdaN : start=X, size=Y, type=swap-uuid
+            SWAP_TYPE="0657FD6D-A4AB-43C4-84E5-0933C84B4F4F"  # Linux swap GUID
+            echo "${ROOT_PARTITION%[0-9]*}${SWAP_PART_NUM} : start=${SWAP_START}, size=${SWAP_SIZE_SECTORS}, type=${SWAP_TYPE}"
+            
+        } > "$PTABLE_NEW"
+        
+        log_info "Modified partition table saved to: $PTABLE_NEW"
+        log_info "Changes:"
+        log_info "  - Root partition (${ROOT_PART_NUM}): shrunk to ${NEW_ROOT_SIZE_SECTORS} sectors"
+        log_info "  - Swap partition (${SWAP_PART_NUM}): added at sector ${SWAP_START}, ${SWAP_SIZE_SECTORS} sectors"
+        
+        # Write modified partition table
+        log_info "Step 3: Writing modified partition table..."
+        SWAP_PARTITION="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
+        
+        if sfdisk --force --no-reread "/dev/$ROOT_DISK" < "$PTABLE_NEW" 2>&1 | tee -a "$LOG_FILE"; then
+            log_info "Modified partition table written (ioctl error is expected)"
+        else
+            log_error "Failed to write modified partition table"
+            log_error "Backup available at: $BACKUP_FILE"
+            log_info "To restore: sfdisk --force /dev/$ROOT_DISK < $BACKUP_FILE"
+            return 1
+        fi
     fi
     
     # Verify partition table
@@ -573,11 +721,54 @@ create_swap_partition() {
     log_info "Informing kernel of partition table changes..."
     if command -v partprobe >/dev/null 2>&1; then
         partprobe "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
+        log_info "Used partprobe to update kernel partition table"
     else
         partx --update "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
+        log_info "Used partx to update kernel partition table"
     fi
     
-    # Wait for device to appear
+    # If we shrunk root partition, resize the filesystem now
+    if [ "$DISK_LAYOUT" = "full_root" ]; then
+        log_info "Step 3: Resizing root filesystem to match new partition size..."
+        
+        case "$FS_TYPE" in
+            ext4|ext3|ext2)
+                # For ext filesystems, need to check first, then resize
+                log_info "Checking ext filesystem integrity..."
+                # Online check (read-only)
+                e2fsck -n -f "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE" || true
+                
+                log_info "Resizing ext filesystem to match partition..."
+                if resize2fs "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
+                    log_success "Ext filesystem resized successfully"
+                else
+                    log_error "Failed to resize ext filesystem"
+                    log_warn "Partition table changed but filesystem not shrunk!"
+                    log_warn "System may be in inconsistent state - restore from backup: $BACKUP_FILE"
+                    return 1
+                fi
+                ;;
+            btrfs)
+                log_info "Resizing btrfs filesystem..."
+                # Calculate target size in bytes
+                TARGET_SIZE=$((NEW_ROOT_SIZE_SECTORS * 512))
+                if btrfs filesystem resize "${TARGET_SIZE}" / 2>&1 | tee -a "$LOG_FILE"; then
+                    log_success "Btrfs filesystem resized successfully"
+                else
+                    log_error "Failed to resize btrfs filesystem"
+                    return 1
+                fi
+                ;;
+            *)
+                log_error "Cannot resize filesystem type: $FS_TYPE"
+                log_warn "Partition table updated but filesystem not resized!"
+                log_warn "Manual intervention required"
+                return 1
+                ;;
+        esac
+    fi
+    
+    # Wait for swap device to appear
     log_info "Waiting for ${SWAP_PARTITION} to appear..."
     count=0
     while [ ! -b "$SWAP_PARTITION" ] && [ "$count" -lt 10 ]; do
@@ -590,39 +781,134 @@ create_swap_partition() {
         return 1
     fi
     
-    # Format as swap
-    log_info "Formatting ${SWAP_PARTITION} as swap..."
-    if mkswap --verbose "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
-        log_success "Swap partition formatted successfully"
+    # Format and activate based on backing type
+    if [ "$SWAP_BACKING" = "ext4" ]; then
+        # Ext4-backed swap: format as ext4, mount, create swap files
+        log_info "Using ext4-backed swap (filesystem with swap files)"
+        
+        # Format as ext4
+        log_info "Formatting ${SWAP_PARTITION} as ext4..."
+        if mkfs.ext4 -L "swap-backing" "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
+            log_success "Ext4 filesystem created successfully"
+        else
+            log_error "Failed to create ext4 filesystem"
+            return 1
+        fi
+        
+        # Create mount point
+        SWAP_MOUNT="/mnt/swap-backing"
+        mkdir -p "$SWAP_MOUNT"
+        
+        # Mount the partition
+        log_info "Mounting ${SWAP_PARTITION} at ${SWAP_MOUNT}..."
+        if mount "$SWAP_PARTITION" "$SWAP_MOUNT" 2>&1 | tee -a "$LOG_FILE"; then
+            log_success "Partition mounted successfully"
+        else
+            log_error "Failed to mount partition"
+            return 1
+        fi
+        
+        # Add to fstab for persistent mount
+        SWAP_PARTUUID=$(blkid "$SWAP_PARTITION" | sed -E 's/.*(PARTUUID="[^"]+").*/\1/' | tr -d '"')
+        if [ -n "$SWAP_PARTUUID" ] && ! grep -q "$SWAP_PARTUUID" /etc/fstab 2>/dev/null; then
+            echo "PARTUUID=$SWAP_PARTUUID ${SWAP_MOUNT} ext4 defaults 0 2" >> /etc/fstab
+            log_success "Added mount to /etc/fstab"
+        fi
+        
+        # Create swap files on the ext4 partition
+        log_info "Creating ${SWAP_FILES} swap files on ext4 partition..."
+        local SWAP_FILE_SIZE_GB=$((SWAP_PARTITION_SIZE_GB / SWAP_FILES))
+        
+        for i in $(seq 1 "$SWAP_FILES"); do
+            local swapfile="${SWAP_MOUNT}/swapfile${i}"
+            
+            log_info "Creating ${swapfile} (${SWAP_FILE_SIZE_GB}GB)..."
+            
+            # Use fallocate for speed
+            if fallocate -l "${SWAP_FILE_SIZE_GB}G" "$swapfile" 2>/dev/null; then
+                log_debug "Used fallocate for $swapfile"
+            else
+                # Fallback to dd if fallocate not supported
+                log_debug "Using dd for $swapfile (slower)..."
+                dd if=/dev/zero of="$swapfile" bs=1M count=$((SWAP_FILE_SIZE_GB * 1024)) status=progress 2>&1 | tee -a "$LOG_FILE"
+            fi
+            
+            # Set permissions
+            chmod 600 "$swapfile"
+            
+            # Format as swap
+            mkswap "$swapfile" 2>&1 | tee -a "$LOG_FILE"
+            
+            # Activate with same priority (enables round-robin I/O striping)
+            swapon -p "$SWAP_PRIORITY" "$swapfile" 2>&1 | tee -a "$LOG_FILE"
+            
+            # Add to fstab
+            if ! grep -q "$swapfile" /etc/fstab 2>/dev/null; then
+                echo "$swapfile none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+            fi
+            
+            log_success "Swap file ${i}/${SWAP_FILES} created and activated"
+        done
+        
+        log_success "Ext4-backed swap setup complete: ${SWAP_FILES} files on ${SWAP_PARTITION}"
+        log_info "Note: All swap files have equal priority (${SWAP_PRIORITY}) for I/O striping"
+        
     else
-        log_error "Failed to format swap partition"
-        return 1
+        # Direct swap: format partition as native swap
+        log_info "Using direct swap (native swap partition)"
+        
+        # Format as swap
+        # Note: Each mkswap call generates a new UUID for the swap device
+        log_info "Formatting ${SWAP_PARTITION} as swap..."
+        if mkswap --verbose "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
+            log_success "Swap partition formatted successfully"
+        else
+            log_error "Failed to format swap partition"
+            return 1
+        fi
+        
+        # Get PARTUUID for fstab (more stable than UUID which changes on each mkswap)
+        # PARTUUID is the partition UUID, UUID is the filesystem/swap UUID
+        SWAP_PARTUUID=$(blkid "$SWAP_PARTITION" | sed -E 's/.*(PARTUUID="[^"]+").*/\1/' | tr -d '"')
+        
+        if [ -z "$SWAP_PARTUUID" ]; then
+            log_warn "Could not get PARTUUID, using device path"
+            SWAP_PARTUUID="$SWAP_PARTITION"
+        else
+            log_info "Swap PARTUUID: $SWAP_PARTUUID"
+        fi
+        
+        # Activate swap
+        log_info "Activating swap partition..."
+        if swapon --verbose -p "$SWAP_PRIORITY" "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
+            log_success "Swap partition activated"
+        else
+            log_error "Failed to activate swap partition"
+            return 1
+        fi
+        
+        # Add to fstab using PARTUUID (more stable than UUID which changes on mkswap)
+        log_info "Adding swap to /etc/fstab..."
+        if echo "$SWAP_PARTUUID" | grep -q "^/dev/"; then
+            # Using device path as fallback
+            if ! grep -q "$SWAP_PARTITION" /etc/fstab 2>/dev/null; then
+                echo "$SWAP_PARTITION none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+                log_success "Added to /etc/fstab using device path"
+            else
+                log_info "Already in /etc/fstab"
+            fi
+        else
+            # Using PARTUUID
+            if ! grep -q "$SWAP_PARTUUID" /etc/fstab 2>/dev/null; then
+                echo "PARTUUID=$SWAP_PARTUUID none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+                log_success "Added to /etc/fstab using PARTUUID"
+            else
+                log_info "Already in /etc/fstab"
+            fi
+        fi
+        
+        log_success "Direct swap partition setup complete: ${SWAP_PARTITION} (${SWAP_PARTITION_SIZE_GB}GB)"
     fi
-    
-    # Get PARTUUID for fstab
-    SWAP_PARTUUID=$(blkid "$SWAP_PARTITION" | sed -E 's/.*(PARTUUID="[^"]+").*/\1/' | tr -d '"')
-    
-    log_info "Swap PARTUUID: $SWAP_PARTUUID"
-    
-    # Activate swap
-    log_info "Activating swap partition..."
-    if swapon --verbose -p "$SWAP_PRIORITY" "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
-        log_success "Swap partition activated"
-    else
-        log_error "Failed to activate swap partition"
-        return 1
-    fi
-    
-    # Add to fstab using PARTUUID
-    log_info "Adding swap to /etc/fstab..."
-    if ! grep -q "$SWAP_PARTUUID" /etc/fstab 2>/dev/null; then
-        echo "PARTUUID=$SWAP_PARTUUID none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
-        log_success "Added to /etc/fstab"
-    else
-        log_info "Already in /etc/fstab"
-    fi
-    
-    log_success "Swap partition setup complete: ${SWAP_PARTITION} (${SWAP_PARTITION_SIZE_GB}GB)"
     
     return 0
 }
@@ -665,11 +951,13 @@ extend_root_partition() {
     log_info "Partition table backed up to: $BACKUP_FILE"
     
     # Resize partition using sfdisk
+    # Best practice: Omit start to leave it untouched, just set new size
+    # Use --force with --no-reread for in-use disk
     log_info "Resizing root partition ${ROOT_PART_NUM}..."
-    if echo ",${REMAINING_MIB}M" | sfdisk --force "/dev/$ROOT_DISK" -N"${ROOT_PART_NUM}" 2>&1 | tee -a "$LOG_FILE"; then
-        log_success "Root partition resized in partition table"
+    if echo ",${REMAINING_MIB}M" | sfdisk --force --no-reread "/dev/$ROOT_DISK" -N"${ROOT_PART_NUM}" 2>&1 | tee -a "$LOG_FILE"; then
+        log_info "Root partition resized in partition table (ioctl error is expected)"
     else
-        log_warn "sfdisk reported errors (may be normal - checking partition table)"
+        log_warn "sfdisk reported errors - checking partition table"
     fi
     
     # Verify partition table
