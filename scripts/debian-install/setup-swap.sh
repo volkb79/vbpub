@@ -2,6 +2,14 @@
 # Debian Swap Configuration Setup Script
 # Comprehensive swap orchestrator supporting 7 architectures
 # Requires: Debian 12/13, root privileges
+#
+# Partition Management Notes:
+# - Uses sfdisk for scripted partition operations
+# - When disk is in-use, sfdisk with --force --no-reread will succeed but report:
+#   "Re-reading the partition table failed: Device or resource busy"
+#   This is expected behavior, partprobe/partx updates kernel after
+# - PARTUUID is used in fstab for swap (stable across mkswap calls)
+# - UUID changes on each mkswap call, PARTUUID does not
 
 set -euo pipefail
 
@@ -556,15 +564,18 @@ create_swap_partition() {
     log_info "Partition table backed up to: $BACKUP_FILE"
     
     # Create swap partition using sfdisk
-    # Format for sfdisk --append: "size=+XM,type=swap"
-    # The partition will start at the first available sector
+    # Best practice: Use size only, let sfdisk handle alignment
+    # Format: ",,S" for remaining space or ",,<size>M,S" for specific size
+    # Note: Always reports "Re-reading the partition table failed: Device or resource busy"
+    #       This is expected when disk is in use, we use partprobe after
     log_info "Adding swap partition with sfdisk..."
     
-    # Use --no-reread to avoid "disk in use" errors, then manually update kernel
-    if echo "size=+${SWAP_SIZE_MIB}M,type=swap" | sfdisk --no-reread --append "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
-        log_success "Swap partition created successfully"
+    # Use --force with --no-reread to work on in-use disk
+    # The command will succeed but always report ioctl() failure - this is expected
+    if echo ",,${SWAP_SIZE_MIB}M,S" | sfdisk --force --no-reread --append "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
+        log_info "Partition table updated (ioctl error is expected for in-use disk)"
     else
-        log_warn "sfdisk reported errors (may be normal - checking partition table)"
+        log_warn "sfdisk reported errors - checking partition table"
     fi
     
     # Verify partition table
@@ -579,8 +590,10 @@ create_swap_partition() {
     log_info "Informing kernel of partition table changes..."
     if command -v partprobe >/dev/null 2>&1; then
         partprobe "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
+        log_info "Used partprobe to update kernel partition table"
     else
         partx --update "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
+        log_info "Used partx to update kernel partition table"
     fi
     
     # Wait for device to appear
@@ -597,6 +610,7 @@ create_swap_partition() {
     fi
     
     # Format as swap
+    # Note: Each mkswap call generates a new UUID for the swap device
     log_info "Formatting ${SWAP_PARTITION} as swap..."
     if mkswap --verbose "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
         log_success "Swap partition formatted successfully"
@@ -605,10 +619,16 @@ create_swap_partition() {
         return 1
     fi
     
-    # Get PARTUUID for fstab
+    # Get PARTUUID for fstab (more stable than UUID which changes on each mkswap)
+    # PARTUUID is the partition UUID, UUID is the filesystem/swap UUID
     SWAP_PARTUUID=$(blkid "$SWAP_PARTITION" | sed -E 's/.*(PARTUUID="[^"]+").*/\1/' | tr -d '"')
     
-    log_info "Swap PARTUUID: $SWAP_PARTUUID"
+    if [ -z "$SWAP_PARTUUID" ]; then
+        log_warn "Could not get PARTUUID, using device path"
+        SWAP_PARTUUID="$SWAP_PARTITION"
+    else
+        log_info "Swap PARTUUID: $SWAP_PARTUUID"
+    fi
     
     # Activate swap
     log_info "Activating swap partition..."
@@ -619,13 +639,24 @@ create_swap_partition() {
         return 1
     fi
     
-    # Add to fstab using PARTUUID
+    # Add to fstab using PARTUUID (more stable than UUID which changes on mkswap)
     log_info "Adding swap to /etc/fstab..."
-    if ! grep -q "$SWAP_PARTUUID" /etc/fstab 2>/dev/null; then
-        echo "PARTUUID=$SWAP_PARTUUID none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
-        log_success "Added to /etc/fstab"
+    if echo "$SWAP_PARTUUID" | grep -q "^/dev/"; then
+        # Using device path as fallback
+        if ! grep -q "$SWAP_PARTITION" /etc/fstab 2>/dev/null; then
+            echo "$SWAP_PARTITION none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+            log_success "Added to /etc/fstab using device path"
+        else
+            log_info "Already in /etc/fstab"
+        fi
     else
-        log_info "Already in /etc/fstab"
+        # Using PARTUUID
+        if ! grep -q "$SWAP_PARTUUID" /etc/fstab 2>/dev/null; then
+            echo "PARTUUID=$SWAP_PARTUUID none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+            log_success "Added to /etc/fstab using PARTUUID"
+        else
+            log_info "Already in /etc/fstab"
+        fi
     fi
     
     log_success "Swap partition setup complete: ${SWAP_PARTITION} (${SWAP_PARTITION_SIZE_GB}GB)"
@@ -671,11 +702,13 @@ extend_root_partition() {
     log_info "Partition table backed up to: $BACKUP_FILE"
     
     # Resize partition using sfdisk
+    # Best practice: Omit start to leave it untouched, just set new size
+    # Use --force with --no-reread for in-use disk
     log_info "Resizing root partition ${ROOT_PART_NUM}..."
-    if echo "size=+${REMAINING_MIB}M" | sfdisk --no-reread "/dev/$ROOT_DISK" -N"${ROOT_PART_NUM}" 2>&1 | tee -a "$LOG_FILE"; then
-        log_success "Root partition resized in partition table"
+    if echo ",${REMAINING_MIB}M" | sfdisk --force --no-reread "/dev/$ROOT_DISK" -N"${ROOT_PART_NUM}" 2>&1 | tee -a "$LOG_FILE"; then
+        log_info "Root partition resized in partition table (ioctl error is expected)"
     else
-        log_warn "sfdisk reported errors (may be normal - checking partition table)"
+        log_warn "sfdisk reported errors - checking partition table"
     fi
     
     # Verify partition table
