@@ -428,6 +428,142 @@ github/list-installations --app-id 2030793
 
 ---
 
+## 🔧 Debian Install Tools (`debian-install/`)
+
+### Comprehensive Swap Configuration Toolkit
+
+A complete toolkit for configuring and optimizing swap on Debian 12/13 systems with support for multiple architectures including ZRAM, ZSWAP, swap files, and ZFS zvol configurations.
+
+#### Features
+
+- **7 Architecture Options:**
+  1. ZRAM Only (memory-only compression)
+  2. ZRAM + Swap Files (two-tier)
+  3. ZSWAP + Swap Files (recommended, single compression)
+  4. Swap Files Only (no compression)
+  5. ZFS Compressed Swap (zvol)
+  6. ZRAM + ZFS zvol (double compression)
+  7. Compressed Swap File Alternatives (experimental)
+
+- **Intelligent Configuration:**
+  - Automatic system detection (RAM, disk, CPU, storage type)
+  - Dynamic sizing based on available resources
+  - Default 8 swap files for optimal concurrency
+  - SSD vs HDD optimizations
+
+- **Comprehensive Monitoring:**
+  - Real-time swap and memory monitoring
+  - Correct metrics: pgmajfault, ZSWAP writeback ratio, PSI
+  - Color-coded alerts for pressure indicators
+  - Per-process swap usage tracking
+
+- **Performance Testing:**
+  - Benchmark different block sizes
+  - Test compression algorithms (lz4, zstd, lzo-rle)
+  - Test allocators (zsmalloc, z3fold, zbud)
+  - Compare ZRAM vs ZSWAP performance
+
+#### Quick Start
+
+**Netcup Bootstrap (<10KB):**
+
+```bash
+# Minimal bootstrap for VPS initialization
+curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | bash
+
+# Or with custom configuration
+curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | \
+  SWAP_ARCH=3 SWAP_TOTAL_GB=16 SWAP_FILES=8 bash
+```
+
+**Full Installation:**
+
+```bash
+cd scripts/debian-install
+
+# Analyze your system first
+./analyze-memory.sh
+
+# Run setup with defaults (ZSWAP + Swap Files, 8 files)
+sudo ./setup-swap.sh
+
+# Or customize
+sudo SWAP_ARCH=3 SWAP_TOTAL_GB=16 SWAP_FILES=8 ./setup-swap.sh
+```
+
+#### Script Reference
+
+| Script | Purpose |
+|--------|---------|
+| `README.md` | User guide and quick start |
+| `SWAP_ARCHITECTURE.md` | Technical deep-dive documentation |
+| `bootstrap.sh` | Minimal bootstrap (<10KB for netcup) |
+| `setup-swap.sh` | Main installation orchestrator |
+| `analyze-memory.sh` | Pre-installation system analysis |
+| `benchmark.py` | Performance testing |
+| `swap-monitor.sh` | Real-time monitoring with correct metrics |
+| `sysinfo-notify.py` | System info and Telegram notifications |
+| `ksm-trial.sh` | KSM effectiveness testing |
+
+#### Key Technical Points
+
+- **SWAP_TOTAL_GB / SWAP_FILES = per-file size** for concurrent I/O
+- **Default 8 swap files** for optimal concurrency
+- **vm.page-cluster controls I/O size, NOT striping** (round-robin across equal-priority devices)
+- **ZRAM same_pages only zero-filled pages** (not arbitrary identical content)
+- **ZSWAP single compression** vs ZRAM decompress→recompress inefficiency
+- **Monitoring metrics:** pgmajfault (actual disk I/O), writeback ratio, PSI (pressure stall information)
+- **vmstat si is MISLEADING** - includes ZSWAP RAM hits, not just disk I/O!
+- **KSM requires MADV_MERGEABLE** - most apps don't use it, typically ineffective
+
+#### Telegram Notifications
+
+Optional Telegram integration for deployment notifications:
+
+```bash
+export TELEGRAM_BOT_TOKEN="110201543:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"
+export TELEGRAM_CHAT_ID="123456789"
+
+# Test configuration
+./sysinfo-notify.py --test-mode
+
+# Send system info
+./sysinfo-notify.py --notify
+```
+
+**CRITICAL:** Send a message to your bot first before it can message you! Use @userinfobot or @getidsbot to get your chat ID.
+
+#### Post-Installation
+
+```bash
+# Monitor swap status
+./swap-monitor.sh
+
+# Single snapshot
+./swap-monitor.sh --once
+
+# JSON output
+./swap-monitor.sh --json
+
+# Benchmark performance
+sudo ./benchmark.py --test-all
+
+# Test KSM effectiveness
+sudo ./ksm-trial.sh
+```
+
+#### Architecture Selection Guide
+
+- **1-2GB RAM:** ZSWAP + Swap Files with zstd compression
+- **Limited disk (<30GB):** ZRAM Only
+- **General purpose:** ZSWAP + Swap Files (arch 3, recommended)
+- **ZFS systems:** ZFS Compressed Swap (arch 5)
+- **Maximum speed:** ZRAM Only (arch 1)
+
+See `debian-install/README.md` for comprehensive documentation and `debian-install/SWAP_ARCHITECTURE.md` for technical details.
+
+---
+
 ## 📞 Support
 
 For issues, questions, or contributions:
@@ -444,5 +580,6 @@ For issues, questions, or contributions:
 - `utils/jwt-decode`: v1.0.0  
 - `utils/subtree-checkout`: v2.0.0
 - `docker/compose-init`: v2.0.0
+- `debian-install`: v1.0.0
 
 All scripts are designed for production use with comprehensive error handling, security considerations, and extensive documentation.
