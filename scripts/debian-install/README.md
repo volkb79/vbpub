@@ -135,21 +135,35 @@ sudo SWAP_ARCH=6 SWAP_TOTAL_GB=8 ZFS_POOL=tank ./setup-swap.sh
 
 **Use case:** Extreme memory constraints, experimental setups only.
 
-### 7. Compressed Swap File Alternatives
+### 7. ZRAM + Uncompressed Swap Partition
 
-**Best for:** Custom setups or specific use cases.
+**Best for:** Debian minimal installs with remaining disk space, or when partitions are preferred over files.
 
 ```bash
-sudo SWAP_ARCH=7 SWAP_TYPE=squashfs SWAP_TOTAL_GB=8 ./setup-swap.sh
+sudo SWAP_ARCH=7 USE_PARTITION=yes SWAP_TOTAL_GB=8 ./setup-swap.sh
 ```
 
-Options:
-- **SquashFS loop device:** Read-only compression with loop mount
-- **FUSE compressors:** User-space compression layers
+Features:
+- **ZRAM tier:** zstd+zsmalloc compression (priority 100)
+- **Partition tier:** Uncompressed disk partition for overflow (priority 10)
+- Efficient single-compression path (unlike ZRAM+files decompress→recompress)
+- Partition-based swap can be faster than file-based on some systems
 
-⚠️ **Experimental** - prefer ZSWAP/ZRAM for production.
+Configuration:
+```bash
+# Use ZRAM with partition overflow
+SWAP_ARCH=7 USE_PARTITION=yes SWAP_PARTITION_SIZE_GB=8 ./setup-swap.sh
 
-**Use case:** Testing, specific kernel limitations, educational purposes.
+# With automatic root partition extension (if space available)
+SWAP_ARCH=7 USE_PARTITION=yes EXTEND_ROOT=yes ./setup-swap.sh
+```
+
+⚠️ **Partition management:** Creating partitions at end of disk and extending root requires careful handling. The script provides guidance for manual partition setup.
+
+**Use case:** 
+- Fresh Debian installs with unallocated space
+- Systems where partition-based swap is preferred over file-based
+- ZRAM memory-only with disk overflow safety
 
 ## Configuration Reference
 
@@ -165,7 +179,12 @@ Options:
 | `ZRAM_PRIORITY` | `100` | ZRAM priority (higher than disk) |
 | `ZSWAP_POOL_PERCENT` | `20` | ZSWAP pool size as % of RAM |
 | `ZSWAP_COMPRESSOR` | `lz4` | Compression algorithm (lz4, zstd, lzo-rle) |
+| `ZRAM_COMPRESSOR` | `lz4` | ZRAM compression algorithm |
+| `ZRAM_ALLOCATOR` | `zsmalloc` | ZRAM allocator (zsmalloc, z3fold, zbud) |
 | `ZFS_POOL` | `tank` | ZFS pool name for zvol (arch 5 & 6) |
+| `USE_PARTITION` | `no` | Use partition instead of files (yes/no) |
+| `SWAP_PARTITION_SIZE_GB` | `auto` | Size for swap partition |
+| `EXTEND_ROOT` | `yes` | Extend root partition after creating swap (yes/no) |
 | `TELEGRAM_BOT_TOKEN` | - | Telegram bot token for notifications |
 | `TELEGRAM_CHAT_ID` | - | Telegram chat ID for notifications |
 

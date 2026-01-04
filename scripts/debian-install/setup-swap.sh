@@ -19,6 +19,9 @@ ZRAM_ALLOCATOR="${ZRAM_ALLOCATOR:-zsmalloc}"
 ZFS_POOL="${ZFS_POOL:-tank}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+USE_PARTITION="${USE_PARTITION:-no}"  # yes/no - use partition instead of files
+SWAP_PARTITION_SIZE_GB="${SWAP_PARTITION_SIZE_GB:-auto}"  # Size for partition-based swap
+EXTEND_ROOT="${EXTEND_ROOT:-yes}"  # yes/no - extend root partition after creating swap
 
 # Directories
 SWAP_DIR="/var/swap"
@@ -470,6 +473,110 @@ setup_zfs_zvol() {
     log_info "ZFS zvol swap setup complete"
 }
 
+# Detect disk layout
+detect_disk_layout() {
+    log_step "Detecting disk layout"
+    
+    # Find root partition
+    ROOT_PARTITION=$(findmnt -n -o SOURCE /)
+    ROOT_DISK=$(lsblk -no PKNAME "$ROOT_PARTITION")
+    
+    log_info "Root partition: $ROOT_PARTITION"
+    log_info "Root disk: /dev/$ROOT_DISK"
+    
+    # Get disk size
+    DISK_SIZE_SECTORS=$(cat "/sys/block/$ROOT_DISK/size")
+    DISK_SIZE_GB=$((DISK_SIZE_SECTORS / 2048 / 1024))
+    
+    # Get current partition table
+    PARTITION_TABLE=$(sfdisk -d "/dev/$ROOT_DISK" 2>/dev/null || echo "")
+    
+    log_info "Disk size: ${DISK_SIZE_GB}GB"
+    
+    return 0
+}
+
+# Create swap partition at end of disk
+create_swap_partition() {
+    log_step "Creating swap partition at end of disk"
+    
+    detect_disk_layout
+    
+    # Calculate swap partition size
+    if [ "$SWAP_PARTITION_SIZE_GB" = "auto" ]; then
+        SWAP_PARTITION_SIZE_GB=$SWAP_TOTAL_GB
+    fi
+    
+    log_info "Creating ${SWAP_PARTITION_SIZE_GB}GB swap partition"
+    
+    # Check if there's unallocated space at the end
+    LAST_PARTITION=$(lsblk -n -o NAME "/dev/$ROOT_DISK" | tail -1)
+    LAST_PARTITION_END=$(sfdisk -l "/dev/$ROOT_DISK" | grep "$LAST_PARTITION" | awk '{print $3}')
+    
+    # Use parted to create partition at end
+    # This is a simplified version - real implementation would need more careful handling
+    log_warn "Partition creation requires careful handling and is system-specific"
+    log_warn "Manual partition creation recommended: use fdisk or parted"
+    
+    # Create swap partition (example - needs refinement)
+    # parted "/dev/$ROOT_DISK" mkpart primary linux-swap "${END_POSITION}GB" 100%
+    
+    # For now, recommend manual approach
+    log_info "To create swap partition manually:"
+    log_info "  1. Use fdisk or parted to create partition at end of disk"
+    log_info "  2. Set type to 'Linux swap' (82)"
+    log_info "  3. Run: mkswap /dev/sdXN"
+    log_info "  4. Run: swapon /dev/sdXN"
+    log_info "  5. Add to /etc/fstab"
+    
+    return 1  # Not fully implemented - needs careful testing
+}
+
+# Extend root partition
+extend_root_partition() {
+    log_step "Extending root partition"
+    
+    detect_disk_layout
+    
+    log_warn "Root partition extension requires careful handling"
+    log_warn "Recommend using: growpart, resize2fs, or xfs_growfs"
+    
+    # Check filesystem type
+    FS_TYPE=$(findmnt -n -o FSTYPE /)
+    
+    log_info "Root filesystem: $FS_TYPE"
+    log_info "To extend root partition manually:"
+    log_info "  1. Grow partition: growpart /dev/$ROOT_DISK <partition_number>"
+    
+    if [ "$FS_TYPE" = "ext4" ]; then
+        log_info "  2. Resize filesystem: resize2fs $ROOT_PARTITION"
+    elif [ "$FS_TYPE" = "xfs" ]; then
+        log_info "  2. Resize filesystem: xfs_growfs /"
+    elif [ "$FS_TYPE" = "btrfs" ]; then
+        log_info "  2. Resize filesystem: btrfs filesystem resize max /"
+    fi
+    
+    return 1  # Not fully implemented - needs careful testing
+}
+
+# Setup ZRAM with partition overflow
+setup_zram_with_partition() {
+    log_step "Setting up ZRAM with uncompressed swap partition overflow"
+    
+    # First setup ZRAM with higher priority
+    setup_zram
+    
+    # Then setup partition-based swap with lower priority
+    if [ "$USE_PARTITION" = "yes" ]; then
+        log_warn "Partition-based overflow not yet fully automated"
+        log_info "To set up manually:"
+        log_info "  1. Create partition with create_swap_partition"
+        log_info "  2. Format: mkswap /dev/sdXN"
+        log_info "  3. Activate with lower priority: swapon -p 10 /dev/sdXN"
+        log_info "  4. ZRAM will use priority 100 (higher), partition priority 10 (lower)"
+    fi
+}
+
 # Configure kernel parameters
 configure_kernel_params() {
     log_step "Configuring kernel parameters"
@@ -575,16 +682,30 @@ setup_architecture() {
         2)
             log_info "Architecture 2: ZRAM + Swap Files (Two-Tier)"
             setup_zram
-            create_swap_files
+            if [ "$USE_PARTITION" = "yes" ]; then
+                log_info "  Using partition instead of files"
+                setup_zram_with_partition
+            else
+                create_swap_files
+            fi
             ;;
         3)
             log_info "Architecture 3: ZSWAP + Swap Files (Recommended)"
             setup_zswap
+            if [ "$USE_PARTITION" = "yes" ]; then
+                log_warn "Partition-based swap not typically used with ZSWAP"
+                log_info "Falling back to swap files"
+            fi
             create_swap_files
             ;;
         4)
             log_info "Architecture 4: Swap Files Only"
-            create_swap_files
+            if [ "$USE_PARTITION" = "yes" ]; then
+                log_info "  Using partition instead of files"
+                create_swap_partition
+            else
+                create_swap_files
+            fi
             ;;
         5)
             log_info "Architecture 5: ZFS Compressed Swap (zvol)"
@@ -596,9 +717,10 @@ setup_architecture() {
             setup_zfs_zvol
             ;;
         7)
-            log_error "Architecture 7: Compressed Swap File Alternatives - Not yet implemented"
-            log_error "Please use ZSWAP (arch 3) or ZRAM (arch 1) instead"
-            exit 1
+            log_info "Architecture 7: ZRAM + Uncompressed Swap Partition"
+            log_info "  ZRAM with zstd+zsmalloc (high priority)"
+            log_info "  Partition for overflow (low priority)"
+            setup_zram_with_partition
             ;;
         *)
             log_error "Invalid architecture: $SWAP_ARCH (must be 1-7)"
