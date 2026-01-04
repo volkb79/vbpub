@@ -264,7 +264,7 @@ def format_message(sysinfo: Dict, geekbench: Optional[Dict] = None) -> str:
     # Disk
     disk = sysinfo['disk']
     if 'total' in disk:
-        lines.append("*Disk (/))*")
+        lines.append("*Disk (/)*")
         lines.append(f"  • Total: {disk['total']}")
         lines.append(f"  • Used: {disk['used']} ({disk.get('use_percent', 'N/A')})")
         lines.append(f"  • Available: {disk['available']}")

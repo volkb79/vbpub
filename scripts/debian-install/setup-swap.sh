@@ -261,6 +261,11 @@ setup_zram() {
     print_success "ZRAM swap enabled"
     
     # Create systemd service
+    local backing_param=""
+    if [ -n "$backing_dev" ]; then
+        backing_param="ExecStart=/bin/sh -c 'echo $backing_dev > /sys/block/zram0/backing_dev'"
+    fi
+    
     cat > /etc/systemd/system/zram.service << EOF
 [Unit]
 Description=ZRAM Swap
@@ -270,7 +275,7 @@ After=local-fs.target
 Type=oneshot
 ExecStart=/sbin/modprobe zram
 ExecStart=/bin/sh -c 'echo $compressor > /sys/block/zram0/comp_algorithm'
-$([ -n "$backing_dev" ] && echo "ExecStart=/bin/sh -c 'echo $backing_dev > /sys/block/zram0/backing_dev'")
+${backing_param}
 ExecStart=/bin/sh -c 'echo $size_bytes > /sys/block/zram0/disksize'
 ExecStart=/sbin/mkswap /dev/zram0
 ExecStart=/sbin/swapon -p 100 /dev/zram0
@@ -314,7 +319,21 @@ setup_zswap() {
     
     # Make persistent via kernel parameters
     if ! grep -q "zswap.enabled=1" /etc/default/grub; then
-        sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="zswap.enabled=1 zswap.compressor='$compressor' zswap.zpool='$zpool' zswap.max_pool_percent='$max_pool' /' /etc/default/grub
+        # Create backup
+        cp /etc/default/grub /etc/default/grub.backup
+        
+        # Check if GRUB_CMDLINE_LINUX_DEFAULT exists
+        if grep -q "^GRUB_CMDLINE_LINUX_DEFAULT=" /etc/default/grub; then
+            # Remove any existing zswap parameters first
+            sed -i 's/zswap\.[a-z_]*=[^ "]* //g' /etc/default/grub
+            
+            # Add new zswap parameters
+            sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"/GRUB_CMDLINE_LINUX_DEFAULT=\"zswap.enabled=1 zswap.compressor=$compressor zswap.zpool=$zpool zswap.max_pool_percent=$max_pool /" /etc/default/grub
+        else
+            # Create new line
+            echo "GRUB_CMDLINE_LINUX_DEFAULT=\"zswap.enabled=1 zswap.compressor=$compressor zswap.zpool=$zpool zswap.max_pool_percent=$max_pool\"" >> /etc/default/grub
+        fi
+        
         update-grub
         print_success "Updated GRUB configuration"
     fi

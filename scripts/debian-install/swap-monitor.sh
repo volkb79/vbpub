@@ -113,10 +113,15 @@ main() {
                 echo "Pool limit hits: $pool_limit"
                 
                 if [ "$stored" -gt 0 ]; then
-                    local ratio=$(awk "BEGIN {printf \"%.2f\", $written * 100 / $stored}")
+                    local ratio=$(awk "BEGIN {printf \"%.2f\", $written * 100 / $stored}" 2>/dev/null || echo "0")
                     echo "Writeback ratio: ${ratio}%"
                     
-                    if (( $(echo "$ratio > 30" | bc -l 2>/dev/null || echo 0) )); then
+                    # Check if bc is available for comparison
+                    if command -v bc &>/dev/null; then
+                        if (( $(echo "$ratio > 30" | bc -l 2>/dev/null || echo 0) )); then
+                            print_colored "$RED" "⚠️  WARNING: Writeback ratio > 30%, consider increasing max_pool_percent"
+                        fi
+                    elif (( $(awk "BEGIN {print ($ratio > 30 ? 1 : 0)}") )); then
                         print_colored "$RED" "⚠️  WARNING: Writeback ratio > 30%, consider increasing max_pool_percent"
                     fi
                 fi

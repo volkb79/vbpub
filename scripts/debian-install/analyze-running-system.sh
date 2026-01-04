@@ -564,8 +564,10 @@ generate_recommendations() {
             
             if (( $(echo "$wb_ratio > 30" | bc -l) )); then
                 has_recommendations=true
+                local current_max=$(cat /sys/module/zswap/parameters/max_pool_percent)
+                local new_max=$((current_max + 10))
                 log_output "• ZSWAP pool is too small (writeback ratio ${wb_ratio}%):"
-                log_output "  - Increase max_pool_percent from $(cat /sys/module/zswap/parameters/max_pool_percent)% to $(($(cat /sys/module/zswap/parameters/max_pool_percent) + 10))%"
+                log_output "  - Increase max_pool_percent from ${current_max}% to ${new_max}%"
                 log_output "  - Edit /etc/sysctl.d/99-swap.conf"
                 echo "" | tee -a "$REPORT_FILE"
             fi
