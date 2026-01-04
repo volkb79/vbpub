@@ -39,14 +39,23 @@ log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 log_debug() { echo -e "${CYAN}[DEBUG]${NC} $*"; }
 log_step() { echo -e "${BLUE}[STEP]${NC} $*"; }
 
-# Telegram notification
-telegram_notify() {
+# Get system identification
+get_system_id() {
+    local hostname=$(hostname)
+    local ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "unknown")
+    echo "${hostname} (${ip})"
+}
+
+# Telegram notification with source attribution
+telegram_send() {
     [ -z "$TELEGRAM_BOT_TOKEN" ] && return 0
     [ -z "$TELEGRAM_CHAT_ID" ] && return 0
     local msg="$1"
+    local system_id=$(get_system_id)
+    local prefixed_msg="<b>${system_id}</b>\n${msg}"
     curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
         -d "chat_id=${TELEGRAM_CHAT_ID}" \
-        -d "text=${msg}" \
+        -d "text=${prefixed_msg}" \
         -d "parse_mode=HTML" >/dev/null 2>&1 || true
 }
 
@@ -611,7 +620,7 @@ main() {
     log_info "  ZSWAP Pool: ${ZSWAP_POOL_PERCENT}%"
     echo ""
     
-    telegram_notify "🔧 Starting swap configuration on $(hostname)"
+    telegram_send "🔧 Starting swap configuration"
     
     # Print current state
     print_current_config
@@ -642,7 +651,7 @@ main() {
     log_info "  2. Check performance: ./benchmark.py"
     log_info "  3. Analyze memory: ./analyze-memory.sh"
     
-    telegram_notify "✅ Swap configuration completed on $(hostname)"
+    telegram_send "✅ Swap configuration completed"
 }
 
 # Run main function

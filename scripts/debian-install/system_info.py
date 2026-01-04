@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""
+System Information Module
+Collect comprehensive system information
+"""
+
+import json
+import os
+import platform
+import subprocess
+from datetime import datetime
+
+
+class SystemInfo:
+    """Collect comprehensive system information"""
+    
+    def __init__(self):
+        self.info = {}
+    
+    def collect(self):
+        """Collect all system information"""
+        self.info['timestamp'] = datetime.now().isoformat()
+        self.info['hostname'] = platform.node()
+        self.info['os'] = self.get_os_info()
+        self.info['hardware'] = self.get_hardware_info()
+        self.info['memory'] = self.get_memory_info()
+        self.info['disk'] = self.get_disk_info()
+        self.info['swap'] = self.get_swap_info()
+        self.info['network'] = self.get_network_info()
+        
+        return self.info
+    
+    def get_os_info(self):
+        """Get OS information"""
+        info = {
+            'system': platform.system(),
+            'release': platform.release(),
+            'version': platform.version()
+        }
+        
+        # Try to get distribution info
+        try:
+            with open('/etc/os-release') as f:
+                for line in f:
+                    if line.startswith('PRETTY_NAME='):
+                        info['distribution'] = line.split('=')[1].strip().strip('"')
+                        break
+        except:
+            pass
+        
+        return info
+    
+    def get_hardware_info(self):
+        """Get hardware information"""
+        info = {
+            'architecture': platform.machine(),
+            'cpu_cores': os.cpu_count()
+        }
+        
+        # Try to get CPU model
+        try:
+            with open('/proc/cpuinfo') as f:
+                for line in f:
+                    if 'model name' in line:
+                        info['cpu_model'] = line.split(':')[1].strip()
+                        break
+        except:
+            pass
+        
+        return info
+    
+    def get_memory_info(self):
+        """Get memory information"""
+        info = {}
+        
+        try:
+            with open('/proc/meminfo') as f:
+                for line in f:
+                    if 'MemTotal' in line:
+                        info['total_kb'] = int(line.split()[1])
+                        info['total_gb'] = round(info['total_kb'] / 1024 / 1024, 2)
+                    elif 'MemAvailable' in line:
+                        info['available_kb'] = int(line.split()[1])
+                        info['available_gb'] = round(info['available_kb'] / 1024 / 1024, 2)
+        except:
+            pass
+        
+        return info
+    
+    def get_disk_info(self):
+        """Get disk information"""
+        info = {}
+        
+        try:
+            result = subprocess.run(
+                ['df', '-k', '/'],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            lines = result.stdout.strip().split('\n')
+            if len(lines) > 1:
+                parts = lines[1].split()
+                info['total_kb'] = int(parts[1])
+                info['used_kb'] = int(parts[2])
+                info['available_kb'] = int(parts[3])
+                info['total_gb'] = round(info['total_kb'] / 1024 / 1024, 2)
+                info['available_gb'] = round(info['available_kb'] / 1024 / 1024, 2)
+                info['used_percent'] = int(parts[4].rstrip('%'))
+        except:
+            pass
+        
+        return info
+    
+    def get_swap_info(self):
+        """Get swap information"""
+        info = {}
+        
+        try:
+            result = subprocess.run(
+                ['swapon', '--show', '--noheadings'],
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode == 0 and result.stdout.strip():
+                lines = result.stdout.strip().split('\n')
+                info['devices'] = []
+                
+                for line in lines:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        device_info = {
+                            'device': parts[0],
+                            'size': parts[2],
+                            'priority': parts[3] if len(parts) > 3 else 'unknown'
+                        }
+                        info['devices'].append(device_info)
+                
+                info['count'] = len(info['devices'])
+            else:
+                info['enabled'] = False
+        except:
+            pass
+        
+        return info
+    
+    def get_network_info(self):
+        """Get network information"""
+        info = {}
+        
+        # Try to get public IP
+        try:
+            result = subprocess.run(
+                ['curl', '-s', '--max-time', '5', 'https://api.ipify.org'],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                info['public_ip'] = result.stdout.strip()
+        except:
+            pass
+        
+        return info
+    
+    def format_html(self):
+        """Format system info as HTML for Telegram"""
+        html = f"<b>🖥 System Information</b>\n"
+        html += f"<b>Hostname:</b> {self.info['hostname']}\n"
+        html += f"<b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        
+        # OS
+        html += f"<b>📀 Operating System</b>\n"
+        if 'distribution' in self.info['os']:
+            html += f"  {self.info['os']['distribution']}\n"
+        html += f"  Kernel: {self.info['os']['release']}\n\n"
+        
+        # Hardware
+        html += f"<b>⚙️ Hardware</b>\n"
+        html += f"  CPU: {self.info['hardware'].get('cpu_model', 'Unknown')}\n"
+        html += f"  Cores: {self.info['hardware']['cpu_cores']}\n"
+        html += f"  Architecture: {self.info['hardware']['architecture']}\n\n"
+        
+        # Memory
+        if 'memory' in self.info and 'total_gb' in self.info['memory']:
+            html += f"<b>💾 Memory</b>\n"
+            html += f"  Total: {self.info['memory']['total_gb']} GB\n"
+            html += f"  Available: {self.info['memory']['available_gb']} GB\n\n"
+        
+        # Disk
+        if 'disk' in self.info and 'total_gb' in self.info['disk']:
+            html += f"<b>💿 Disk</b>\n"
+            html += f"  Total: {self.info['disk']['total_gb']} GB\n"
+            html += f"  Available: {self.info['disk']['available_gb']} GB\n"
+            html += f"  Used: {self.info['disk'].get('used_percent', 0)}%\n\n"
+        
+        # Swap
+        if 'swap' in self.info and 'devices' in self.info['swap']:
+            html += f"<b>💱 Swap</b>\n"
+            html += f"  Devices: {self.info['swap']['count']}\n"
+            for dev in self.info['swap']['devices']:
+                html += f"    • {dev['device']} ({dev['size']}, pri: {dev['priority']})\n"
+        elif 'swap' in self.info:
+            html += f"<b>💱 Swap</b>\n  Not configured\n"
+        
+        # Network
+        if 'network' in self.info and 'public_ip' in self.info['network']:
+            html += f"\n<b>🌐 Network</b>\n"
+            html += f"  Public IP: {self.info['network']['public_ip']}\n"
+        
+        return html
+
+
+def main():
+    """CLI interface"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='System Information Collector')
+    parser.add_argument('--collect', action='store_true', help='Collect system info')
+    parser.add_argument('--html', action='store_true', help='Output as HTML')
+    parser.add_argument('--output', '-o', metavar='FILE', help='Save to JSON file')
+    
+    args = parser.parse_args()
+    
+    collector = SystemInfo()
+    info = collector.collect()
+    
+    if args.html:
+        print(collector.format_html())
+    elif args.output:
+        with open(args.output, 'w') as f:
+            json.dump(info, f, indent=2)
+        print(f"System info saved to {args.output}")
+    else:
+        print(json.dumps(info, indent=2))
+    
+    return 0
+
+
+if __name__ == '__main__':
+    import sys
+    sys.exit(main())

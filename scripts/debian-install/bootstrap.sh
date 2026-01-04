@@ -11,6 +11,8 @@ REPO_URL="${REPO_URL:-https://github.com/volkb79/vbpub.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
 CLONE_DIR="${CLONE_DIR:-/opt/vbpub}"
 SCRIPT_DIR="${CLONE_DIR}/scripts/debian-install"
+LOG_DIR="${LOG_DIR:-/var/log/swap-setup}"
+LOG_FILE="${LOG_DIR}/bootstrap-$(date +%Y%m%d-%H%M%S).log"
 
 # Swap configuration (passed through to setup-swap.sh)
 SWAP_ARCH="${SWAP_ARCH:-3}"
@@ -33,25 +35,38 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-log_info() { echo -e "${GREEN}[INFO]${NC} $*"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+log_info() { echo -e "${GREEN}[INFO]${NC} $*" | tee -a "$LOG_FILE"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $*" | tee -a "$LOG_FILE"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*" | tee -a "$LOG_FILE" >&2; }
 
-telegram_notify() {
+# Get system identification
+get_system_id() {
+    local hostname=$(hostname)
+    local ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "unknown")
+    echo "${hostname} (${ip})"
+}
+
+telegram_send() {
     [ -z "$TELEGRAM_BOT_TOKEN" ] && return 0
     [ -z "$TELEGRAM_CHAT_ID" ] && return 0
     local msg="$1"
+    local system_id=$(get_system_id)
+    local prefixed_msg="<b>${system_id}</b>\n${msg}"
     curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
         -d "chat_id=${TELEGRAM_CHAT_ID}" \
-        -d "text=${msg}" \
+        -d "text=${prefixed_msg}" \
         -d "parse_mode=HTML" >/dev/null 2>&1 || true
 }
 
 main() {
+    # Create log directory
+    mkdir -p "$LOG_DIR"
+    
     log_info "Debian Swap Configuration Bootstrap"
     log_info "Repository: $REPO_URL"
+    log_info "Log file: $LOG_FILE"
     
-    telegram_notify "🚀 Starting swap configuration on $(hostname)"
+    telegram_send "🚀 Starting swap configuration"
     
     # Check if running as root
     if [ "$EUID" -ne 0 ]; then
@@ -81,7 +96,7 @@ main() {
     # Check script exists
     if [ ! -f "$SCRIPT_DIR/setup-swap.sh" ]; then
         log_error "setup-swap.sh not found in $SCRIPT_DIR"
-        telegram_notify "❌ Bootstrap failed: script not found"
+        telegram_send "❌ Bootstrap failed: script not found"
         exit 1
     fi
     
@@ -96,14 +111,15 @@ main() {
     
     export SWAP_ARCH SWAP_TOTAL_GB SWAP_FILES SWAP_PRIORITY
     export ZRAM_SIZE_GB ZRAM_PRIORITY ZSWAP_POOL_PERCENT ZSWAP_COMPRESSOR
-    export ZFS_POOL TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID
+    export ZFS_POOL TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID LOG_FILE
     
-    if ./setup-swap.sh; then
+    if ./setup-swap.sh 2>&1 | tee -a "$LOG_FILE"; then
         log_info "✓ Swap configuration completed successfully"
-        telegram_notify "✅ Swap configuration completed on $(hostname)"
+        log_info "Log saved to: $LOG_FILE"
+        telegram_send "✅ Swap configuration completed\nLog: $LOG_FILE"
     else
         log_error "✗ Swap configuration failed"
-        telegram_notify "❌ Swap configuration failed on $(hostname)"
+        telegram_send "❌ Swap configuration failed\nLog: $LOG_FILE"
         exit 1
     fi
 }
