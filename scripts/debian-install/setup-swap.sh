@@ -292,7 +292,7 @@ print_system_analysis_and_plan() {
     echo ""
     
     echo "Current Swap Status:"
-    if swapon --show | grep -q "/"; then
+    if swapon --show | grep -q '^/'; then
         swapon --show
     else
         echo "  No active swap"
@@ -452,7 +452,7 @@ install_dependencies() {
 disable_existing_swap() {
     log_step "Disabling existing swap devices"
     
-    if swapon --show | grep -q "/"; then
+    if swapon --show | grep -q '^/'; then
         log_info "Disabling active swap devices..."
         swapoff -a || log_warn "Some swap devices may not have been disabled"
         
@@ -748,10 +748,21 @@ create_swap_partition() {
             return 1
         fi
         
-        # Find next partition number
-        LAST_PART_NUM=$(lsblk -n -o NAME "/dev/$ROOT_DISK" | grep -oE '[0-9]+$' | sort -n | tail -1)
+        # Find next partition number (handles nvme, sd, vd, etc.)
+        # Use sfdisk to list partitions more reliably
+        LAST_PART_NUM=$(sfdisk -l "/dev/$ROOT_DISK" 2>/dev/null | grep "^/dev/" | grep -oE '[0-9]+' | tail -1)
+        if [ -z "$LAST_PART_NUM" ]; then
+            # Fallback: if no partitions found, start at 1
+            LAST_PART_NUM=0
+        fi
         SWAP_PART_NUM=$((LAST_PART_NUM + 1))
-        SWAP_PARTITION="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
+        
+        # Handle device naming (nvme uses p prefix, others don't)
+        if [[ "$ROOT_DISK" =~ nvme ]]; then
+            SWAP_PARTITION="/dev/${ROOT_DISK}p${SWAP_PART_NUM}"
+        else
+            SWAP_PARTITION="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
+        fi
         
         log_info "Creating partition ${SWAP_PART_NUM} as ${SWAP_PARTITION}"
         
@@ -886,7 +897,8 @@ create_swap_partition() {
     
     # Try partx as well (alternative method)
     if command -v partx >/dev/null 2>&1; then
-        partx -a "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
+        # Use -u (update) instead of -a (add) to handle existing partitions gracefully
+        partx -u "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
         log_info "Used partx to update kernel partition table"
     fi
     
