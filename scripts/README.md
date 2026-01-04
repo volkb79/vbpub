@@ -9,6 +9,7 @@ scripts/
 ├── github/          # GitHub App authentication and repository management
 ├── utils/           # General-purpose utilities and tools
 ├── docker/          # Docker and container-related scripts
+├── debian-install/  # Debian swap configuration toolkit
 └── legacy/          # Legacy scripts with unique functionality (7 scripts)
 ```
 
@@ -42,6 +43,22 @@ utils/subtree-checkout --repo DST-DNS
 ```bash
 # Initialize and start Docker Compose services
 compose-init-up.py --directory /path/to/project --verbose
+```
+
+### Debian Swap Configuration
+
+```bash
+# Quick bootstrap on fresh Debian 12/13 VPS
+curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | bash
+
+# Analyze current memory state
+debian-install/analyze-memory.sh
+
+# Setup swap with custom configuration
+sudo SWAP_ARCH=zswap-files SWAP_TOTAL_GB=64 debian-install/setup-swap.sh
+
+# Monitor swap in real-time
+debian-install/swap-monitor.sh
 ```
 
 ## 📚 Script Documentation
@@ -183,6 +200,53 @@ compose-init-up.py --env-only --file docker-compose.yml
 - ✅ Host directory creation with proper permissions
 - ✅ Pre-compose hook integration
 - ✅ Comprehensive error handling and rollback
+
+### Debian Tools (`debian-install/`)
+
+#### Swap Configuration Toolkit
+**Purpose:** Comprehensive multi-tier swap setup system for Debian 12/13, optimized for VPS environments.
+
+```bash
+# Quick bootstrap (remote installation)
+curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | bash
+
+# Analyze current memory state
+debian-install/analyze-memory.sh
+
+# Setup with auto-detection
+sudo debian-install/setup-swap.sh
+
+# Setup with specific configuration
+sudo SWAP_ARCH=zswap-files SWAP_TOTAL_GB=64 debian-install/setup-swap.sh
+
+# Real-time monitoring
+debian-install/swap-monitor.sh
+
+# Benchmark performance
+sudo debian-install/benchmark.py --test-all
+```
+
+**Key Features:**
+- ✅ 6 swap architectures (ZRAM, ZSWAP, files-only, ZFS, hybrid)
+- ✅ Automatic system detection and configuration
+- ✅ Compression algorithm and allocator selection
+- ✅ Dynamic sizing (1GB-32GB RAM support)
+- ✅ Real-time monitoring with correct metrics
+- ✅ Telegram notifications
+- ✅ Performance benchmarking
+- ✅ Comprehensive documentation
+
+**Architecture Options:**
+- `zram-only`: Pure RAM-based compressed swap (fast, no disk)
+- `zram-files`: Two-tier with ZRAM cache and disk backing
+- `zswap-files`: **Recommended** - Transparent cache with efficient compression
+- `files-only`: Traditional uncompressed swap files
+- `zfs-zvol`: ZFS volume with integrated compression
+- `zram-zfs`: Double compression (research only)
+
+**Documentation:**
+- `README.md`: User guide, quick start, configuration reference
+- `SWAP_ARCHITECTURE.md`: Deep technical dive (36KB)
 
 ## 🔧 Configuration
 
