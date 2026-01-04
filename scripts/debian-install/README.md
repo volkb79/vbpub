@@ -7,10 +7,12 @@ A comprehensive toolkit for Debian 12/13 system initialization including swap co
 - **7 Swap Architectures**: ZRAM, ZSWAP, swap files/partitions, ZFS zvol, and combinations
 - **Intelligent Detection**: Automatic RAM, disk, and storage type detection with dynamic sizing
 - **Partition Management**: Create swap partitions at end of disk, extend root partition  
-- **User Configuration**: Automated setup for nano, Midnight Commander, iftop, htop
+- **User Configuration**: Automated setup for nano, Midnight Commander, iftop, htop, bash aliases
+- **APT Management**: Modern deb822 format with backports (priority 600) and testing repositories
+- **System Configuration**: Journald log retention, Docker installation with modern settings
 - **Performance Testing**: Geekbench integration and comprehensive swap benchmarking
 - **Real-time Monitoring**: Correct metrics (pgmajfault, writeback ratio, PSI)
-- **Telegram Integration**: Automated notifications with source attribution
+- **Telegram Integration**: Automated notifications with FQDN, file attachments, proper formatting
 
 ## Quick Start
 
@@ -243,7 +245,10 @@ The bootstrap script orchestrates complete system setup beyond just swap configu
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RUN_USER_CONFIG` | `yes` | Configure nano, mc, iftop, htop for all users |
+| `RUN_USER_CONFIG` | `yes` | Configure nano, mc, iftop, htop, bash aliases for all users |
+| `RUN_APT_CONFIG` | `yes` | Configure APT with deb822 format, backports, testing repos |
+| `RUN_JOURNALD_CONFIG` | `yes` | Configure journald log retention (200M max, 12 months) |
+| `RUN_DOCKER_INSTALL` | `no` | Install Docker from official repository with modern settings |
 | `RUN_GEEKBENCH` | `no` | Run Geekbench 6 and upload results (5-10 min) |
 | `RUN_BENCHMARKS` | `no` | Run comprehensive swap benchmarks |
 | `SEND_SYSINFO` | `yes` | Send system info to Telegram if configured |
@@ -256,19 +261,36 @@ The bootstrap script orchestrates complete system setup beyond just swap configu
    - Install nano, mc, iftop, htop
    - Configure for root and existing users
    - Set /etc/skel defaults for future users
-4. **Geekbench** (if RUN_GEEKBENCH=yes)
+   - Add bash aliases (ll, la, l, colored ls/grep)
+4. **APT configuration** (if RUN_APT_CONFIG=yes)
+   - Configure sources with deb822 format
+   - Add main, contrib, non-free, non-free-firmware
+   - Add backports with priority 600 (preferred by default)
+   - Add testing with priority 100 (visibility only)
+   - Configure APT settings (Debug::pkgPolicy, Show-Versions, AutomaticRemove)
+5. **Journald configuration** (if RUN_JOURNALD_CONFIG=yes)
+   - Set SystemMaxUse=200M, SystemKeepFree=500M
+   - Set SystemMaxFileSize=100M
+   - Set retention: 12 months, rotation: 1 month
+6. **Docker installation** (if RUN_DOCKER_INSTALL=yes)
+   - Add Docker official repository
+   - Install docker-ce, docker-compose-plugin, buildx
+   - Configure daemon.json with log-driver: local
+7. **Geekbench** (if RUN_GEEKBENCH=yes)
    - Download latest version for architecture
    - Run CPU and compute benchmarks
    - Upload to Geekbench Browser
    - Extract result URL and claim URL
-5. **Swap benchmarks** (if RUN_BENCHMARKS=yes)
+8. **Swap benchmarks** (if RUN_BENCHMARKS=yes)
    - Test block sizes, compression algorithms, allocators
    - Test concurrency scaling
    - Export optimal configuration
-6. **System info report** (if SEND_SYSINFO=yes)
+9. **System info report** (if SEND_SYSINFO=yes)
    - Collect hardware specs
    - Compile configuration details
    - Send formatted report via Telegram
+   - Attach detailed system info as file
+   - Attach bootstrap log as file
 
 ### Example: Complete System Setup
 
@@ -278,10 +300,104 @@ curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-i
   SWAP_ARCH=3 \
   SWAP_TOTAL_GB=16 \
   RUN_USER_CONFIG=yes \
+  RUN_APT_CONFIG=yes \
+  RUN_JOURNALD_CONFIG=yes \
+  RUN_DOCKER_INSTALL=yes \
   RUN_GEEKBENCH=yes \
   TELEGRAM_BOT_TOKEN=110201543:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw \
   TELEGRAM_CHAT_ID=123456789 \
   bash
+```
+
+## System Configuration
+
+### APT Configuration
+
+The `configure-apt.sh` script sets up APT sources using modern deb822 format with proper priorities:
+
+```bash
+# Run APT configuration
+sudo ./configure-apt.sh
+```
+
+**Features:**
+- **Main repository (stable)**: Priority 500 (default)
+  - Components: main, contrib, non-free, non-free-firmware
+  - Includes security updates
+- **Backports**: Priority 600 (preferred by default)
+  - Packages from backports are automatically used when available
+  - No need for `-t backports` flag
+- **Testing**: Priority 100 (visibility only)
+  - Available for checking upcoming versions
+  - Requires explicit `-t testing` to install
+- **APT settings**: `/etc/apt/apt.conf.d/99-custom.conf`
+  - Debug::pkgPolicy - Show repository priorities
+  - APT::Get::Show-Versions - Display version info
+  - APT::Get::AutomaticRemove - Clean up unused dependencies
+
+**Usage:**
+```bash
+# Install normally - will use backports if newer version available
+apt-get install package-name
+
+# Check which repository provides a package
+apt-cache policy package-name
+
+# Explicitly install from testing
+apt-get install -t testing package-name
+```
+
+### Journald Configuration
+
+The `configure-journald.sh` script sets up systemd journal log retention:
+
+```bash
+# Run journald configuration
+sudo ./configure-journald.sh
+```
+
+**Settings:**
+- SystemMaxUse=200M - Maximum disk space for logs
+- SystemKeepFree=500M - Minimum free space to maintain
+- SystemMaxFileSize=100M - Maximum size per log file
+- MaxRetentionSec=12month - Keep logs for 12 months
+- MaxFileSec=1month - Rotate logs monthly
+
+**Benefits:**
+- Prevents runaway log growth
+- Ensures disk space availability
+- Automatic rotation and cleanup
+
+### Docker Installation
+
+The `install-docker.sh` script installs Docker from official repositories:
+
+```bash
+# Run Docker installation
+sudo ./install-docker.sh
+```
+
+**Features:**
+- Official Docker repository (not distro packages)
+- Includes: docker-ce, docker-compose-plugin, buildx-plugin
+- Modern daemon.json configuration:
+  - log-driver: local (efficient, rotating logs)
+  - Max log size: 10M per container
+  - Max log files: 3 per container
+  - storage-driver: overlay2
+  - live-restore: enabled
+  - BuildKit: enabled
+  - Metrics endpoint: 127.0.0.1:9323
+
+**Post-install:**
+```bash
+# Add user to docker group (requires logout/login)
+sudo usermod -aG docker username
+
+# Verify installation
+docker --version
+docker compose version
+docker run --rm hello-world
 ```
 
 ## User Configuration
@@ -317,6 +433,13 @@ The `configure-users.sh` script sets up consistent environments for command-line
 - Custom columns for detailed process info
 - Tree view available
 - Mouse support enabled
+
+**bash** - Shell aliases
+- `ll` - ls -alF (detailed list)
+- `la` - ls -A (show hidden)
+- `l` - ls -CF (compact)
+- Colored ls, grep, fgrep, egrep
+- Human-readable df, du, free
 
 ### Application Scope
 
@@ -415,7 +538,35 @@ If sending to a channel:
 2. Use channel username with @ prefix: `@yourchannel`
 3. Or use numeric channel ID (negative number): `-1001234567890`
 
-### Configuration
+### Telegram Notification Improvements
+
+**FQDN Support**: System identification now uses Fully Qualified Domain Names
+```
+Before: v1001 (152.53.166.181)
+After:  v1001.example.com (152.53.166.181)
+```
+
+**Proper Newlines**: Messages now display correctly formatted with line breaks
+```
+Before: v1001 (152.53.166.181)\n🚀 Starting system setup
+After:  v1001.example.com (152.53.166.181)
+        🚀 Starting system setup
+```
+
+**File Attachments**: System information and logs are sent as downloadable files
+- Detailed system info JSON
+- Bootstrap execution logs
+- Easy archival and sharing
+
+### Logging
+
+All logs are stored in `/var/log/debian-install/`:
+```
+/var/log/debian-install/
+  ├── bootstrap-20260104-221645.log
+  ├── bootstrap-20260104-223012.log
+  └── ...
+```
 
 ```bash
 export TELEGRAM_BOT_TOKEN="110201543:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"
@@ -642,12 +793,20 @@ See [SWAP_ARCHITECTURE.md](SWAP_ARCHITECTURE.md) for comprehensive technical doc
 | `README.md` | This user guide |
 | `SWAP_ARCHITECTURE.md` | Technical deep-dive documentation |
 | `bootstrap.sh` | Minimal bootstrap script (<10KB) |
-| `setup-swap.sh` | Main installation and configuration orchestrator |
+| `setup-swap.sh` | Main swap installation and configuration |
+| `configure-users.sh` | User environment setup (nano, mc, htop, iftop, bash aliases) |
+| `configure-apt.sh` | APT repository configuration (deb822, backports, testing) |
+| `configure-journald.sh` | Journald log retention settings |
+| `install-docker.sh` | Docker installation from official repository |
 | `analyze-memory.sh` | Pre-installation system analysis |
 | `benchmark.py` | Performance testing and comparison |
 | `swap-monitor.sh` | Real-time monitoring with correct metrics |
 | `sysinfo-notify.py` | System info and Telegram notifications |
+| `system_info.py` | System information collection module |
+| `telegram_client.py` | Telegram messaging client with FQDN and file attachments |
+| `geekbench_runner.py` | Geekbench benchmark runner |
 | `ksm-trial.sh` | KSM effectiveness testing |
+| `test-improvements.sh` | Test suite for verifying improvements |
 
 ## References
 

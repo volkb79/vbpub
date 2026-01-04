@@ -26,6 +26,7 @@ EXTEND_ROOT="${EXTEND_ROOT:-yes}"  # yes/no - extend root partition after creati
 # Directories
 SWAP_DIR="/var/swap"
 SYSCTL_CONF="/etc/sysctl.d/99-swap.conf"
+LOG_FILE="${LOG_FILE:-/dev/null}"  # Fallback if not set by bootstrap
 
 # Colors
 RED='\033[0;31m'
@@ -37,6 +38,7 @@ NC='\033[0m'
 
 # Logging functions
 log_info() { echo -e "${GREEN}[INFO]${NC} $*"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 log_debug() { echo -e "${CYAN}[DEBUG]${NC} $*"; }
@@ -554,11 +556,12 @@ create_swap_partition() {
     log_info "Partition table backed up to: $BACKUP_FILE"
     
     # Create swap partition using sfdisk
-    # Format: ",,S" means: start=next available, size=remaining, type=swap
-    # Or: ",,${SWAP_SIZE_MIB}M,S" for specific size
+    # Format for sfdisk --append: "size=+XM,type=swap"
+    # The partition will start at the first available sector
     log_info "Adding swap partition with sfdisk..."
     
-    if echo ",,${SWAP_SIZE_MIB}M,S" | sfdisk --force --append "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
+    # Use --no-reread to avoid "disk in use" errors, then manually update kernel
+    if echo "size=+${SWAP_SIZE_MIB}M,type=swap" | sfdisk --no-reread --append "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
         log_success "Swap partition created successfully"
     else
         log_warn "sfdisk reported errors (may be normal - checking partition table)"
@@ -669,7 +672,7 @@ extend_root_partition() {
     
     # Resize partition using sfdisk
     log_info "Resizing root partition ${ROOT_PART_NUM}..."
-    if echo ",${REMAINING_MIB}M" | sfdisk --force "/dev/$ROOT_DISK" -N"${ROOT_PART_NUM}" 2>&1 | tee -a "$LOG_FILE"; then
+    if echo "size=+${REMAINING_MIB}M" | sfdisk --no-reread "/dev/$ROOT_DISK" -N"${ROOT_PART_NUM}" 2>&1 | tee -a "$LOG_FILE"; then
         log_success "Root partition resized in partition table"
     else
         log_warn "sfdisk reported errors (may be normal - checking partition table)"
