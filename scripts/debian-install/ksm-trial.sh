@@ -73,12 +73,13 @@ print_ksm_stats() {
     fi
 }
 
+# Calculate effectiveness
 calculate_effectiveness() {
     local pages_shared=$(cat /sys/kernel/mm/ksm/pages_shared 2>/dev/null || echo 0)
     local pages_sharing=$(cat /sys/kernel/mm/ksm/pages_sharing 2>/dev/null || echo 0)
     
     if [ "$pages_sharing" -eq 0 ]; then
-        echo 0
+        echo "0.00"
         return
     fi
     
@@ -89,8 +90,8 @@ calculate_effectiveness() {
     local saved_pages=$((pages_sharing - pages_shared))
     local saved_kb=$((saved_pages * 4))
     
-    # Percentage
-    local effectiveness=$(echo "scale=2; 100 * $saved_kb / $mem_total_kb" | bc)
+    # Percentage - use awk instead of bc
+    local effectiveness=$(awk "BEGIN {printf \"%.2f\", 100.0 * $saved_kb / $mem_total_kb}")
     echo "$effectiveness"
 }
 
@@ -148,6 +149,11 @@ main() {
     # Calculate effectiveness
     local effectiveness=$(calculate_effectiveness)
     
+    # Validate effectiveness is a valid number
+    if ! [[ "$effectiveness" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+        effectiveness="0.00"
+    fi
+    
     echo ""
     log_step "Analysis"
     
@@ -156,20 +162,20 @@ main() {
     echo ""
     
     # Provide recommendation
-    if (( $(echo "$effectiveness < 0.5" | bc -l) )); then
+    if (( $(awk "BEGIN {print ($effectiveness < 0.5)}") )); then
         log_warn "KSM appears INEFFECTIVE (<0.5% memory saved)"
         echo ""
         echo "Recommendation: ${RED}Do NOT enable KSM${NC}"
         echo "  • KSM overhead not worth minimal savings"
         echo "  • Your applications likely don't use MADV_MERGEABLE"
         echo "  • Focus on other memory optimizations (ZSWAP, ZRAM)"
-    elif (( $(echo "$effectiveness < 2" | bc -l) )); then
+    elif (( $(awk "BEGIN {print ($effectiveness < 2)}") )); then
         log_warn "KSM shows MINIMAL benefit (<2% memory saved)"
         echo ""
         echo "Recommendation: ${YELLOW}KSM probably not worth it${NC}"
         echo "  • Small benefit may not justify overhead"
         echo "  • Consider only if memory is critically constrained"
-    elif (( $(echo "$effectiveness < 10" | bc -l) )); then
+    elif (( $(awk "BEGIN {print ($effectiveness < 10)}") )); then
         log_info "KSM shows MODERATE benefit (2-10% memory saved)"
         echo ""
         echo "Recommendation: ${YELLOW}Consider enabling KSM${NC}"

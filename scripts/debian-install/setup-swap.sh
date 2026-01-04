@@ -315,7 +315,7 @@ After=local-fs.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/bash -c 'modprobe zram && echo $ZRAM_COMPRESSOR > /sys/block/zram0/comp_algorithm && echo $zram_size_bytes > /sys/block/zram0/disksize && mkswap /dev/zram0 && swapon -p $ZRAM_PRIORITY /dev/zram0'
+ExecStart=/bin/bash -c 'modprobe zram && echo ${ZRAM_COMPRESSOR} > /sys/block/zram0/comp_algorithm && echo ${zram_size_bytes} > /sys/block/zram0/disksize && mkswap /dev/zram0 && swapon -p ${ZRAM_PRIORITY} /dev/zram0'
 ExecStop=/bin/bash -c 'swapoff /dev/zram0 && rmmod zram'
 
 [Install]

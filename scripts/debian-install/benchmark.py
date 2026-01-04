@@ -2,6 +2,11 @@
 """
 Swap Performance Benchmark Script
 Tests different configurations for optimal performance
+
+Dependencies:
+    - python3
+    - Root privileges required
+    - bc command (for calculations)
 """
 
 import argparse
@@ -163,7 +168,7 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=100):
         test_script = f"""
 python3 -c "
 import time
-data = bytearray({size_mb * 1024 * 1024})
+data = bytearray({size_mb} * 1024 * 1024)
 # Touch all memory
 for i in range(0, len(data), 4096):
     data[i] = i % 256

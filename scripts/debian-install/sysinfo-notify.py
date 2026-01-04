@@ -2,6 +2,11 @@
 """
 System Information and Telegram Notification Script
 Supports personal chats and channels
+
+Dependencies:
+    - python3
+    - requests module (install with: pip3 install requests)
+    - curl command (for network info)
 """
 
 import argparse

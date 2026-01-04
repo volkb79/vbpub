@@ -86,7 +86,8 @@ main() {
     fi
     
     # Make executable
-    chmod +x "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/*.py 2>/dev/null || true
+    chmod +x "$SCRIPT_DIR/setup-swap.sh" "$SCRIPT_DIR/analyze-memory.sh" "$SCRIPT_DIR/swap-monitor.sh" "$SCRIPT_DIR/ksm-trial.sh" 2>/dev/null || true
+    chmod +x "$SCRIPT_DIR/benchmark.py" "$SCRIPT_DIR/sysinfo-notify.py" 2>/dev/null || true
     
     # Run setup
     log_info "Running swap setup (arch=$SWAP_ARCH, size=${SWAP_TOTAL_GB}GB, files=$SWAP_FILES)"

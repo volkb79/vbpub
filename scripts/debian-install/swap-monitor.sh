@@ -94,7 +94,8 @@ get_zram_stats() {
         ZRAM_ACTIVE=1
         read ZRAM_ORIG_SIZE ZRAM_COMPR_SIZE _ < /sys/block/zram0/mm_stat
         if [ "$ZRAM_COMPR_SIZE" -gt 0 ]; then
-            ZRAM_RATIO=$(echo "scale=2; $ZRAM_ORIG_SIZE / $ZRAM_COMPR_SIZE" | bc)
+            # Use shell arithmetic to avoid bc dependency
+            ZRAM_RATIO=$(awk "BEGIN {printf \"%.2f\", $ZRAM_ORIG_SIZE / $ZRAM_COMPR_SIZE}")
         fi
     fi
 }
@@ -114,7 +115,8 @@ get_zswap_stats() {
             ZSWAP_WRITTEN_BACK=$(cat /sys/kernel/debug/zswap/written_back_pages 2>/dev/null || echo 0)
             
             if [ "$ZSWAP_POOL_PAGES" -gt 0 ]; then
-                ZSWAP_WRITEBACK_RATIO=$(echo "scale=2; 100 * $ZSWAP_WRITTEN_BACK / $ZSWAP_POOL_PAGES" | bc)
+                # Use awk instead of bc
+                ZSWAP_WRITEBACK_RATIO=$(awk "BEGIN {printf \"%.2f\", 100 * $ZSWAP_WRITTEN_BACK / $ZSWAP_POOL_PAGES}")
             fi
         fi
     fi
@@ -127,7 +129,8 @@ get_pgfault_stats() {
     
     if [ -n "$PREV_PGMAJFAULT" ]; then
         PGMAJFAULT_DELTA=$((PGMAJFAULT - PREV_PGMAJFAULT))
-        PGMAJFAULT_RATE=$(echo "scale=2; $PGMAJFAULT_DELTA / $INTERVAL" | bc)
+        # Use awk instead of bc
+        PGMAJFAULT_RATE=$(awk "BEGIN {printf \"%.2f\", $PGMAJFAULT_DELTA / $INTERVAL}")
     fi
     
     PREV_PGMAJFAULT=$PGMAJFAULT
