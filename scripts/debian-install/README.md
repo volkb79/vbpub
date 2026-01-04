@@ -1,26 +1,38 @@
-# Debian Swap Configuration Toolkit
+# Debian System Setup Toolkit
 
-A comprehensive toolkit for configuring and optimizing swap on Debian 12/13 systems with support for ZRAM, ZSWAP, swap files, and ZFS zvol configurations.
+A comprehensive toolkit for Debian 12/13 system initialization including swap configuration, user environment setup, and performance benchmarking.
+
+## Features
+
+- **7 Swap Architectures**: ZRAM, ZSWAP, swap files/partitions, ZFS zvol, and combinations
+- **Intelligent Detection**: Automatic RAM, disk, and storage type detection with dynamic sizing
+- **Partition Management**: Create swap partitions at end of disk, extend root partition  
+- **User Configuration**: Automated setup for nano, Midnight Commander, iftop, htop
+- **Performance Testing**: Geekbench integration and comprehensive swap benchmarking
+- **Real-time Monitoring**: Correct metrics (pgmajfault, writeback ratio, PSI)
+- **Telegram Integration**: Automated notifications with source attribution
 
 ## Quick Start
 
-### Netcup Bootstrap (< 10KB)
+### Full System Bootstrap (< 10KB)
 
-For minimal netcup VPS bootstrap, use the lightweight bootstrap script:
+For complete system initialization on new Debian installations:
 
 ```bash
-# Download and run bootstrap (under 10KB)
+# Basic setup with swap configuration
 curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | bash
-```
 
-Or with custom configuration:
-
-```bash
+# Full setup with user config, geekbench, and Telegram notifications
 curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | \
-  SWAP_ARCH=3 SWAP_TOTAL_GB=16 SWAP_FILES=8 bash
+  SWAP_ARCH=3 SWAP_TOTAL_GB=16 RUN_GEEKBENCH=yes \
+  TELEGRAM_BOT_TOKEN=your_token TELEGRAM_CHAT_ID=your_id bash
+
+# With partition-based swap (extend root, create swap at end)
+curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | \
+  SWAP_ARCH=7 USE_PARTITION=yes EXTEND_ROOT=yes bash
 ```
 
-### Full Installation
+### Manual Installation
 
 ```bash
 # Clone repository
@@ -30,11 +42,17 @@ cd vbpub/scripts/debian-install
 # Analyze your system first (recommended)
 ./analyze-memory.sh
 
-# Run setup with defaults (ZSWAP + Swap Files, 8 files)
+# Run swap setup with defaults (ZSWAP + Swap Files, 8 files)
 sudo ./setup-swap.sh
 
-# Or customize
-sudo SWAP_ARCH=3 SWAP_TOTAL_GB=16 SWAP_FILES=8 ./setup-swap.sh
+# Configure user environments (nano, mc, iftop, htop)
+sudo ./configure-users.sh
+
+# Send system info via Telegram
+./sysinfo-notify.py --notify --geekbench
+
+# Monitor swap performance
+./swap-monitor.sh
 ```
 
 ## Architecture Options Overview
@@ -216,6 +234,151 @@ Disk space constraints:
 - Minimum 30GB disk: Use ZRAM only (arch 1) or minimal swap
 - 30-100GB disk: Use calculated swap, may reduce if needed
 - 100GB+ disk: Full calculated swap size
+
+## Bootstrap Options
+
+The bootstrap script orchestrates complete system setup beyond just swap configuration:
+
+### Bootstrap Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RUN_USER_CONFIG` | `yes` | Configure nano, mc, iftop, htop for all users |
+| `RUN_GEEKBENCH` | `no` | Run Geekbench 6 and upload results (5-10 min) |
+| `RUN_BENCHMARKS` | `no` | Run comprehensive swap benchmarks |
+| `SEND_SYSINFO` | `yes` | Send system info to Telegram if configured |
+
+### Bootstrap Execution Flow
+
+1. **Clone/update repository** from GitHub
+2. **Swap configuration** using setup-swap.sh
+3. **User environment setup** (if RUN_USER_CONFIG=yes)
+   - Install nano, mc, iftop, htop
+   - Configure for root and existing users
+   - Set /etc/skel defaults for future users
+4. **Geekbench** (if RUN_GEEKBENCH=yes)
+   - Download latest version for architecture
+   - Run CPU and compute benchmarks
+   - Upload to Geekbench Browser
+   - Extract result URL and claim URL
+5. **Swap benchmarks** (if RUN_BENCHMARKS=yes)
+   - Test block sizes, compression algorithms, allocators
+   - Test concurrency scaling
+   - Export optimal configuration
+6. **System info report** (if SEND_SYSINFO=yes)
+   - Collect hardware specs
+   - Compile configuration details
+   - Send formatted report via Telegram
+
+### Example: Complete System Setup
+
+```bash
+# Full initialization with all features
+curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | \
+  SWAP_ARCH=3 \
+  SWAP_TOTAL_GB=16 \
+  RUN_USER_CONFIG=yes \
+  RUN_GEEKBENCH=yes \
+  TELEGRAM_BOT_TOKEN=110201543:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw \
+  TELEGRAM_CHAT_ID=123456789 \
+  bash
+```
+
+## User Configuration
+
+The `configure-users.sh` script sets up consistent environments for command-line tools.
+
+### Configured Applications
+
+**nano** - Text editor
+- Tab size: 4 spaces
+- Convert tabs to spaces (Python/VSCode compatible)
+- Soft wrap long lines
+- Line numbers enabled
+- Mouse support
+- Syntax highlighting
+
+**Midnight Commander** - File manager
+- Skin: modarin256-defbg-thin
+- Custom panel format: type, name, size, owner, group, permissions, atime
+- Both panels in full user format
+- Internal viewer and editor enabled
+
+**iftop** - Network monitor
+- Bar graphs enabled
+- Port resolution on
+- DNS resolution off (faster)
+- Two-line display
+- Sort by total bandwidth
+
+**htop** - Process monitor
+- All CPU meters shown
+- Memory and swap meters
+- Custom columns for detailed process info
+- Tree view available
+- Mouse support enabled
+
+### Application Scope
+
+- **Immediate:** Configures root and all existing users (UID ≥ 1000)
+- **Future:** Sets /etc/skel defaults for new user creation
+- **Safe:** Non-destructive, only creates new config files
+
+### Manual Execution
+
+```bash
+# Run user configuration separately
+sudo ./configure-users.sh
+
+# Verify configurations
+ls -la ~/.nanorc ~/.config/mc/ ~/.iftoprc ~/.config/htop/
+```
+
+## Partition Management
+
+The toolkit includes full partition management for systems with unallocated disk space.
+
+### Supported Operations
+
+1. **Create swap partition at end of disk**
+   - Uses sfdisk for scripted partition creation
+   - Calculates proper sizes in MiB
+   - Formats as swap with mkswap
+   - Activates and adds to /etc/fstab using PARTUUID
+
+2. **Extend root partition**
+   - Resizes partition table entry
+   - Extends filesystem (ext4/xfs/btrfs)
+   - Safe online resizing where supported
+
+### Partition Management Example
+
+```bash
+# Architecture 7: ZRAM + partition overflow with root extension
+sudo SWAP_ARCH=7 USE_PARTITION=yes EXTEND_ROOT=yes \
+  SWAP_PARTITION_SIZE_GB=16 ./setup-swap.sh
+```
+
+### Manual Partition Operations
+
+The toolkit provides detailed guidance for manual partition operations when automatic execution is not desired:
+
+```bash
+# Detect current layout
+sudo ./setup-swap.sh --detect-only
+
+# Step-by-step partition creation
+# 1. Calculate sizes (sectors to MiB conversion)
+# 2. Backup partition table: sfdisk --dump /dev/vda > backup.dump
+# 3. Extend root: echo ",490492M" | sfdisk --force /dev/vda -N3
+# 4. Add swap: echo ",,S" | sfdisk --force /dev/vda -N4
+# 5. Verify: sfdisk --verify /dev/vda
+# 6. Update kernel: partprobe /dev/vda
+# 7. Resize filesystem: resize2fs /dev/vda3
+# 8. Format swap: mkswap /dev/vda4
+# 9. Activate: swapon /dev/vda4
+# 10. Add to fstab using PARTUUID
+```
 
 ## Telegram Notifications Setup
 

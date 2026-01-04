@@ -479,84 +479,258 @@ detect_disk_layout() {
     
     # Find root partition
     ROOT_PARTITION=$(findmnt -n -o SOURCE /)
-    ROOT_DISK=$(lsblk -no PKNAME "$ROOT_PARTITION")
+    ROOT_DISK=$(lsblk -no PKNAME "$ROOT_PARTITION" 2>/dev/null | head -1)
+    
+    if [ -z "$ROOT_DISK" ]; then
+        log_error "Could not determine root disk"
+        return 1
+    fi
     
     log_info "Root partition: $ROOT_PARTITION"
     log_info "Root disk: /dev/$ROOT_DISK"
     
-    # Get disk size
-    DISK_SIZE_SECTORS=$(cat "/sys/block/$ROOT_DISK/size")
+    # Get disk size using blockdev
+    DISK_SIZE_SECTORS=$(blockdev --getsz "/dev/$ROOT_DISK" 2>/dev/null || echo "0")
     DISK_SIZE_GB=$((DISK_SIZE_SECTORS / 2048 / 1024))
     
-    # Get current partition table
-    PARTITION_TABLE=$(sfdisk -d "/dev/$ROOT_DISK" 2>/dev/null || echo "")
+    log_info "Disk size: ${DISK_SIZE_GB}GB (${DISK_SIZE_SECTORS} sectors)"
     
-    log_info "Disk size: ${DISK_SIZE_GB}GB"
+    # Get root partition info
+    ROOT_PART_NUM=$(echo "$ROOT_PARTITION" | grep -oE '[0-9]+$')
+    ROOT_START=$(sfdisk -d "/dev/$ROOT_DISK" 2>/dev/null | grep "^$ROOT_PARTITION" | sed -E 's/.*start= *([0-9]+).*/\1/')
+    ROOT_SIZE=$(sfdisk -d "/dev/$ROOT_DISK" 2>/dev/null | grep "^$ROOT_PARTITION" | sed -E 's/.*size= *([0-9]+).*/\1/')
+    
+    log_info "Root partition: start=$ROOT_START, size=$ROOT_SIZE sectors"
+    
+    # Calculate free space
+    FREE_SECTORS=$((DISK_SIZE_SECTORS - ROOT_START - ROOT_SIZE))
+    FREE_GB=$((FREE_SECTORS / 2048 / 1024))
+    
+    log_info "Free space after root: ${FREE_GB}GB (${FREE_SECTORS} sectors)"
     
     return 0
 }
 
-# Create swap partition at end of disk
+# Create swap partition at end of disk using sfdisk
 create_swap_partition() {
     log_step "Creating swap partition at end of disk"
     
-    detect_disk_layout
+    # Detect layout first
+    if ! detect_disk_layout; then
+        log_error "Failed to detect disk layout"
+        return 1
+    fi
     
     # Calculate swap partition size
     if [ "$SWAP_PARTITION_SIZE_GB" = "auto" ]; then
         SWAP_PARTITION_SIZE_GB=$SWAP_TOTAL_GB
     fi
     
-    log_info "Creating ${SWAP_PARTITION_SIZE_GB}GB swap partition"
+    # Convert GB to MiB for sfdisk (1GB = 1024 MiB)
+    SWAP_SIZE_MIB=$((SWAP_PARTITION_SIZE_GB * 1024))
     
-    # Check if there's unallocated space at the end
-    LAST_PARTITION=$(lsblk -n -o NAME "/dev/$ROOT_DISK" | tail -1)
-    LAST_PARTITION_END=$(sfdisk -l "/dev/$ROOT_DISK" | grep "$LAST_PARTITION" | awk '{print $3}')
+    log_info "Creating ${SWAP_PARTITION_SIZE_GB}GB (${SWAP_SIZE_MIB}MiB) swap partition"
     
-    # Use parted to create partition at end
-    # This is a simplified version - real implementation would need more careful handling
-    log_warn "Partition creation requires careful handling and is system-specific"
-    log_warn "Manual partition creation recommended: use fdisk or parted"
+    # Check if we have enough free space
+    FREE_MIB=$((FREE_SECTORS / 2048))
+    if [ "$FREE_MIB" -lt "$SWAP_SIZE_MIB" ]; then
+        log_error "Not enough free space: ${FREE_MIB}MiB available, ${SWAP_SIZE_MIB}MiB needed"
+        return 1
+    fi
     
-    # Create swap partition (example - needs refinement)
-    # parted "/dev/$ROOT_DISK" mkpart primary linux-swap "${END_POSITION}GB" 100%
+    # Find next partition number
+    LAST_PART_NUM=$(lsblk -n -o NAME "/dev/$ROOT_DISK" | grep -oE '[0-9]+$' | sort -n | tail -1)
+    SWAP_PART_NUM=$((LAST_PART_NUM + 1))
+    SWAP_PARTITION="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
     
-    # For now, recommend manual approach
-    log_info "To create swap partition manually:"
-    log_info "  1. Use fdisk or parted to create partition at end of disk"
-    log_info "  2. Set type to 'Linux swap' (82)"
-    log_info "  3. Run: mkswap /dev/sdXN"
-    log_info "  4. Run: swapon /dev/sdXN"
-    log_info "  5. Add to /etc/fstab"
+    log_info "Creating partition ${SWAP_PART_NUM} as ${SWAP_PARTITION}"
     
-    return 1  # Not fully implemented - needs careful testing
+    # Backup current partition table
+    BACKUP_FILE="/tmp/ptable-backup-$(date +%s).dump"
+    sfdisk --dump "/dev/$ROOT_DISK" > "$BACKUP_FILE"
+    log_info "Partition table backed up to: $BACKUP_FILE"
+    
+    # Create swap partition using sfdisk
+    # Format: ",,S" means: start=next available, size=remaining, type=swap
+    # Or: ",,${SWAP_SIZE_MIB}M,S" for specific size
+    log_info "Adding swap partition with sfdisk..."
+    
+    if echo ",,${SWAP_SIZE_MIB}M,S" | sfdisk --force --append "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
+        log_success "Swap partition created successfully"
+    else
+        log_warn "sfdisk reported errors (may be normal - checking partition table)"
+    fi
+    
+    # Verify partition table
+    if sfdisk --verify "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
+        log_success "Partition table verified successfully"
+    else
+        log_error "Partition table verification failed"
+        return 1
+    fi
+    
+    # Inform kernel of partition table changes
+    log_info "Informing kernel of partition table changes..."
+    if command -v partprobe >/dev/null 2>&1; then
+        partprobe "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
+    else
+        partx --update "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
+    fi
+    
+    # Wait for device to appear
+    log_info "Waiting for ${SWAP_PARTITION} to appear..."
+    count=0
+    while [ ! -b "$SWAP_PARTITION" ] && [ "$count" -lt 10 ]; do
+        sleep 1
+        count=$((count + 1))
+    done
+    
+    if [ ! -b "$SWAP_PARTITION" ]; then
+        log_error "Swap partition ${SWAP_PARTITION} did not appear"
+        return 1
+    fi
+    
+    # Format as swap
+    log_info "Formatting ${SWAP_PARTITION} as swap..."
+    if mkswap --verbose "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
+        log_success "Swap partition formatted successfully"
+    else
+        log_error "Failed to format swap partition"
+        return 1
+    fi
+    
+    # Get PARTUUID for fstab
+    SWAP_PARTUUID=$(blkid "$SWAP_PARTITION" | sed -E 's/.*(PARTUUID="[^"]+").*/\1/' | tr -d '"')
+    
+    log_info "Swap PARTUUID: $SWAP_PARTUUID"
+    
+    # Activate swap
+    log_info "Activating swap partition..."
+    if swapon --verbose -p "$SWAP_PRIORITY" "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
+        log_success "Swap partition activated"
+    else
+        log_error "Failed to activate swap partition"
+        return 1
+    fi
+    
+    # Add to fstab using PARTUUID
+    log_info "Adding swap to /etc/fstab..."
+    if ! grep -q "$SWAP_PARTUUID" /etc/fstab 2>/dev/null; then
+        echo "PARTUUID=$SWAP_PARTUUID none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+        log_success "Added to /etc/fstab"
+    else
+        log_info "Already in /etc/fstab"
+    fi
+    
+    log_success "Swap partition setup complete: ${SWAP_PARTITION} (${SWAP_PARTITION_SIZE_GB}GB)"
+    
+    return 0
 }
 
 # Extend root partition
 extend_root_partition() {
     log_step "Extending root partition"
     
-    detect_disk_layout
-    
-    log_warn "Root partition extension requires careful handling"
-    log_warn "Recommend using: growpart, resize2fs, or xfs_growfs"
+    # Detect layout first
+    if ! detect_disk_layout; then
+        log_error "Failed to detect disk layout"
+        return 1
+    fi
     
     # Check filesystem type
     FS_TYPE=$(findmnt -n -o FSTYPE /)
     
     log_info "Root filesystem: $FS_TYPE"
-    log_info "To extend root partition manually:"
-    log_info "  1. Grow partition: growpart /dev/$ROOT_DISK <partition_number>"
+    log_info "Root partition: $ROOT_PARTITION"
     
-    if [ "$FS_TYPE" = "ext4" ]; then
-        log_info "  2. Resize filesystem: resize2fs $ROOT_PARTITION"
-    elif [ "$FS_TYPE" = "xfs" ]; then
-        log_info "  2. Resize filesystem: xfs_growfs /"
-    elif [ "$FS_TYPE" = "btrfs" ]; then
-        log_info "  2. Resize filesystem: btrfs filesystem resize max /"
+    # Calculate new size for root partition
+    # Formula: Total sectors - start of root - space for swap - 1 (for rounding)
+    SWAP_SIZE_MIB=$((SWAP_PARTITION_SIZE_GB * 1024))
+    SWAP_SIZE_SECTORS=$((SWAP_SIZE_MIB * 2048))
+    
+    # Calculate remaining space for root in MiB
+    REMAINING_SECTORS=$((DISK_SIZE_SECTORS - ROOT_START - SWAP_SIZE_SECTORS - 1))
+    REMAINING_MIB=$((REMAINING_SECTORS / 2048))
+    
+    log_info "New root partition size: ${REMAINING_MIB}MiB"
+    
+    if [ "$REMAINING_MIB" -le 0 ]; then
+        log_error "No space available for root partition extension"
+        return 1
     fi
     
-    return 1  # Not fully implemented - needs careful testing
+    # Backup current partition table
+    BACKUP_FILE="/tmp/ptable-backup-$(date +%s).dump"
+    sfdisk --dump "/dev/$ROOT_DISK" > "$BACKUP_FILE"
+    log_info "Partition table backed up to: $BACKUP_FILE"
+    
+    # Resize partition using sfdisk
+    log_info "Resizing root partition ${ROOT_PART_NUM}..."
+    if echo ",${REMAINING_MIB}M" | sfdisk --force "/dev/$ROOT_DISK" -N"${ROOT_PART_NUM}" 2>&1 | tee -a "$LOG_FILE"; then
+        log_success "Root partition resized in partition table"
+    else
+        log_warn "sfdisk reported errors (may be normal - checking partition table)"
+    fi
+    
+    # Verify partition table
+    if sfdisk --verify "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
+        log_success "Partition table verified successfully"
+    else
+        log_error "Partition table verification failed"
+        return 1
+    fi
+    
+    # Inform kernel of partition table changes
+    log_info "Informing kernel of partition table changes..."
+    if command -v partprobe >/dev/null 2>&1; then
+        partprobe "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
+    else
+        partx --update "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
+    fi
+    
+    # Resize filesystem
+    log_info "Resizing ${FS_TYPE} filesystem..."
+    
+    case "$FS_TYPE" in
+        ext4|ext3|ext2)
+            # Check filesystem first
+            log_info "Checking filesystem integrity..."
+            e2fsck -f -y "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE" || true
+            
+            # Resize filesystem
+            if resize2fs "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
+                log_success "ext4 filesystem resized successfully"
+            else
+                log_error "Failed to resize ext4 filesystem"
+                return 1
+            fi
+            ;;
+        xfs)
+            if xfs_growfs / 2>&1 | tee -a "$LOG_FILE"; then
+                log_success "XFS filesystem resized successfully"
+            else
+                log_error "Failed to resize XFS filesystem"
+                return 1
+            fi
+            ;;
+        btrfs)
+            if btrfs filesystem resize max / 2>&1 | tee -a "$LOG_FILE"; then
+                log_success "Btrfs filesystem resized successfully"
+            else
+                log_error "Failed to resize Btrfs filesystem"
+                return 1
+            fi
+            ;;
+        *)
+            log_error "Unsupported filesystem type: $FS_TYPE"
+            log_info "Manual resize required"
+            return 1
+            ;;
+    esac
+    
+    log_success "Root partition extended successfully"
+    
+    return 0
 }
 
 # Setup ZRAM with partition overflow
@@ -693,10 +867,11 @@ setup_architecture() {
             log_info "Architecture 3: ZSWAP + Swap Files (Recommended)"
             setup_zswap
             if [ "$USE_PARTITION" = "yes" ]; then
-                log_warn "Partition-based swap not typically used with ZSWAP"
-                log_info "Falling back to swap files"
+                log_info "  Using partition instead of files"
+                create_swap_partition
+            else
+                create_swap_files
             fi
-            create_swap_files
             ;;
         4)
             log_info "Architecture 4: Swap Files Only"
