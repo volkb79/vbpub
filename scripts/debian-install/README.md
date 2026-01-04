@@ -459,28 +459,79 @@ ls -la ~/.nanorc ~/.config/mc/ ~/.iftoprc ~/.config/htop/
 
 ## Partition Management
 
-The toolkit includes full partition management for systems with unallocated disk space.
+The toolkit includes full partition management supporting two common VM disk layouts.
+
+### Supported Disk Layouts
+
+**1. Minimal Root Layout** (e.g., 9GB root with 500GB free)
+- Root partition uses only a small portion of disk
+- Plenty of unallocated space after root partition
+- **Strategy:** Simply append swap partition to free space
+- **Advantages:** No filesystem resizing needed, safe and fast
+- **Example:** Debian minimal install with "small layout for individual use"
+
+**2. Full Root Layout** (root uses entire disk)
+- Root partition takes all available disk space
+- No free space after root partition
+- **Strategy:** Shrink root partition, then add swap partition
+- **Process:**
+  1. Resize root partition in partition table
+  2. Append swap partition
+  3. Shrink root filesystem to match new partition size
+- **Requirements:** Filesystem must support shrinking (ext4, btrfs)
+- **Not Supported:** XFS (cannot shrink)
+
+The script automatically detects the layout and applies the appropriate strategy.
 
 ### Supported Operations
 
 1. **Create swap partition at end of disk**
-   - Uses sfdisk for scripted partition creation
-   - Calculates proper sizes in MiB
+   - Auto-detects disk layout (minimal root vs. full root)
+   - For minimal root: Appends to free space
+   - For full root: Shrinks root, then appends
+   - Uses sfdisk for scripted operations
    - Formats as swap with mkswap
    - Activates and adds to /etc/fstab using PARTUUID
 
-2. **Extend root partition**
-   - Resizes partition table entry
-   - Extends filesystem (ext4/xfs/btrfs)
-   - Safe online resizing where supported
+2. **Filesystem resizing** (for full root layout)
+   - ext4/ext3/ext2: Supports online shrinking with resize2fs
+   - btrfs: Supports online resizing
+   - XFS: **Not supported** (cannot shrink, must use minimal root layout)
 
-### Partition Management Example
+### Partition Management Examples
 
 ```bash
-# Architecture 7: ZRAM + partition overflow with root extension
-sudo SWAP_ARCH=7 USE_PARTITION=yes EXTEND_ROOT=yes \
-  SWAP_PARTITION_SIZE_GB=16 ./setup-swap.sh
+# Minimal root layout - append swap to free space
+sudo SWAP_ARCH=3 USE_PARTITION=yes SWAP_PARTITION_SIZE_GB=16 ./setup-swap.sh
+
+# Full root layout - shrink root and add swap (ext4/btrfs only)
+sudo SWAP_ARCH=3 USE_PARTITION=yes SWAP_PARTITION_SIZE_GB=32 ./setup-swap.sh
+
+# Architecture 7: ZRAM + partition overflow
+sudo SWAP_ARCH=7 USE_PARTITION=yes SWAP_PARTITION_SIZE_GB=16 ./setup-swap.sh
 ```
+
+### Safety Features
+
+- **Automatic layout detection:** Script detects which scenario applies
+- **Partition table backup:** Saved before any changes
+- **Verification:** Partition table verified after changes
+- **PARTUUID usage:** Stable across mkswap calls (UUID changes each time)
+- **Error handling:** Detailed error messages and rollback guidance
+- **XFS protection:** Refuses to proceed with full root + XFS
+
+### Technical Notes
+
+**sfdisk on in-use disk:**
+- Uses `--force --no-reread` flags together
+- Always reports: "Re-reading the partition table failed: Device or resource busy"
+- This is **expected behavior** when disk is mounted
+- Kernel partition table updated with `partprobe` or `partx --update` after
+
+**PARTUUID vs UUID:**
+- PARTUUID: Partition UUID (stable, doesn't change)
+- UUID: Filesystem/swap UUID (changes on each mkswap)
+- Use PARTUUID in /etc/fstab for swap partitions
 
 ### Manual Partition Operations
 

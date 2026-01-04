@@ -3,6 +3,16 @@
 # Comprehensive swap orchestrator supporting 7 architectures
 # Requires: Debian 12/13, root privileges
 #
+# Supported Disk Layouts for Partition-Based Swap:
+# 1. MINIMAL ROOT: Small root partition (~9GB) with remaining unallocated space
+#    - Simply appends swap partition to free space
+#    - No filesystem resizing needed
+# 2. FULL ROOT: Root partition uses entire disk
+#    - Shrinks root partition (partition table + filesystem)
+#    - Adds swap partition to reclaimed space
+#    - Requires filesystem that supports shrinking (ext4, btrfs)
+#    - XFS not supported (cannot shrink)
+#
 # Partition Management Notes:
 # - Uses sfdisk for scripted partition operations
 # - When disk is in-use, sfdisk with --force --no-reread will succeed but report:
@@ -486,7 +496,7 @@ setup_zfs_zvol() {
     log_info "ZFS zvol swap setup complete"
 }
 
-# Detect disk layout
+# Detect disk layout and determine strategy
 detect_disk_layout() {
     log_step "Detecting disk layout"
     
@@ -515,11 +525,20 @@ detect_disk_layout() {
     
     log_info "Root partition: start=$ROOT_START, size=$ROOT_SIZE sectors"
     
-    # Calculate free space
+    # Calculate free space after root partition
     FREE_SECTORS=$((DISK_SIZE_SECTORS - ROOT_START - ROOT_SIZE))
     FREE_GB=$((FREE_SECTORS / 2048 / 1024))
     
     log_info "Free space after root: ${FREE_GB}GB (${FREE_SECTORS} sectors)"
+    
+    # Determine disk layout type
+    if [ "$FREE_GB" -ge 10 ]; then
+        DISK_LAYOUT="minimal_root"
+        log_info "Disk layout: MINIMAL ROOT (root partition uses partial disk, ${FREE_GB}GB free)"
+    else
+        DISK_LAYOUT="full_root"
+        log_info "Disk layout: FULL ROOT (root partition uses entire disk, need to shrink)"
+    fi
     
     return 0
 }
@@ -544,38 +563,100 @@ create_swap_partition() {
     
     log_info "Creating ${SWAP_PARTITION_SIZE_GB}GB (${SWAP_SIZE_MIB}MiB) swap partition"
     
-    # Check if we have enough free space
-    FREE_MIB=$((FREE_SECTORS / 2048))
-    if [ "$FREE_MIB" -lt "$SWAP_SIZE_MIB" ]; then
-        log_error "Not enough free space: ${FREE_MIB}MiB available, ${SWAP_SIZE_MIB}MiB needed"
-        return 1
-    fi
-    
-    # Find next partition number
-    LAST_PART_NUM=$(lsblk -n -o NAME "/dev/$ROOT_DISK" | grep -oE '[0-9]+$' | sort -n | tail -1)
-    SWAP_PART_NUM=$((LAST_PART_NUM + 1))
-    SWAP_PARTITION="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
-    
-    log_info "Creating partition ${SWAP_PART_NUM} as ${SWAP_PARTITION}"
-    
     # Backup current partition table
     BACKUP_FILE="/tmp/ptable-backup-$(date +%s).dump"
     sfdisk --dump "/dev/$ROOT_DISK" > "$BACKUP_FILE"
     log_info "Partition table backed up to: $BACKUP_FILE"
     
-    # Create swap partition using sfdisk
-    # Best practice: Use size only, let sfdisk handle alignment
-    # Format: ",,S" for remaining space or ",,<size>M,S" for specific size
-    # Note: Always reports "Re-reading the partition table failed: Device or resource busy"
-    #       This is expected when disk is in use, we use partprobe after
-    log_info "Adding swap partition with sfdisk..."
-    
-    # Use --force with --no-reread to work on in-use disk
-    # The command will succeed but always report ioctl() failure - this is expected
-    if echo ",,${SWAP_SIZE_MIB}M,S" | sfdisk --force --no-reread --append "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
-        log_info "Partition table updated (ioctl error is expected for in-use disk)"
+    # Handle based on disk layout type
+    if [ "$DISK_LAYOUT" = "minimal_root" ]; then
+        # Scenario 1: Minimal root with free space
+        # Just append swap partition to the free space
+        log_info "Layout: Minimal root - appending swap to free space"
+        
+        # Check if we have enough free space
+        FREE_MIB=$((FREE_SECTORS / 2048))
+        if [ "$FREE_MIB" -lt "$SWAP_SIZE_MIB" ]; then
+            log_error "Not enough free space: ${FREE_MIB}MiB available, ${SWAP_SIZE_MIB}MiB needed"
+            return 1
+        fi
+        
+        # Find next partition number
+        LAST_PART_NUM=$(lsblk -n -o NAME "/dev/$ROOT_DISK" | grep -oE '[0-9]+$' | sort -n | tail -1)
+        SWAP_PART_NUM=$((LAST_PART_NUM + 1))
+        SWAP_PARTITION="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
+        
+        log_info "Creating partition ${SWAP_PART_NUM} as ${SWAP_PARTITION}"
+        
+        # Append swap partition using sfdisk
+        # Format: ",,<size>M,S" for specific size or ",,S" for all remaining space
+        if echo ",,${SWAP_SIZE_MIB}M,S" | sfdisk --force --no-reread --append "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
+            log_info "Partition table updated (ioctl error is expected for in-use disk)"
+        else
+            log_warn "sfdisk reported errors - checking partition table"
+        fi
+        
     else
-        log_warn "sfdisk reported errors - checking partition table"
+        # Scenario 2: Full root - need to shrink root and add swap
+        log_info "Layout: Full root - shrinking root partition and adding swap"
+        
+        # Calculate new root size (total - start - swap space - 1 for rounding)
+        SWAP_SIZE_SECTORS=$((SWAP_SIZE_MIB * 2048))
+        NEW_ROOT_SIZE_SECTORS=$((DISK_SIZE_SECTORS - ROOT_START - SWAP_SIZE_SECTORS - 2048))
+        NEW_ROOT_SIZE_MIB=$((NEW_ROOT_SIZE_SECTORS / 2048))
+        
+        log_info "Shrinking root partition from ${ROOT_SIZE} to ${NEW_ROOT_SIZE_SECTORS} sectors"
+        log_info "New root size: ${NEW_ROOT_SIZE_MIB}MiB"
+        
+        # Get filesystem type to check if we can shrink
+        FS_TYPE=$(findmnt -n -o FSTYPE /)
+        log_info "Root filesystem: $FS_TYPE"
+        
+        # Check if filesystem supports online shrinking
+        case "$FS_TYPE" in
+            ext4|ext3|ext2)
+                log_info "Filesystem supports online/offline resizing"
+                ;;
+            xfs)
+                log_error "XFS does not support shrinking - cannot proceed"
+                log_info "Recommendation: Use minimal root layout or backup/reinstall"
+                return 1
+                ;;
+            btrfs)
+                log_info "Btrfs supports online resizing"
+                ;;
+            *)
+                log_warn "Unknown filesystem type: $FS_TYPE"
+                log_warn "Proceeding with caution..."
+                ;;
+        esac
+        
+        # First, resize the root partition in partition table
+        log_info "Step 1: Resizing root partition in partition table..."
+        if echo ",${NEW_ROOT_SIZE_MIB}M" | sfdisk --force --no-reread "/dev/$ROOT_DISK" -N"${ROOT_PART_NUM}" 2>&1 | tee -a "$LOG_FILE"; then
+            log_info "Root partition resized in partition table (ioctl error is expected)"
+        else
+            log_error "Failed to resize root partition"
+            return 1
+        fi
+        
+        # Verify partition table
+        if ! sfdisk --verify "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
+            log_error "Partition table verification failed after root resize"
+            return 1
+        fi
+        
+        # Second, append swap partition
+        log_info "Step 2: Appending swap partition..."
+        SWAP_PART_NUM=$((ROOT_PART_NUM + 1))
+        SWAP_PARTITION="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
+        
+        if echo ",,S" | sfdisk --force --no-reread --append "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
+            log_info "Swap partition added to partition table"
+        else
+            log_error "Failed to add swap partition"
+            return 1
+        fi
     fi
     
     # Verify partition table
@@ -596,7 +677,48 @@ create_swap_partition() {
         log_info "Used partx to update kernel partition table"
     fi
     
-    # Wait for device to appear
+    # If we shrunk root partition, resize the filesystem now
+    if [ "$DISK_LAYOUT" = "full_root" ]; then
+        log_info "Step 3: Resizing root filesystem to match new partition size..."
+        
+        case "$FS_TYPE" in
+            ext4|ext3|ext2)
+                # For ext filesystems, need to check first, then resize
+                log_info "Checking ext filesystem integrity..."
+                # Online check (read-only)
+                e2fsck -n -f "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE" || true
+                
+                log_info "Resizing ext filesystem to match partition..."
+                if resize2fs "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
+                    log_success "Ext filesystem resized successfully"
+                else
+                    log_error "Failed to resize ext filesystem"
+                    log_warn "Partition table changed but filesystem not shrunk!"
+                    log_warn "System may be in inconsistent state - restore from backup: $BACKUP_FILE"
+                    return 1
+                fi
+                ;;
+            btrfs)
+                log_info "Resizing btrfs filesystem..."
+                # Calculate target size in bytes
+                TARGET_SIZE=$((NEW_ROOT_SIZE_SECTORS * 512))
+                if btrfs filesystem resize "${TARGET_SIZE}" / 2>&1 | tee -a "$LOG_FILE"; then
+                    log_success "Btrfs filesystem resized successfully"
+                else
+                    log_error "Failed to resize btrfs filesystem"
+                    return 1
+                fi
+                ;;
+            *)
+                log_error "Cannot resize filesystem type: $FS_TYPE"
+                log_warn "Partition table updated but filesystem not resized!"
+                log_warn "Manual intervention required"
+                return 1
+                ;;
+        esac
+    fi
+    
+    # Wait for swap device to appear
     log_info "Waiting for ${SWAP_PARTITION} to appear..."
     count=0
     while [ ! -b "$SWAP_PARTITION" ] && [ "$count" -lt 10 ]; do
