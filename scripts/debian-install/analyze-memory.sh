@@ -265,10 +265,9 @@ analyze_hot_cold_pages() {
         
         local full_avg10=$(grep '^full' /proc/pressure/memory | awk '{print $2}' | cut -d'=' -f2)
         if [ -n "$full_avg10" ]; then
-            local pressure_val=$(echo "$full_avg10" | awk '{printf "%.1f", $1}')
-            if (( $(echo "$pressure_val > 5.0" | bc -l 2>/dev/null || echo 0) )); then
+            if awk -v val="$full_avg10" 'BEGIN {exit !(val > 5.0)}'; then
                 echo -e "   ${RED}⚠️  Severe memory pressure (full avg10 > 5%)${NC}"
-            elif (( $(echo "$pressure_val > 2.0" | bc -l 2>/dev/null || echo 0) )); then
+            elif awk -v val="$full_avg10" 'BEGIN {exit !(val > 2.0)}'; then
                 echo -e "   ${YELLOW}⚠️  Significant memory pressure${NC}"
             else
                 echo -e "   ${GREEN}✅ Memory pressure normal${NC}"

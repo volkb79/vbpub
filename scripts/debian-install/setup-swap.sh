@@ -143,7 +143,8 @@ create_swap_files() {
         fi
         
         log_info "Creating $swapfile (${file_size_gb}GB)..."
-        dd if=/dev/zero of="$swapfile" bs=1M count=$((file_size_gb * 1024)) status=progress 2>&1 | tail -1
+        # Use fallocate for better performance
+        fallocate -l ${file_size_gb}G "$swapfile"
         chmod 600 "$swapfile"
         mkswap "$swapfile" >/dev/null
         swapon "$swapfile" -p 10

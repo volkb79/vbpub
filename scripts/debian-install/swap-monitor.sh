@@ -143,11 +143,10 @@ monitor_loop() {
             
             # Interpret full avg10
             if [ -n "$full_avg10" ]; then
-                local pressure_val=$(echo "$full_avg10" | awk '{printf "%.1f", $1}')
                 echo ""
-                if (( $(echo "$pressure_val > 5.0" | bc -l 2>/dev/null || echo 0) )); then
+                if awk -v val="$full_avg10" 'BEGIN {exit !(val > 5.0)}'; then
                     echo -e "${RED}⚠️  SEVERE memory pressure (full avg10 > 5%)${NC}"
-                elif (( $(echo "$pressure_val > 2.0" | bc -l 2>/dev/null || echo 0) )); then
+                elif awk -v val="$full_avg10" 'BEGIN {exit !(val > 2.0)}'; then
                     echo -e "${YELLOW}⚠️  Significant memory pressure (full avg10 > 2%)${NC}"
                 else
                     echo -e "${GREEN}✅ Memory pressure normal${NC}"
@@ -178,7 +177,7 @@ monitor_loop() {
                         local wb_ratio=$(awk "BEGIN {printf \"%.3f\", $written_back / $stored}")
                         echo "Writeback ratio:  $wb_ratio"
                         
-                        if (( $(echo "$wb_ratio > 0.3" | bc -l 2>/dev/null || echo 0) )); then
+                        if awk -v ratio="$wb_ratio" 'BEGIN {exit !(ratio > 0.3)}'; then
                             echo -e "${RED}⚠️  Pool too small (writeback ratio > 0.3)${NC}"
                         else
                             echo -e "${GREEN}✅ Pool size adequate${NC}"
