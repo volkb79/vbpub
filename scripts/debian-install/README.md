@@ -187,6 +187,85 @@ SWAP_ARCH=7 USE_PARTITION=yes EXTEND_ROOT=yes ./setup-swap.sh
 
 ## Configuration Reference
 
+## Swap Configuration Variables
+
+### Understanding Variable Interaction
+
+#### Basic Concept
+You specify **how much disk-based swap** you want (`SWAP_TOTAL_GB`), then choose **how it's stored**:
+- **File-based**: Multiple files in `/var/swap/` (default)
+- **Partition-based**: Dedicated partition(s) at end of disk
+
+#### Variables
+
+**SWAP_TOTAL_GB** (default: `auto`)
+- Total size of disk-based swap space
+- `auto`: Calculated based on RAM (2x for ≤2GB RAM, 1x for ≤8GB, etc.)
+- Example: `SWAP_TOTAL_GB=16` means 16GB of disk-based swap
+
+**USE_PARTITION** (default: `no`)
+- `no`: Use swap files in `/var/swap/`
+- `yes`: Use dedicated partition at end of disk
+
+**SWAP_FILES** (default: `8`)
+- When `USE_PARTITION=no`: Number of swap files to create
+  - Each file is `SWAP_TOTAL_GB / SWAP_FILES` in size
+  - Multiple files enable I/O parallelism
+- When `USE_PARTITION=yes` and `SWAP_BACKING=ext4`: Number of swap files on the partition
+- When `USE_PARTITION=yes` and `SWAP_BACKING=direct`: Ignored (single partition)
+
+**SWAP_PARTITION_SIZE_GB** (default: `auto`)
+- Only relevant when `USE_PARTITION=yes`
+- `auto`: Uses `SWAP_TOTAL_GB` value
+- Explicit value: Override partition size
+
+**SWAP_BACKING** (default: `direct`)
+- Only relevant when `USE_PARTITION=yes`
+- `direct`: Native swap partition (recommended)
+- `ext4`: ext4 filesystem with swap files on it (more flexible)
+
+#### Examples
+
+```bash
+# Example 1: 16GB swap in 8 files (default behavior)
+SWAP_TOTAL_GB=16 SWAP_FILES=8 ./bootstrap.sh
+# Result: 8 × 2GB files in /var/swap/
+
+# Example 2: 16GB swap in single partition
+SWAP_TOTAL_GB=16 USE_PARTITION=yes ./bootstrap.sh  
+# Result: 16GB partition /dev/vdaN formatted as swap
+
+# Example 3: 16GB partition with 4 files on ext4
+SWAP_TOTAL_GB=16 USE_PARTITION=yes SWAP_BACKING=ext4 SWAP_FILES=4 ./bootstrap.sh
+# Result: 16GB ext4 partition with 4 × 4GB swap files
+
+# Example 4: Auto-sized swap on partition
+SWAP_ARCH=3 USE_PARTITION=yes ./bootstrap.sh
+# Result: Auto-calculated size based on RAM, single partition
+```
+
+### Debug Mode
+
+Enable detailed tracing and verbose debug output:
+```bash
+DEBUG_MODE=yes ./bootstrap.sh
+```
+
+This enables:
+- Bash trace mode (`set -x`) - shows every command executed
+- Verbose debug output from `log_debug()` calls
+- Detailed command execution logs
+- Useful for troubleshooting issues or understanding script behavior
+
+Example with debug mode:
+```bash
+# Debug a specific swap configuration
+DEBUG_MODE=yes SWAP_ARCH=3 USE_PARTITION=yes ./setup-swap.sh
+
+# Debug full bootstrap process
+DEBUG_MODE=yes SWAP_TOTAL_GB=16 ./bootstrap.sh
+```
+
 ### Environment Variables
 
 | Variable | Default | Description |
@@ -206,6 +285,9 @@ SWAP_ARCH=7 USE_PARTITION=yes EXTEND_ROOT=yes ./setup-swap.sh
 | `SWAP_PARTITION_SIZE_GB` | `auto` | Size for swap partition |
 | `SWAP_BACKING` | `direct` | Swap backing: `direct` (native swap) or `ext4` (filesystem-backed) |
 | `EXTEND_ROOT` | `yes` | Extend root partition after creating swap (yes/no) |
+| `DEBUG_MODE` | `no` | Enable bash trace mode and verbose debug logging (yes/no) |
+| `RUN_GEEKBENCH` | `yes` | Run Geekbench benchmark during bootstrap (yes/no) |
+| `RUN_BENCHMARKS` | `yes` | Run swap benchmarks during bootstrap (yes/no) |
 | `TELEGRAM_BOT_TOKEN` | - | Telegram bot token for notifications |
 | `TELEGRAM_CHAT_ID` | - | Telegram chat ID for notifications |
 

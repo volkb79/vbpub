@@ -37,6 +37,12 @@
 
 set -euo pipefail
 
+# Debug mode
+DEBUG_MODE="${DEBUG_MODE:-no}"
+if [ "$DEBUG_MODE" = "yes" ]; then
+    set -x  # Enable bash trace
+fi
+
 # Configuration variables with defaults
 SWAP_ARCH="${SWAP_ARCH:-3}"  # 1-7, default: ZSWAP + Swap Files
 SWAP_TOTAL_GB="${SWAP_TOTAL_GB:-auto}"
@@ -74,7 +80,11 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_success() { echo -e "${GREEN}[SUCCESS]${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
-log_debug() { echo -e "${CYAN}[DEBUG]${NC} $*"; }
+log_debug() { 
+    if [ "$DEBUG_MODE" = "yes" ]; then
+        echo -e "${CYAN}[DEBUG]${NC} $*"
+    fi
+}
 log_step() { echo -e "${BLUE}[STEP]${NC} $*"; }
 
 # Get system identification
@@ -185,8 +195,9 @@ detect_system() {
     fi
     log_debug "Available compressors: $AVAILABLE_COMPRESSORS"
     
-    # Detect storage type (SSD vs HDD)
+    # Detect storage type (SSD vs HDD) and disk info
     STORAGE_TYPE="unknown"
+    ROOT_PARTITION=$(findmnt -n -o SOURCE / 2>/dev/null || echo "unknown")
     ROOT_DISK=$(df / | tail -1 | awk '{print $1}' | sed 's/[0-9]*$//' | sed 's|/dev/||')
     if [ -f "/sys/block/${ROOT_DISK}/queue/rotational" ]; then
         if [ "$(cat /sys/block/${ROOT_DISK}/queue/rotational)" = "0" ]; then
@@ -259,6 +270,147 @@ calculate_swap_sizes() {
             log_warn "Current compressor is lz4. Consider zstd for better compression ratio."
         fi
     fi
+}
+
+# Print system analysis and execution plan
+print_system_analysis_and_plan() {
+    log_step "System Analysis & Configuration Plan"
+    echo ""
+    echo "╔═══════════════════════════════════════════════════════╗"
+    echo "║              SYSTEM ANALYSIS                          ║"
+    echo "╚═══════════════════════════════════════════════════════╝"
+    echo ""
+    echo "Hardware Detected:"
+    echo "  RAM:           ${RAM_GB}GB"
+    echo "  Disk Space:    ${DISK_GB}GB available"
+    echo "  CPU Cores:     ${CPU_CORES}"
+    echo "  Storage Type:  ${STORAGE_TYPE}"
+    if [ "$USE_PARTITION" = "yes" ]; then
+        echo "  Root Disk:     /dev/${ROOT_DISK}"
+        echo "  Root Partition: ${ROOT_PARTITION}"
+    fi
+    echo ""
+    
+    echo "Current Swap Status:"
+    if swapon --show | grep -q "/"; then
+        swapon --show
+    else
+        echo "  No active swap"
+    fi
+    echo ""
+    
+    echo "╔═══════════════════════════════════════════════════════╗"
+    echo "║           DERIVED CONFIGURATION                       ║"
+    echo "╚═══════════════════════════════════════════════════════╝"
+    echo ""
+    echo "Selected Architecture: $SWAP_ARCH"
+    case $SWAP_ARCH in
+        1) echo "  Type: ZRAM Only (no disk-based swap)" ;;
+        2) echo "  Type: ZRAM + Disk Swap (two-tier)" ;;
+        3) echo "  Type: ZSWAP + Disk Swap (recommended)" ;;
+        4) echo "  Type: Disk Swap Only" ;;
+        5) echo "  Type: ZFS zvol Compressed Swap" ;;
+        6) echo "  Type: ZRAM + ZFS zvol" ;;
+        7) echo "  Type: ZRAM + Uncompressed Partition" ;;
+    esac
+    echo ""
+    
+    if [ "$SWAP_ARCH" -eq 1 ] || [ "$SWAP_ARCH" -eq 2 ] || [ "$SWAP_ARCH" -eq 6 ] || [ "$SWAP_ARCH" -eq 7 ]; then
+        echo "ZRAM Configuration:"
+        echo "  Size:          ${ZRAM_SIZE_GB}GB"
+        echo "  Compressor:    ${ZRAM_COMPRESSOR}"
+        echo "  Priority:      ${ZRAM_PRIORITY}"
+        echo ""
+    fi
+    
+    if [ "$SWAP_ARCH" -eq 3 ]; then
+        echo "ZSWAP Configuration:"
+        echo "  Pool Size:     ${ZSWAP_POOL_PERCENT}% of RAM"
+        echo "  Compressor:    ${ZSWAP_COMPRESSOR}"
+        echo ""
+    fi
+    
+    if [ "$SWAP_ARCH" -ne 1 ]; then
+        echo "Disk-based Swap Configuration:"
+        echo "  Total Size:    ${SWAP_TOTAL_GB}GB"
+        
+        if [ "$USE_PARTITION" = "yes" ]; then
+            echo "  Backing:       Partition-based"
+            if [ "$SWAP_PARTITION_SIZE_GB" = "auto" ]; then
+                echo "  Partition Size: ${SWAP_TOTAL_GB}GB (auto)"
+            else
+                echo "  Partition Size: ${SWAP_PARTITION_SIZE_GB}GB"
+            fi
+            echo "  Type:          ${SWAP_BACKING}"
+            if [ "$SWAP_BACKING" = "ext4" ]; then
+                echo "  Files:         ${SWAP_FILES} files on ext4 partition"
+            fi
+        else
+            echo "  Backing:       File-based"
+            echo "  Files:         ${SWAP_FILES} × ${SWAP_FILE_SIZE_GB}GB"
+            echo "  Location:      ${SWAP_DIR}/"
+        fi
+        echo "  Priority:      ${SWAP_PRIORITY}"
+        echo ""
+    fi
+    
+    echo "Kernel Parameters:"
+    echo "  vm.swappiness: $([ "$RAM_GB" -le 2 ] && echo "80" || [ "$RAM_GB" -ge 16 ] && echo "10" || echo "60")"
+    echo "  vm.page-cluster: $([ "$STORAGE_TYPE" = "hdd" ] && echo "4 (64KB)" || echo "3 (32KB)")"
+    echo ""
+    
+    echo "╔═══════════════════════════════════════════════════════╗"
+    echo "║              EXECUTION PLAN                           ║"
+    echo "╚═══════════════════════════════════════════════════════╝"
+    echo ""
+    echo "The following changes will be made:"
+    echo "  1. Disable any existing swap"
+    
+    if [ "$SWAP_ARCH" -eq 1 ] || [ "$SWAP_ARCH" -eq 2 ] || [ "$SWAP_ARCH" -eq 6 ] || [ "$SWAP_ARCH" -eq 7 ]; then
+        echo "  2. Create ZRAM device (${ZRAM_SIZE_GB}GB compressed)"
+    fi
+    
+    if [ "$SWAP_ARCH" -eq 3 ]; then
+        echo "  2. Enable ZSWAP (${ZSWAP_POOL_PERCENT}% pool, ${ZSWAP_COMPRESSOR} compression)"
+    fi
+    
+    if [ "$USE_PARTITION" = "yes" ] && [ "$SWAP_ARCH" -ne 1 ]; then
+        echo "  3. Create swap partition at end of disk"
+        if [ "$EXTEND_ROOT" = "yes" ]; then
+            echo "     - Extend root partition to use remaining space"
+            local swap_size="${SWAP_PARTITION_SIZE_GB}"
+            [ "$swap_size" = "auto" ] && swap_size="${SWAP_TOTAL_GB}"
+            echo "     - Reserve ${swap_size}GB at end for swap"
+        fi
+        if [ "$SWAP_BACKING" = "ext4" ]; then
+            echo "     - Format partition as ext4"
+            echo "     - Create ${SWAP_FILES} swap files on partition"
+        else
+            echo "     - Format partition as native swap"
+        fi
+    elif [ "$SWAP_ARCH" -ne 1 ]; then
+        echo "  3. Create ${SWAP_FILES} swap files in ${SWAP_DIR}/"
+    fi
+    
+    echo "  4. Configure kernel parameters in ${SYSCTL_CONF}"
+    echo "  5. Add swap to /etc/fstab for persistence"
+    echo ""
+    
+    if [ "$DISK_GB" -lt 30 ] && [ "$SWAP_ARCH" -ne 1 ]; then
+        log_warn "⚠️  Low disk space detected (<30GB)"
+        log_warn "⚠️  Consider Architecture 1 (ZRAM only) for minimal disk usage"
+        echo ""
+    fi
+    
+    if [ "$RAM_GB" -le 2 ]; then
+        log_warn "⚠️  Low RAM detected (${RAM_GB}GB)"
+        log_warn "⚠️  Recommended: ZSWAP_COMPRESSOR=zstd for better compression"
+        echo ""
+    fi
+    
+    log_info "Press Ctrl+C within 5 seconds to cancel, or wait to proceed..."
+    sleep 5
+    echo ""
 }
 
 # Install dependencies
@@ -604,8 +756,9 @@ create_swap_partition() {
         log_info "Creating partition ${SWAP_PART_NUM} as ${SWAP_PARTITION}"
         
         # Append swap partition using sfdisk
-        # Format: ",,<size>M,S" for specific size or ",,S" for all remaining space
-        if echo ",,${SWAP_SIZE_MIB}M,S" | sfdisk --force --no-reread --append "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
+        # Format: ",<size>M,S" for specific size or ",S" for all remaining space
+        # Note: Single leading comma means "start at next available location"
+        if echo ",${SWAP_SIZE_MIB}M,S" | sfdisk --force --no-reread --append "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
             log_info "Partition table updated (ioctl error is expected for in-use disk)"
         else
             log_warn "sfdisk reported errors - checking partition table"
@@ -717,15 +870,34 @@ create_swap_partition() {
         return 1
     fi
     
-    # Inform kernel of partition table changes
+    # Sync and wait for disk writes to complete
+    log_info "Syncing disk writes..."
+    sync
+    sleep 2
+    
+    # Inform kernel of partition table changes with multiple methods
     log_info "Informing kernel of partition table changes..."
+    
+    # Try partprobe first (most comprehensive)
     if command -v partprobe >/dev/null 2>&1; then
         partprobe "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
         log_info "Used partprobe to update kernel partition table"
-    else
-        partx --update "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
+    fi
+    
+    # Try partx as well (alternative method)
+    if command -v partx >/dev/null 2>&1; then
+        partx -a "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
         log_info "Used partx to update kernel partition table"
     fi
+    
+    # Settle udev events
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm settle 2>&1 | tee -a "$LOG_FILE" || true
+        log_info "Settled udev events"
+    fi
+    
+    # Additional wait for device node creation
+    sleep 2
     
     # If we shrunk root partition, resize the filesystem now
     if [ "$DISK_LAYOUT" = "full_root" ]; then
@@ -1205,14 +1377,18 @@ main() {
     log_info "  ZSWAP Pool: ${ZSWAP_POOL_PERCENT}%"
     echo ""
     
-    telegram_send "🔧 Starting swap configuration"
-    
     # Print current state
     print_current_config
     
     # Detection and calculation
     detect_system
     calculate_swap_sizes
+    
+    # NEW: Show analysis and plan
+    print_system_analysis_and_plan
+    
+    # Send telegram notification AFTER showing the plan
+    telegram_send "🔧 Starting swap configuration"
     
     # Install dependencies
     install_dependencies

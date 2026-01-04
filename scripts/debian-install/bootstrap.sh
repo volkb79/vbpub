@@ -7,6 +7,12 @@
 
 set -euo pipefail
 
+# Debug mode
+DEBUG_MODE="${DEBUG_MODE:-no}"
+if [ "$DEBUG_MODE" = "yes" ]; then
+    set -x
+fi
+
 # Configuration
 REPO_URL="${REPO_URL:-https://github.com/volkb79/vbpub.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
@@ -34,8 +40,8 @@ RUN_USER_CONFIG="${RUN_USER_CONFIG:-yes}"
 RUN_APT_CONFIG="${RUN_APT_CONFIG:-yes}"
 RUN_JOURNALD_CONFIG="${RUN_JOURNALD_CONFIG:-yes}"
 RUN_DOCKER_INSTALL="${RUN_DOCKER_INSTALL:-no}"
-RUN_GEEKBENCH="${RUN_GEEKBENCH:-no}"
-RUN_BENCHMARKS="${RUN_BENCHMARKS:-no}"
+RUN_GEEKBENCH="${RUN_GEEKBENCH:-yes}"
+RUN_BENCHMARKS="${RUN_BENCHMARKS:-yes}"
 SEND_SYSINFO="${SEND_SYSINFO:-yes}"
 
 # Telegram
@@ -102,6 +108,7 @@ main() {
     export ZRAM_SIZE_GB ZRAM_PRIORITY ZSWAP_POOL_PERCENT ZSWAP_COMPRESSOR
     export ZFS_POOL USE_PARTITION SWAP_PARTITION_SIZE_GB EXTEND_ROOT
     export TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID LOG_FILE
+    export DEBUG_MODE
     
     # Run swap setup
     log_info "==> Configuring swap (arch=$SWAP_ARCH)"
