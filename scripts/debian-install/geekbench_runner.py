@@ -46,30 +46,37 @@ class GeekbenchRunner:
         else:
             raise ValueError(f"Unsupported architecture: {arch}")
         
-        # Try to find the latest minor version by attempting common version patterns
-        # Try versions from .0 to .10 (should cover most cases)
-        for minor in range(10, -1, -1):
-            for patch in range(10, -1, -1):
-                version_str = f"{self.version}.{minor}.{patch}"
-                url = f"https://cdn.geekbench.com/{base_filename}.{minor}.{patch}{suffix}"
-                
-                # Check if URL is valid with a HEAD request
-                try:
-                    result = subprocess.run(
-                        ['curl', '-sI', '-o', '/dev/null', '-w', '%{http_code}', url],
-                        capture_output=True,
-                        text=True,
-                        timeout=10
-                    )
-                    if result.returncode == 0 and result.stdout.strip() == '200':
-                        print(f"Found Geekbench version {version_str}")
-                        return url
-                except:
-                    continue
+        # Try to find the latest version by attempting common version patterns
+        # Check recent versions first (most likely to be current)
+        # Based on problem statement, current version is 6.4.0
+        version_candidates = [
+            (4, 0), (3, 0), (5, 0), (4, 1), (3, 1),  # Recent versions
+            (2, 0), (1, 0), (0, 0)  # Older fallbacks
+        ]
         
-        # Fallback to base version without minor/patch
+        for minor, patch in version_candidates:
+            version_str = f"{self.version}.{minor}.{patch}"
+            url = f"https://cdn.geekbench.com/{base_filename}.{minor}.{patch}{suffix}"
+            
+            # Quick check if URL is valid with HEAD request (5 second timeout)
+            try:
+                result = subprocess.run(
+                    ['curl', '-sI', '--max-time', '5', '-o', '/dev/null', '-w', '%{http_code}', url],
+                    capture_output=True,
+                    text=True,
+                    timeout=6
+                )
+                if result.returncode == 0 and result.stdout.strip() == '200':
+                    print(f"Found Geekbench version {version_str}")
+                    return url
+            except subprocess.TimeoutExpired:
+                continue
+            except Exception:
+                continue
+        
+        # Fallback to base version without minor/patch (e.g., Geekbench-6-Linux.tar.gz)
         fallback_url = f"https://cdn.geekbench.com/{base_filename}{suffix}"
-        print(f"Using fallback URL: {fallback_url}")
+        print(f"Using fallback URL (will be validated during download): {fallback_url}")
         return fallback_url
     
     def download_and_extract(self):
