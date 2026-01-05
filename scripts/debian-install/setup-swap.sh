@@ -846,8 +846,24 @@ create_swap_partition() {
     # Handle based on disk layout type
     if [ "$DISK_LAYOUT" = "minimal_root" ]; then
         # Scenario 1: Minimal root with free space
-        # Just append swap partition to the free space
-        log_info "Layout: Minimal root - appending swap to free space"
+        log_info "Layout: Minimal root - managing root extension and swap"
+        
+        # If EXTEND_ROOT is yes, extend root partition first, then add swap at the end
+        if [ "$EXTEND_ROOT" = "yes" ]; then
+            log_info "EXTEND_ROOT=yes: Will extend root partition and place swap at end"
+            
+            # Call the extend_root_partition function which handles both root extension and swap creation
+            if ! extend_root_partition; then
+                log_error "Failed to extend root partition"
+                return 1
+            fi
+            # extend_root_partition already creates the swap partition at the end
+            # So we're done here for this scenario
+            return 0
+        else
+            # EXTEND_ROOT=no: Just append swap partition to the free space
+            log_info "EXTEND_ROOT=no: Appending swap to existing free space (root stays as-is)"
+        fi
         
         # Check if we have enough free space
         FREE_MIB=$((FREE_SECTORS / 2048))
@@ -1312,6 +1328,70 @@ extend_root_partition() {
     esac
     
     log_success "Root partition extended successfully"
+    
+    # Now create swap partition at the end of the disk
+    log_info "Creating swap partition at end of disk..."
+    
+    # Find next partition number after root
+    LAST_PART_NUM=$(sfdisk -l "/dev/$ROOT_DISK" 2>/dev/null | grep "^/dev/" | grep -oE '[0-9]+' | tail -1)
+    if [ -z "$LAST_PART_NUM" ]; then
+        LAST_PART_NUM=$ROOT_PART_NUM
+    fi
+    SWAP_PART_NUM=$((LAST_PART_NUM + 1))
+    
+    # Handle device naming (nvme uses p prefix, others don't)
+    if [[ "$ROOT_DISK" =~ nvme ]]; then
+        SWAP_PARTITION="/dev/${ROOT_DISK}p${SWAP_PART_NUM}"
+    else
+        SWAP_PARTITION="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
+    fi
+    
+    log_info "Creating swap partition ${SWAP_PART_NUM} as ${SWAP_PARTITION}"
+    
+    # Append swap partition (all remaining space)
+    # Format: ",S" means use remaining space with type=swap
+    if echo ",S" | sfdisk --force --no-reread --append "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
+        log_info "Swap partition created successfully"
+    else
+        log_warn "sfdisk reported errors for swap partition"
+    fi
+    
+    # Inform kernel again
+    if command -v partprobe >/dev/null 2>&1; then
+        partprobe "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
+    else
+        partx --update "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
+    fi
+    
+    # Wait for device to appear
+    sleep 2
+    
+    # Format and enable swap partition
+    log_info "Formatting swap partition..."
+    if mkswap "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
+        log_success "Swap partition formatted"
+    else
+        log_error "Failed to format swap partition"
+        return 1
+    fi
+    
+    log_info "Enabling swap partition..."
+    if swapon -p "$SWAP_PRIORITY" "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
+        log_success "Swap partition enabled"
+    else
+        log_error "Failed to enable swap partition"
+        return 1
+    fi
+    
+    # Add to fstab with PARTUUID for stability
+    PARTUUID=$(blkid -s PARTUUID -o value "$SWAP_PARTITION" 2>/dev/null)
+    if [ -n "$PARTUUID" ]; then
+        echo "PARTUUID=${PARTUUID} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+        log_info "Added swap to /etc/fstab using PARTUUID"
+    else
+        echo "${SWAP_PARTITION} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+        log_info "Added swap to /etc/fstab using device path"
+    fi
     
     return 0
 }
