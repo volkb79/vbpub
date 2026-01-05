@@ -159,6 +159,14 @@ class Colors:
     BOLD = '\033[1m'
     NC = '\033[0m'
 
+# Benchmark configuration constants
+COMPRESSION_TEST_SIZE_MB = 256  # Default compression test size
+COMPRESSION_MEMORY_PERCENT = 90  # Percentage of test size to allocate (90%)
+COMPRESSION_MIN_SWAP_PERCENT = 50  # Minimum expected swap activity (50% of test size)
+COMPRESSION_RATIO_MIN = 1.5  # Minimum expected compression ratio
+COMPRESSION_RATIO_MAX = 4.0  # Maximum typical compression ratio
+COMPRESSION_RATIO_SUSPICIOUS = 10.0  # Ratio above this is suspicious
+
 def log_info(msg):
     print(f"{Colors.GREEN}[INFO]{Colors.NC} {msg}")
 
@@ -422,7 +430,7 @@ bs={size_kb}k
     
     return results
 
-def benchmark_compression(compressor, allocator='zsmalloc', size_mb=256):
+def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_TEST_SIZE_MB):
     """
     Benchmark compression algorithm with specific allocator
     Tests with semi-realistic memory workload
@@ -475,7 +483,7 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=256):
         # Create memory pressure with mixed data patterns
         start = time.time()
         
-        # Test with different data patterns - use 90% of test size to ensure swapping
+        # Test with different data patterns - use configured percentage to ensure memory swapping
         test_script = f"""
 python3 << 'PYEOF'
 import time
@@ -483,7 +491,7 @@ import random
 import sys
 
 # Allocate memory (90% of test size to trigger swapping)
-size = {size_mb * 1024 * 1024 * 9 // 10}
+size = {size_mb * 1024 * 1024 * COMPRESSION_MEMORY_PERCENT // 100}
 size_mb_actual = size // 1024 // 1024
 print("Allocating " + str(size_mb_actual) + "MB of memory...", file=sys.stderr)
 
@@ -534,11 +542,11 @@ PYEOF
                     return results
                 
                 # VALIDATION: Ensure meaningful data was swapped (at least 50% of test size)
-                min_expected_bytes = size_mb * 1024 * 1024 * 0.5
+                min_expected_bytes = size_mb * 1024 * 1024 * COMPRESSION_MIN_SWAP_PERCENT // 100
                 if orig_size < min_expected_bytes:
-                    log_warn(f"Insufficient swap activity: only {orig_size/1024/1024:.1f}MB of {size_mb}MB swapped (expected at least 50%)")
+                    log_warn(f"Insufficient swap activity: only {orig_size/1024/1024:.1f}MB of {size_mb}MB swapped (expected at least {COMPRESSION_MIN_SWAP_PERCENT}%)")
                     log_warn("Consider increasing test size or memory pressure")
-                    results['warning'] = f'Low swap activity: {orig_size/1024/1024:.1f}MB < {size_mb*0.5:.1f}MB expected'
+                    results['warning'] = f'Low swap activity: {orig_size/1024/1024:.1f}MB < {size_mb*COMPRESSION_MIN_SWAP_PERCENT/100:.1f}MB expected'
                 
                 if compr_size == 0:
                     log_error("Compressed size is zero - invalid ZRAM state")
@@ -553,10 +561,10 @@ PYEOF
                 results['compr_size_mb'] = round(compr_size / 1024 / 1024, 2)
                 results['mem_used_mb'] = round(mem_used / 1024 / 1024, 2)
                 
-                # Compression ratio: should be 1.0 - 4.0 typically
+                # Compression ratio: should be 1.5 - 4.0 typically
                 ratio = orig_size / compr_size
-                if ratio < 1.0 or ratio > 100.0:
-                    log_warn(f"Suspicious compression ratio: {ratio:.2f}x (expected 1.5-4.0x for typical data)")
+                if ratio < COMPRESSION_RATIO_MIN or ratio > COMPRESSION_RATIO_SUSPICIOUS:
+                    log_warn(f"Suspicious compression ratio: {ratio:.2f}x (expected {COMPRESSION_RATIO_MIN}-{COMPRESSION_RATIO_MAX}x for typical data)")
                 
                 results['compression_ratio'] = round(ratio, 2)
                 
@@ -810,8 +818,8 @@ def format_benchmark_html(results):
         max_ratio = max(c.get('compression_ratio', 0) for c in results['compressors'])
         
         # VALIDATION: Check for unrealistic ratios
-        if max_ratio > 10.0:
-            log_warn(f"Suspicious max compression ratio: {max_ratio:.1f}x (expected 1.5-4.0x for typical data)")
+        if max_ratio > COMPRESSION_RATIO_SUSPICIOUS:
+            log_warn(f"Suspicious max compression ratio: {max_ratio:.1f}x (expected {COMPRESSION_RATIO_MIN}-{COMPRESSION_RATIO_MAX}x for typical data)")
         
         for comp in results['compressors']:
             name = comp.get('compressor', 'N/A')
