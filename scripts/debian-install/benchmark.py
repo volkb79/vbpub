@@ -625,7 +625,7 @@ def export_shell_config(results, output_file):
     log_info(f"Configuration saved to {output_file}")
 
 def format_benchmark_html(results):
-    """Format benchmark results as HTML for Telegram"""
+    """Format benchmark results as HTML for Telegram with visual indicators"""
     html = "<b>📊 Swap Benchmark Results</b>\n\n"
     
     # System info
@@ -633,44 +633,64 @@ def format_benchmark_html(results):
         sysinfo = results['system_info']
         html += f"<b>💻 System:</b> {sysinfo.get('ram_gb', 'N/A')}GB RAM, {sysinfo.get('cpu_cores', 'N/A')} CPU cores\n\n"
     
-    # Block size tests
+    # Block size tests with visual bar chart
     if 'block_sizes' in results and results['block_sizes']:
-        html += "<b>📦 Block Size Tests:</b>\n"
+        html += "<b>📦 Block Size Performance:</b>\n"
+        max_total = max((b.get('write_mb_per_sec', 0) + b.get('read_mb_per_sec', 0)) for b in results['block_sizes'])
         for block in results['block_sizes']:
             size_kb = block.get('block_size_kb', 'N/A')
             write_mb = block.get('write_mb_per_sec', 0)
             read_mb = block.get('read_mb_per_sec', 0)
-            html += f"  {size_kb}KB: ↑{write_mb:.1f} ↓{read_mb:.1f} MB/s\n"
+            total = write_mb + read_mb
+            bar_length = int((total / max_total) * 10) if max_total > 0 else 0
+            bar = '█' * bar_length + '░' * (10 - bar_length)
+            html += f"  {size_kb}KB: {bar} ↑{write_mb:.1f} ↓{read_mb:.1f} MB/s\n"
         html += "\n"
     
-    # Compressor comparison
+    # Compressor comparison with visual indicators
     if 'compressors' in results and results['compressors']:
         html += "<b>🗜️ Compressor Performance:</b>\n"
+        max_ratio = max(c.get('compression_ratio', 0) for c in results['compressors'])
         for comp in results['compressors']:
             name = comp.get('compressor', 'N/A')
             ratio = comp.get('compression_ratio', 0)
             cpu = comp.get('cpu_usage', 0)
-            html += f"  {name}: {ratio:.1f}x compression, {cpu:.1f}% CPU\n"
+            bar_length = int((ratio / max_ratio) * 10) if max_ratio > 0 else 0
+            bar = '▓' * bar_length + '░' * (10 - bar_length)
+            is_best = ratio == max_ratio
+            marker = " ⭐" if is_best else ""
+            html += f"  {name}: {bar} {ratio:.1f}x, {cpu:.1f}% CPU{marker}\n"
         html += "\n"
     
     # Allocator comparison
     if 'allocators' in results and results['allocators']:
         html += "<b>💾 Allocator Performance:</b>\n"
+        max_ratio = max(a.get('compression_ratio', 0) for a in results['allocators'])
         for alloc in results['allocators']:
             name = alloc.get('allocator', 'N/A')
             ratio = alloc.get('compression_ratio', 0)
             cpu = alloc.get('cpu_usage', 0)
-            html += f"  {name}: {ratio:.1f}x compression, {cpu:.1f}% CPU\n"
+            bar_length = int((ratio / max_ratio) * 10) if max_ratio > 0 else 0
+            bar = '▓' * bar_length + '░' * (10 - bar_length)
+            is_best = ratio == max_ratio
+            marker = " ⭐" if is_best else ""
+            html += f"  {name}: {bar} {ratio:.1f}x, {cpu:.1f}% CPU{marker}\n"
         html += "\n"
     
-    # Concurrency tests
+    # Concurrency tests with scaling chart
     if 'concurrency' in results and results['concurrency']:
-        html += "<b>⚡ Concurrency Tests:</b>\n"
+        html += "<b>⚡ Concurrency Scaling:</b>\n"
+        max_total = max((c.get('write_mb_per_sec', 0) + c.get('read_mb_per_sec', 0)) for c in results['concurrency'])
         for concur in results['concurrency']:
             files = concur.get('num_files', 'N/A')
             write_mb = concur.get('write_mb_per_sec', 0)
             read_mb = concur.get('read_mb_per_sec', 0)
-            html += f"  {files} files: ↑{write_mb:.1f} ↓{read_mb:.1f} MB/s\n"
+            total = write_mb + read_mb
+            bar_length = int((total / max_total) * 10) if max_total > 0 else 0
+            bar = '█' * bar_length + '░' * (10 - bar_length)
+            is_best = total == max_total
+            marker = " ⭐" if is_best else ""
+            html += f"  {files:2d} files: {bar} ↑{write_mb:.0f} ↓{read_mb:.0f} MB/s{marker}\n"
         html += "\n"
     
     # Memory-only comparison
