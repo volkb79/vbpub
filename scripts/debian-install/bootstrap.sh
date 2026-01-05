@@ -23,23 +23,17 @@ LOG_FILE="${LOG_DIR}/bootstrap-$(date +%Y%m%d-%H%M%S).log"
 
 # Swap configuration (NEW NAMING CONVENTION)
 # RAM-based swap
-SWAP_RAM_SOLUTION="${SWAP_RAM_SOLUTION:-}"  # zram, zswap, none (auto-detected if not set)
+SWAP_RAM_SOLUTION="${SWAP_RAM_SOLUTION:-auto}"  # zram, zswap, none (auto-detected if not set)
 SWAP_RAM_TOTAL_GB="${SWAP_RAM_TOTAL_GB:-auto}"  # RAM dedicated to compression (auto = calculated)
-ZRAM_COMPRESSOR="${ZRAM_COMPRESSOR:-lz4}"  # lz4, zstd, lzo-rle
+ZRAM_COMPRESSOR="${ZRAM_COMPRESSOR:-zstd}"  # lz4, zstd, lzo-rle
 ZRAM_ALLOCATOR="${ZRAM_ALLOCATOR:-zsmalloc}"  # zsmalloc, z3fold, zbud
 ZRAM_PRIORITY="${ZRAM_PRIORITY:-100}"  # Priority for ZRAM (higher = preferred)
-ZSWAP_COMPRESSOR="${ZSWAP_COMPRESSOR:-lz4}"  # lz4, zstd, lzo-rle
+ZSWAP_COMPRESSOR="${ZSWAP_COMPRESSOR:-zstd}"  # lz4, zstd, lzo-rle
 ZSWAP_ZPOOL="${ZSWAP_ZPOOL:-z3fold}"  # z3fold, zbud, zsmalloc
 
 # Disk-based swap
+SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE:-auto}"  # files_in_root, partitions_swap, partitions_zvol, files_in_partitions, none (auto-detected if not set)
 SWAP_DISK_TOTAL_GB="${SWAP_DISK_TOTAL_GB:-auto}"  # Total disk-based swap (auto = calculated)
-# Track if SWAP_BACKING_TYPE was explicitly set by user (not defaulted)
-if [ -n "${SWAP_BACKING_TYPE+x}" ] && [ -n "$SWAP_BACKING_TYPE" ]; then
-    SWAP_BACKING_TYPE_EXPLICIT="yes"
-else
-    SWAP_BACKING_TYPE_EXPLICIT="no"
-fi
-SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE:-}"  # files_in_root, partitions_swap, partitions_zvol, files_in_partitions, none (auto-detected if not set)
 SWAP_STRIPE_WIDTH="${SWAP_STRIPE_WIDTH:-8}"  # Number of parallel swap devices (for I/O striping)
 SWAP_PRIORITY="${SWAP_PRIORITY:-10}"  # Priority for disk swap (lower than RAM)
 EXTEND_ROOT="${EXTEND_ROOT:-no}"
@@ -47,13 +41,11 @@ EXTEND_ROOT="${EXTEND_ROOT:-no}"
 # ZFS-specific
 ZFS_POOL="${ZFS_POOL:-tank}"
 
-
-
 # Bootstrap options
 RUN_USER_CONFIG="${RUN_USER_CONFIG:-yes}"
 RUN_APT_CONFIG="${RUN_APT_CONFIG:-yes}"
 RUN_JOURNALD_CONFIG="${RUN_JOURNALD_CONFIG:-yes}"
-RUN_DOCKER_INSTALL="${RUN_DOCKER_INSTALL:-no}"
+RUN_DOCKER_INSTALL="${RUN_DOCKER_INSTALL:-yes}"
 RUN_GEEKBENCH="${RUN_GEEKBENCH:-yes}"
 RUN_BENCHMARKS="${RUN_BENCHMARKS:-yes}"
 BENCHMARK_DURATION="${BENCHMARK_DURATION:-5}"  # Duration in seconds for each benchmark test
@@ -93,20 +85,23 @@ tg_send_file() {
 
 # Collect system summary
 get_system_summary() {
-    echo "📊 System Summary"
-    echo "================"
-    echo "Hostname: $(hostname -f 2>/dev/null || hostname)"
-    echo "IP: $(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo "Boostrap Installation started."
+    echo "```"
+    echo "# System Summary"
+    echo "Hostname:  $(hostname -f 2>/dev/null || hostname)"
+    echo "IP:        $(hostname -I 2>/dev/null | awk '{print $1}')"
     echo ""
-    echo "CPU: $(grep 'model name' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)"
-    echo "CPU Cores: $(nproc)"
-    echo "RAM: $(free -h | awk '/^Mem:/{print $2}')"
+    echo "CPU:   $(grep 'model name' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)"
+    echo "Cores: $(nproc)"
+    echo "RAM:   $(free -h | awk '/^Mem:/{print $2}')"
     echo ""
-    echo "OS: $(cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '"')"
+    echo "OS:     $(cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '"')"
     echo "Kernel: $(uname -r)"
+    echo "User:   $(whoami)"
     echo ""
     echo "Disk Layout:"
     lsblk -o NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null || df -h
+    echo "```"
 }
 
 # Install essential packages early
@@ -152,7 +147,12 @@ main() {
     mkdir -p "$LOG_DIR"
     log_info "Debian System Setup Bootstrap"
     log_info "Log: $LOG_FILE"
-    tg_send "🚀 Starting system setup"
+
+    # Send system summary
+    log_info "==> Collecting system summary"
+    SYSTEM_SUMMARY=$(get_system_summary)
+    echo "$SYSTEM_SUMMARY" | tee -a "$LOG_FILE"
+    tg_send "$SYSTEM_SUMMARY"
     
     if [ "$EUID" -ne 0 ]; then log_error "Must run as root"; exit 1; fi
     
@@ -199,12 +199,7 @@ main() {
     export ZFS_POOL
     export TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID LOG_FILE
     export DEBUG_MODE
-    
-    # Send system summary
-    log_info "==> Collecting system summary"
-    SYSTEM_SUMMARY=$(get_system_summary)
-    echo "$SYSTEM_SUMMARY" | tee -a "$LOG_FILE"
-    tg_send "$SYSTEM_SUMMARY"
+
     
     # Run benchmarks BEFORE swap setup for smart auto-configuration
     if [ "$RUN_BENCHMARKS" = "yes" ]; then
@@ -212,34 +207,33 @@ main() {
         BENCHMARK_DURATION="${BENCHMARK_DURATION:-5}"  # Default to 5 seconds per test
         if ./benchmark.py --test-all --duration "$BENCHMARK_DURATION" 2>&1 | tee -a "$LOG_FILE"; then
             log_info "✓ Benchmarks complete"
+            ### TODO tg_send benchmark results with graphics  
         else
             log_warn "Benchmarks had issues (non-critical, continuing)"
         fi
     else
         log_info "==> Benchmarks skipped (RUN_BENCHMARKS=$RUN_BENCHMARKS)"
     fi
+
+    # TODO how do results from system summary and benchmarks figure into `setup-swap.sh`?
     
     # Run swap setup
     log_info "==> Configuring swap"
     if ./setup-swap.sh 2>&1 | tee -a "$LOG_FILE"; then
         log_info "✓ Swap configured"
-        tg_send "✅ Swap configured"
     else
         log_error "✗ Swap config failed"
-        tg_send "❌ Swap config failed"
-        exit 1
     fi
     
     # Sync and send log file
     sync
-    tg_send_file "$LOG_FILE" "📋 Swap Configuration Log"
+    tg_send_file "$LOG_FILE" "Swap Configuration Log attached"
     
     # User configuration
     if [ "$RUN_USER_CONFIG" = "yes" ]; then
         log_info "==> Configuring users"
         if ./configure-users.sh 2>&1 | tee -a "$LOG_FILE"; then
             log_info "✓ Users configured"
-            tg_send "✅ User configs applied"
         else
             log_warn "User config had issues"
         fi
@@ -252,7 +246,6 @@ main() {
         log_info "==> Configuring journald"
         if ./configure-journald.sh 2>&1 | tee -a "$LOG_FILE"; then
             log_info "✓ Journald configured"
-            tg_send "✅ Journald configured"
         else
             log_warn "Journald config had issues"
         fi
@@ -265,7 +258,6 @@ main() {
         log_info "==> Installing Docker"
         if ./install-docker.sh 2>&1 | tee -a "$LOG_FILE"; then
             log_info "✓ Docker installed"
-            tg_send "✅ Docker installed"
         else
             log_warn "Docker installation had issues"
         fi
@@ -278,6 +270,7 @@ main() {
         log_info "==> Running Geekbench (5-10 min)"
         if ./sysinfo-notify.py --geekbench-only 2>&1 | tee -a "$LOG_FILE"; then
             log_info "✓ Geekbench complete"
+            # TODO send geekbench results via telegram
         else
             log_warn "Geekbench failed"
         fi
@@ -288,6 +281,7 @@ main() {
     # System info
     if [ "$SEND_SYSINFO" = "yes" ] && [ -n "$TELEGRAM_BOT_TOKEN" ]; then
         log_info "==> Sending system info"
+        # TODO why system_info and sysinfo-notify two scripts? and sending only SYSINFO_FILE via telegram?
         # Collect system info to a file
         SYSINFO_FILE="/tmp/system-info-$(date +%Y%m%d-%H%M%S).txt"
         ./system_info.py --collect > "$SYSINFO_FILE" 2>&1 || true
@@ -307,7 +301,6 @@ main() {
     log_info "Log: $LOG_FILE"
     
     # Send completion message with log file as attachment
-    tg_send "🎉 System setup complete"
     if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -f "$LOG_FILE" ]; then
         log_info "Sending final log file as attachment..."
         sync
