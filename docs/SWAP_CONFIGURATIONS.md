@@ -575,8 +575,6 @@ When benchmarks run (`RUN_BENCHMARKS=yes`), the system:
 - Flexible: Can be overridden with environment variables
 - Smart: Adapts to actual system characteristics
 
-```
-
 ## Manual Configuration
 
 Override auto-detection by setting environment variables:

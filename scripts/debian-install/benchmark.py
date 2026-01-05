@@ -682,7 +682,11 @@ def format_benchmark_html(results):
         html += "<b>⚡ Concurrency Scaling:</b>\n"
         max_total = max((c.get('write_mb_per_sec', 0) + c.get('read_mb_per_sec', 0)) for c in results['concurrency'])
         for concur in results['concurrency']:
-            files = concur.get('num_files', 'N/A')
+            files = concur.get('num_files', 0)
+            if files == 0 or not isinstance(files, int):
+                files_str = str(files)
+            else:
+                files_str = f"{files:2d}"
             write_mb = concur.get('write_mb_per_sec', 0)
             read_mb = concur.get('read_mb_per_sec', 0)
             total = write_mb + read_mb
@@ -690,7 +694,7 @@ def format_benchmark_html(results):
             bar = '█' * bar_length + '░' * (10 - bar_length)
             is_best = total == max_total
             marker = " ⭐" if is_best else ""
-            html += f"  {files:2d} files: {bar} ↑{write_mb:.0f} ↓{read_mb:.0f} MB/s{marker}\n"
+            html += f"  {files_str} files: {bar} ↑{write_mb:.0f} ↓{read_mb:.0f} MB/s{marker}\n"
         html += "\n"
     
     # Memory-only comparison
