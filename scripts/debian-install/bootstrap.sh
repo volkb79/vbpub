@@ -7,6 +7,12 @@
 
 set -euo pipefail
 
+# Debug mode
+DEBUG_MODE="${DEBUG_MODE:-no}"
+if [ "$DEBUG_MODE" = "yes" ]; then
+    set -x
+fi
+
 # Configuration
 REPO_URL="${REPO_URL:-https://github.com/volkb79/vbpub.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
@@ -15,27 +21,44 @@ SCRIPT_DIR="${CLONE_DIR}/scripts/debian-install"
 LOG_DIR="${LOG_DIR:-/var/log/debian-install}"
 LOG_FILE="${LOG_DIR}/bootstrap-$(date +%Y%m%d-%H%M%S).log"
 
-# Swap configuration
+# Swap configuration (NEW NAMING CONVENTION)
+# Legacy SWAP_ARCH support (now used as configuration presets)
 SWAP_ARCH="${SWAP_ARCH:-3}"
-SWAP_TOTAL_GB="${SWAP_TOTAL_GB:-auto}"
-SWAP_FILES="${SWAP_FILES:-8}"
-SWAP_PRIORITY="${SWAP_PRIORITY:-10}"
-ZRAM_SIZE_GB="${ZRAM_SIZE_GB:-auto}"
+
+# RAM-based swap
+SWAP_RAM_SOLUTION="${SWAP_RAM_SOLUTION:-zswap}"
+SWAP_RAM_TOTAL_GB="${SWAP_RAM_TOTAL_GB:-auto}"
+ZRAM_COMPRESSOR="${ZRAM_COMPRESSOR:-lz4}"
+ZRAM_ALLOCATOR="${ZRAM_ALLOCATOR:-zsmalloc}"
 ZRAM_PRIORITY="${ZRAM_PRIORITY:-100}"
 ZSWAP_POOL_PERCENT="${ZSWAP_POOL_PERCENT:-20}"
 ZSWAP_COMPRESSOR="${ZSWAP_COMPRESSOR:-lz4}"
-ZFS_POOL="${ZFS_POOL:-tank}"
-USE_PARTITION="${USE_PARTITION:-no}"
+ZSWAP_ZPOOL="${ZSWAP_ZPOOL:-z3fold}"
+
+# Disk-based swap
+SWAP_DISK_TOTAL_GB="${SWAP_DISK_TOTAL_GB:-auto}"
+SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE:-files_in_root}"
+SWAP_STRIPE_WIDTH="${SWAP_STRIPE_WIDTH:-8}"
 SWAP_PARTITION_SIZE_GB="${SWAP_PARTITION_SIZE_GB:-auto}"
+SWAP_PRIORITY="${SWAP_PRIORITY:-10}"
 EXTEND_ROOT="${EXTEND_ROOT:-no}"
+
+# ZFS-specific
+ZFS_POOL="${ZFS_POOL:-tank}"
+
+# Backward compatibility - old variable names
+SWAP_TOTAL_GB="${SWAP_TOTAL_GB:-}"
+SWAP_FILES="${SWAP_FILES:-}"
+USE_PARTITION="${USE_PARTITION:-}"
+ZRAM_SIZE_GB="${ZRAM_SIZE_GB:-}"
 
 # Bootstrap options
 RUN_USER_CONFIG="${RUN_USER_CONFIG:-yes}"
 RUN_APT_CONFIG="${RUN_APT_CONFIG:-yes}"
 RUN_JOURNALD_CONFIG="${RUN_JOURNALD_CONFIG:-yes}"
 RUN_DOCKER_INSTALL="${RUN_DOCKER_INSTALL:-no}"
-RUN_GEEKBENCH="${RUN_GEEKBENCH:-no}"
-RUN_BENCHMARKS="${RUN_BENCHMARKS:-no}"
+RUN_GEEKBENCH="${RUN_GEEKBENCH:-yes}"
+RUN_BENCHMARKS="${RUN_BENCHMARKS:-yes}"
 SEND_SYSINFO="${SEND_SYSINFO:-yes}"
 
 # Telegram
@@ -97,11 +120,22 @@ main() {
     chmod +x "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/*.py 2>/dev/null || true
     cd "$SCRIPT_DIR"
     
-    # Export all config
-    export SWAP_ARCH SWAP_TOTAL_GB SWAP_FILES SWAP_PRIORITY
-    export ZRAM_SIZE_GB ZRAM_PRIORITY ZSWAP_POOL_PERCENT ZSWAP_COMPRESSOR
-    export ZFS_POOL USE_PARTITION SWAP_PARTITION_SIZE_GB EXTEND_ROOT
+    # Export all config (new naming convention)
+    export SWAP_ARCH
+    export SWAP_RAM_SOLUTION SWAP_RAM_TOTAL_GB
+    export ZRAM_COMPRESSOR ZRAM_ALLOCATOR ZRAM_PRIORITY
+    export ZSWAP_POOL_PERCENT ZSWAP_COMPRESSOR ZSWAP_ZPOOL
+    export SWAP_DISK_TOTAL_GB SWAP_BACKING_TYPE SWAP_STRIPE_WIDTH
+    export SWAP_PARTITION_SIZE_GB SWAP_PRIORITY EXTEND_ROOT
+    export ZFS_POOL
     export TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID LOG_FILE
+    export DEBUG_MODE
+    
+    # Export backward compat variables if set
+    [ -n "$SWAP_TOTAL_GB" ] && export SWAP_TOTAL_GB
+    [ -n "$SWAP_FILES" ] && export SWAP_FILES
+    [ -n "$USE_PARTITION" ] && export USE_PARTITION
+    [ -n "$ZRAM_SIZE_GB" ] && export ZRAM_SIZE_GB
     
     # Run swap setup
     log_info "==> Configuring swap (arch=$SWAP_ARCH)"
