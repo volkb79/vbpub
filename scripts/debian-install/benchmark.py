@@ -201,6 +201,26 @@ def log_error(msg):
 def log_step(msg):
     print(f"{Colors.BLUE}[STEP]{Colors.NC} {msg}")
 
+def format_timestamp():
+    """Return formatted timestamp for logging"""
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+def log_info_ts(msg):
+    """Log info message with timestamp"""
+    print(f"{Colors.GREEN}[INFO]{Colors.NC} {format_timestamp()} {msg}")
+
+def log_warn_ts(msg):
+    """Log warning message with timestamp"""
+    print(f"{Colors.YELLOW}[WARN]{Colors.NC} {format_timestamp()} {msg}")
+
+def log_step_ts(msg):
+    """Log step message with timestamp"""
+    print(f"{Colors.BLUE}[STEP]{Colors.NC} {format_timestamp()} {msg}")
+
+def log_debug_ts(msg):
+    """Log debug message with timestamp"""
+    print(f"{Colors.CYAN}[DEBUG]{Colors.NC} {format_timestamp()} {msg}")
+
 def check_root():
     """Check if running as root"""
     if os.geteuid() != 0:
@@ -258,6 +278,18 @@ def get_system_info():
                 info['ram_gb'] = info['ram_kb'] // 1024 // 1024
                 break
     
+    # Available memory
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if 'MemAvailable' in line:
+                    info['available_kb'] = int(line.split()[1])
+                    info['available_gb'] = round(info['available_kb'] / 1024 / 1024, 1)
+                    break
+    except:
+        info['available_kb'] = info['ram_kb']
+        info['available_gb'] = info['ram_gb']
+    
     # CPU
     info['cpu_cores'] = os.cpu_count()
     
@@ -268,6 +300,39 @@ def get_system_info():
         info['page_cluster'] = 3
     
     return info
+
+def calculate_optimal_compression_size(ram_gb, small_tests=False):
+    """
+    Calculate optimal compression test size based on total system RAM
+    
+    Scales test size to be appropriate for the system's RAM capacity,
+    balancing test thoroughness with execution time.
+    
+    Args:
+        ram_gb: Total system RAM in GB (not available RAM)
+        small_tests: If True, use smaller test sizes (64MB max) for quick testing
+    
+    Returns:
+        Test size in MB
+    """
+    if small_tests:
+        # Small tests mode: 64MB for systems with >=8GB RAM, 32MB otherwise
+        return 64 if ram_gb >= 8 else 32
+    
+    # Scale based on RAM to keep tests manageable
+    # Smaller systems use proportionally smaller tests to avoid excessive swapping
+    if ram_gb <= 8:
+        # For 4-8GB systems: 128MB (~1.6-3.1% of RAM)
+        return 128
+    elif ram_gb <= 16:
+        # For 16GB systems: 256MB (~1.6% of RAM)
+        return 256
+    elif ram_gb <= 32:
+        # For 32GB systems: 512MB (~1.6% of RAM)
+        return 512
+    else:
+        # For >32GB systems: 1024MB (cap at 1GB)
+        return 1024
 
 def ensure_zram_loaded():
     """Ensure ZRAM kernel module is loaded and device is clean"""
@@ -308,7 +373,7 @@ def ensure_zram_loaded():
         log_error(f"Failed to ensure ZRAM loaded: {e}")
         return False
 
-def benchmark_block_size_fio(size_kb, test_file='/tmp/fio_test', runtime_sec=5, pattern='sequential'):
+def benchmark_block_size_fio(size_kb, test_file='/tmp/fio_test', runtime_sec=5, pattern='sequential', test_num=None, total_tests=None):
     """
     Benchmark I/O performance with fio (more accurate than dd)
     
@@ -317,8 +382,14 @@ def benchmark_block_size_fio(size_kb, test_file='/tmp/fio_test', runtime_sec=5, 
         test_file: Path to test file
         runtime_sec: Test runtime in seconds (default: 5)
         pattern: 'sequential' or 'random' I/O pattern
+        test_num: Current test number (for progress tracking)
+        total_tests: Total number of tests (for progress tracking)
     """
-    log_step(f"Benchmarking block size: {size_kb}KB with fio ({pattern} I/O, runtime: {runtime_sec}s)")
+    start_time = time.time()
+    
+    # Log with progress tracking
+    progress_str = f"[{test_num}/{total_tests}] " if test_num and total_tests else ""
+    log_step_ts(f"{progress_str}Block size test: {size_kb}KB {pattern} (runtime: {runtime_sec}s)")
     
     results = {
         'block_size_kb': size_kb,
@@ -337,7 +408,7 @@ def benchmark_block_size_fio(size_kb, test_file='/tmp/fio_test', runtime_sec=5, 
         read_rw = 'read'
     
     # Sequential or Random write test
-    log_info(f"{pattern.capitalize()} write test...")
+    log_info(f"Running fio {pattern} write test...")
     # Use configured test file size to ensure meaningful results
     fio_write = f"""
 [global]
@@ -356,6 +427,9 @@ bs={size_kb}k
     try:
         with open('/tmp/fio_write.job', 'w') as f:
             f.write(fio_write)
+        
+        # Log fio command at debug level
+        log_debug_ts(f"fio command: fio --output-format=json /tmp/fio_write.job")
         
         result = subprocess.run(
             ['fio', '--output-format=json', '/tmp/fio_write.job'],
@@ -387,7 +461,7 @@ bs={size_kb}k
         results['write_error'] = str(e)
     
     # Sequential or Random read test
-    log_info(f"{pattern.capitalize()} read test...")
+    log_info(f"Running fio {pattern} read test...")
     fio_read = f"""
 [global]
 ioengine=libaio
@@ -408,6 +482,8 @@ bs={size_kb}k
         
         # Clear cache
         run_command('sync && echo 3 > /proc/sys/vm/drop_caches')
+        
+        log_debug_ts(f"fio command: fio --output-format=json /tmp/fio_read.job")
         
         result = subprocess.run(
             ['fio', '--output-format=json', '/tmp/fio_read.job'],
@@ -446,14 +522,23 @@ bs={size_kb}k
             except:
                 pass
     
+    # Log completion time
+    elapsed = time.time() - start_time
+    results['elapsed_sec'] = round(elapsed, 1)
+    log_info(f"✓ Test completed in {elapsed:.1f}s")
+    
     return results
 
-def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_TEST_SIZE_MB):
+def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_TEST_SIZE_MB, test_num=None, total_tests=None):
     """
     Benchmark compression algorithm with specific allocator
     Tests with semi-realistic memory workload
     """
-    log_step(f"Benchmarking {compressor} with {allocator}")
+    start_time = time.time()
+    
+    # Log with progress tracking
+    progress_str = f"[{test_num}/{total_tests}] " if test_num and total_tests else ""
+    log_step_ts(f"{progress_str}Compression test: {compressor} with {allocator} (test size: {size_mb}MB)")
     
     results = {
         'compressor': compressor,
@@ -464,6 +549,7 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
     
     try:
         # Ensure ZRAM is loaded and clean
+        log_info("Ensuring ZRAM device is clean...")
         if not ensure_zram_loaded():
             results['error'] = "Failed to load/reset ZRAM device"
             return results
@@ -471,6 +557,7 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         # Check if we can set allocator (may not be available)
         if os.path.exists('/sys/block/zram0/mem_pool'):
             try:
+                log_info(f"Setting allocator to {allocator}...")
                 with open('/sys/block/zram0/mem_pool', 'w') as f:
                     f.write(f'{allocator}\n')
             except:
@@ -479,6 +566,7 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         # Set compressor
         if os.path.exists('/sys/block/zram0/comp_algorithm'):
             try:
+                log_info(f"Setting compressor to {compressor}...")
                 with open('/sys/block/zram0/comp_algorithm', 'w') as f:
                     f.write(f'{compressor}\n')
             except:
@@ -487,6 +575,7 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         # Set size - use bash redirection instead of echo command to avoid shell issues
         size_bytes = size_mb * 1024 * 1024
         try:
+            log_info(f"Setting disk size to {size_bytes} bytes ({size_mb}MB)...")
             with open('/sys/block/zram0/disksize', 'w') as f:
                 f.write(str(size_bytes))
         except OSError as e:
@@ -495,12 +584,12 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
             return results
         
         # Make swap
+        log_info("Enabling swap on /dev/zram0...")
         run_command('mkswap /dev/zram0')
         run_command('swapon -p 100 /dev/zram0')
         
         # Create memory pressure to force actual swapping to ZRAM
         # The key is to allocate MORE than available RAM to force the kernel to swap
-        start = time.time()
         
         # Get available memory
         try:
@@ -515,10 +604,12 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
             # Allocate significantly more than available memory to force swapping
             # This ensures the kernel MUST use ZRAM swap
             alloc_size_mb = max(size_mb, (mem_available_kb // 1024) + size_mb)
-            log_debug(f"Available memory: {mem_available_kb // 1024}MB, allocating: {alloc_size_mb}MB to force swapping")
+            log_info(f"Creating memory pressure (allocating {alloc_size_mb}MB to force swapping)...")
+            log_debug_ts(f"Available memory: {mem_available_kb // 1024}MB, allocating: {alloc_size_mb}MB")
         except:
             # Fallback to original approach if we can't read meminfo
             alloc_size_mb = size_mb * COMPRESSION_MEMORY_PERCENT // 100
+            log_info(f"Creating memory pressure (allocating {alloc_size_mb}MB)...")
         
         # Test with different data patterns - use stress-ng if available, otherwise Python allocation
         # stress-ng is more reliable at forcing kernel swapping
@@ -530,7 +621,7 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
             pass
         
         if use_stress_ng:
-            log_info(f"Using stress-ng to force {alloc_size_mb}MB memory allocation to ZRAM...")
+            log_info(f"Using stress-ng for memory allocation...")
             try:
                 # stress-ng with vm-method all creates realistic memory pressure patterns
                 subprocess.run(
@@ -539,14 +630,16 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
                     timeout=STRESS_NG_WAIT_SEC,
                     check=False  # Don't fail on non-zero exit (stress-ng returns 1 on timeout)
                 )
+                log_info("Memory allocation completed")
             except subprocess.TimeoutExpired:
-                log_warn("stress-ng timed out (expected behavior)")
+                log_warn(f"stress-ng timed out after {STRESS_NG_WAIT_SEC}s (expected behavior)")
             except Exception as e:
                 log_warn(f"stress-ng failed: {e}, falling back to Python allocation")
                 use_stress_ng = False
         
         if not use_stress_ng:
             # Fallback: Python-based memory allocation with improved patterns
+            log_info("Using Python-based memory allocation...")
             test_script = f"""
 python3 << 'PYEOF'
 import time
@@ -557,10 +650,11 @@ import os
 # Allocate MORE than available memory to force swapping
 size = {alloc_size_mb * 1024 * 1024}
 size_mb_actual = size // 1024 // 1024
-print("Allocating " + str(size_mb_actual) + "MB of memory to force swapping...", file=sys.stderr)
+print("Allocating " + str(size_mb_actual) + "MB of memory...", file=sys.stderr)
 
 try:
     data = bytearray(size)
+    print("Memory allocated successfully", file=sys.stderr)
 except MemoryError as e:
     print("Failed to allocate memory: " + str(e), file=sys.stderr)
     # Try with smaller allocation if initial fails
@@ -569,6 +663,7 @@ except MemoryError as e:
     print("Retrying with " + str(size_mb_actual) + "MB...", file=sys.stderr)
     try:
         data = bytearray(size)
+        print("Memory allocated successfully", file=sys.stderr)
     except MemoryError as e2:
         print("Failed again: " + str(e2), file=sys.stderr)
         sys.exit(1)
@@ -593,9 +688,12 @@ for i in range(0, len(data), 4096):
         chunk = bytes([(i + j) % 256 for j in range(min(4096, len(data)-i))])
     data[i:i+len(chunk)] = chunk
 
+print("Pattern filling complete", file=sys.stderr)
+
 # Touch all memory multiple times to ensure it's swapped
-print("Forcing memory to swap (multiple passes)...", file=sys.stderr)
+print("Forcing memory to swap...", file=sys.stderr)
 for pass_num in range({COMPRESSION_MEMORY_PASSES}):
+    print("Forcing memory to swap (pass " + str(pass_num + 1) + " of {COMPRESSION_MEMORY_PASSES})...", file=sys.stderr)
     # Access memory in varied patterns to trigger swapping
     for i in range(0, len(data), {MEMORY_ACCESS_STEP_SIZE}):  # 64KB steps
         data[i] = (data[i] + 1) % 256
@@ -608,14 +706,15 @@ PYEOF
             
             run_command(test_script, check=False)
         
-        duration = time.time() - start
+        duration = time.time() - start_time
         
         # Get stats
+        log_info("Reading ZRAM statistics...")
         if os.path.exists('/sys/block/zram0/mm_stat'):
             stats = run_command('cat /sys/block/zram0/mm_stat').split()
             
             # Debug: show raw stats
-            log_debug(f"Raw mm_stat: {stats}")
+            log_debug_ts(f"Raw mm_stat: {' '.join(stats)}")
             
             if len(stats) >= 3:
                 orig_size = int(stats[0])
@@ -674,9 +773,15 @@ PYEOF
         
         results['duration_sec'] = round(duration, 2)
         
+        # Log completion time
+        elapsed = time.time() - start_time
+        log_info(f"✓ Test completed in {elapsed:.1f}s")
+        
     except Exception as e:
         log_error(f"Benchmark failed: {e}")
         results['error'] = str(e)
+        elapsed = time.time() - start_time
+        log_error(f"Test failed after {elapsed:.1f}s")
     finally:
         # Cleanup
         run_command('swapoff /dev/zram0', check=False)
@@ -689,7 +794,7 @@ PYEOF
     
     return results
 
-def test_concurrency(num_files=8, file_size_mb=128, test_dir='/tmp/swap_test'):
+def test_concurrency(num_files=8, file_size_mb=128, test_dir='/tmp/swap_test', test_num=None, total_tests=None):
     """
     Test concurrency with multiple swap files using fio
     
@@ -697,8 +802,14 @@ def test_concurrency(num_files=8, file_size_mb=128, test_dir='/tmp/swap_test'):
         num_files: Number of concurrent swap files
         file_size_mb: Size of each file in MB
         test_dir: Directory for test files
+        test_num: Current test number (for progress tracking)
+        total_tests: Total number of tests (for progress tracking)
     """
-    log_step(f"Testing concurrency with {num_files} files")
+    start_time = time.time()
+    
+    # Log with progress tracking
+    progress_str = f"[{test_num}/{total_tests}] " if test_num and total_tests else ""
+    log_step_ts(f"{progress_str}Concurrency test: {num_files} files")
     
     results = {
         'num_files': num_files,
@@ -734,6 +845,8 @@ stonewall
             f.write(fio_job)
         
         log_info(f"Running concurrent I/O test with {num_files} files...")
+        log_debug_ts(f"fio command: fio --output-format=json /tmp/fio_concurrent.job")
+        
         result = subprocess.run(
             ['fio', '--output-format=json', '/tmp/fio_concurrent.job'],
             capture_output=True,
@@ -742,6 +855,7 @@ stonewall
         )
         
         if result.returncode == 0:
+            log_info("Parsing fio results...")
             data = json.loads(result.stdout)
             
             # Validate data structure
@@ -795,6 +909,11 @@ stonewall
             shutil.rmtree(test_dir, ignore_errors=True)
         if os.path.exists('/tmp/fio_concurrent.job'):
             os.remove('/tmp/fio_concurrent.job')
+    
+    # Log completion time
+    elapsed = time.time() - start_time
+    results['elapsed_sec'] = round(elapsed, 1)
+    log_info(f"✓ Test completed in {elapsed:.1f}s")
     
     return results
 
@@ -1225,6 +1344,10 @@ Examples:
                        help='Test concurrency with N swap files')
     parser.add_argument('--duration', type=int, metavar='SEC', default=5,
                        help='Test duration in seconds for each I/O parameter set (default: 5)')
+    parser.add_argument('--small-tests', action='store_true',
+                       help='Use smaller test sizes for faster benchmarks (64MB compression tests)')
+    parser.add_argument('--max-compression-size', type=int, metavar='MB',
+                       help='Override maximum compression test size in MB')
     parser.add_argument('--output', '-o', metavar='FILE',
                        help='Output JSON results to file')
     parser.add_argument('--shell-config', metavar='FILE',
@@ -1238,14 +1361,78 @@ Examples:
     check_root()
     check_dependencies()
     
+    # Record overall start time
+    benchmark_start_time = time.time()
+    
     # Get system info
     system_info = get_system_info()
-    log_info(f"System: {system_info['ram_gb']}GB RAM, {system_info['cpu_cores']} CPU cores")
+    
+    # Log startup information with timestamps
+    log_info_ts("==> Starting Swap Performance Benchmark")
+    log_info_ts(f"System: {system_info['ram_gb']}GB RAM, {system_info['cpu_cores']} CPU cores")
+    log_info_ts(f"Available memory: {system_info.get('available_gb', 'N/A')}GB")
+    
+    # Calculate optimal compression test size based on RAM
+    if args.max_compression_size:
+        compression_test_size = args.max_compression_size
+        log_info_ts(f"Using user-specified compression test size: {compression_test_size}MB")
+    else:
+        compression_test_size = calculate_optimal_compression_size(
+            system_info['ram_gb'], 
+            small_tests=args.small_tests
+        )
+        if args.small_tests:
+            log_info_ts(f"Using small test size: {compression_test_size}MB (--small-tests mode)")
+        else:
+            # Show if we're using a reduced size
+            default_size = COMPRESSION_TEST_SIZE_MB
+            if compression_test_size < default_size:
+                # Calculate actual percentage (compression_test_size in MB, ram_gb needs to be converted to MB)
+                ram_mb = system_info['ram_gb'] * 1024
+                percent_of_ram = (compression_test_size / ram_mb) * 100
+                log_warn_ts(f"Using reduced test size: {compression_test_size}MB ({percent_of_ram:.1f}% of {system_info['ram_gb']}GB RAM)")
+            else:
+                log_info_ts(f"Using compression test size: {compression_test_size}MB")
+    
+    # Warn if test size is large relative to available memory
+    if system_info.get('available_gb'):
+        available_mb = system_info['available_gb'] * 1024
+        if compression_test_size > available_mb * 0.5:
+            log_warn_ts(f"Compression test size ({compression_test_size}MB) is >50% of available memory ({available_mb:.0f}MB)")
+            log_warn_ts("Tests may take longer due to memory pressure")
+    
+    # Calculate total number of tests
+    total_tests = 0
+    if args.test_all or args.block_size:
+        block_sizes = [4, 8, 16, 32, 64, 128] if args.test_all else [args.block_size]
+        # Each block size has sequential test, and --test-all adds random tests
+        total_tests += len(block_sizes) * (2 if args.test_all else 1)
+    
+    if args.test_all or args.test_compressors:
+        compressors = ['lz4', 'zstd', 'lzo-rle']
+        total_tests += len(compressors)
+    
+    if args.test_all or args.test_allocators:
+        allocators = ['zsmalloc', 'z3fold', 'zbud']
+        total_tests += len(allocators)
+    
+    if args.test_all or args.test_concurrency:
+        file_counts = [1, 2, 4, 8, 16] if args.test_all else [args.test_concurrency]
+        total_tests += len(file_counts)
+    
+    if args.compare_memory_only:
+        total_tests += 2  # lz4 and zstd
+    
+    log_info_ts(f"Total tests to run: {total_tests}")
     
     results = {
         'system_info': system_info,
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now().isoformat(),
+        'compression_test_size_mb': compression_test_size
     }
+    
+    # Track current test number
+    current_test = 0
     
     # Run benchmarks
     if args.test_all or args.block_size:
@@ -1254,11 +1441,25 @@ Examples:
         for size in block_sizes:
             try:
                 # Test sequential
-                seq_result = benchmark_block_size_fio(size, runtime_sec=args.duration, pattern='sequential')
+                current_test += 1
+                seq_result = benchmark_block_size_fio(
+                    size, 
+                    runtime_sec=args.duration, 
+                    pattern='sequential',
+                    test_num=current_test,
+                    total_tests=total_tests
+                )
                 
                 # Test random (if --test-all)
                 if args.test_all:
-                    rand_result = benchmark_block_size_fio(size, runtime_sec=args.duration, pattern='random')
+                    current_test += 1
+                    rand_result = benchmark_block_size_fio(
+                        size, 
+                        runtime_sec=args.duration, 
+                        pattern='random',
+                        test_num=current_test,
+                        total_tests=total_tests
+                    )
                     # Merge results
                     seq_result['rand_write_mb_per_sec'] = rand_result.get('write_mb_per_sec', 0)
                     seq_result['rand_read_mb_per_sec'] = rand_result.get('read_mb_per_sec', 0)
@@ -1272,7 +1473,14 @@ Examples:
         results['compressors'] = []
         for comp in compressors:
             try:
-                result = benchmark_compression(comp, 'zsmalloc')
+                current_test += 1
+                result = benchmark_compression(
+                    comp, 
+                    'zsmalloc', 
+                    size_mb=compression_test_size,
+                    test_num=current_test,
+                    total_tests=total_tests
+                )
                 results['compressors'].append(result)
             except Exception as e:
                 log_error(f"Compressor {comp} failed: {e}")
@@ -1282,7 +1490,14 @@ Examples:
         results['allocators'] = []
         for alloc in allocators:
             try:
-                result = benchmark_compression('lz4', alloc)
+                current_test += 1
+                result = benchmark_compression(
+                    'lz4', 
+                    alloc, 
+                    size_mb=compression_test_size,
+                    test_num=current_test,
+                    total_tests=total_tests
+                )
                 results['allocators'].append(result)
             except Exception as e:
                 log_error(f"Allocator {alloc} failed: {e}")
@@ -1292,7 +1507,12 @@ Examples:
         results['concurrency'] = []
         for count in file_counts:
             try:
-                result = test_concurrency(count)
+                current_test += 1
+                result = test_concurrency(
+                    count,
+                    test_num=current_test,
+                    total_tests=total_tests
+                )
                 results['concurrency'].append(result)
             except Exception as e:
                 log_error(f"Concurrency test with {count} files failed unexpectedly: {e}")
@@ -1307,13 +1527,27 @@ Examples:
     if args.compare_memory_only:
         results['memory_only_comparison'] = compare_memory_only()
     
+    # Calculate and log total elapsed time
+    total_elapsed = time.time() - benchmark_start_time
+    results['total_elapsed_sec'] = round(total_elapsed, 1)
+    
+    # Format elapsed time nicely (minutes and seconds)
+    elapsed_minutes = int(total_elapsed // 60)
+    elapsed_seconds = int(total_elapsed % 60)
+    if elapsed_minutes > 0:
+        elapsed_str = f"{elapsed_minutes}m {elapsed_seconds}s"
+    else:
+        elapsed_str = f"{elapsed_seconds}s"
+    
+    log_info_ts(f"==> Benchmark complete! Total time: {elapsed_str}")
+    
     # Always persist results locally for debugging
     local_results_file = f"/var/log/debian-install/benchmark-results-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
     try:
         os.makedirs(os.path.dirname(local_results_file), exist_ok=True)
         with open(local_results_file, 'w') as f:
             json.dump(results, f, indent=2)
-        log_info(f"Results persisted to {local_results_file}")
+        log_info_ts(f"Results persisted to {local_results_file}")
         
         # Send results JSON as telegram attachment for debugging
         if args.telegram and TELEGRAM_AVAILABLE:
@@ -1379,8 +1613,6 @@ Examples:
                 log_error(f"Telegram configuration error: {e}")
             except Exception as e:
                 log_error(f"Failed to send to Telegram: {e}")
-    
-    log_info("Benchmark complete!")
 
 if __name__ == '__main__':
     main()
