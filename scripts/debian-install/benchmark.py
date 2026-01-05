@@ -311,12 +311,15 @@ def benchmark_block_size_fio(size_kb, test_file='/tmp/fio_test', runtime_sec=5, 
     
     # Sequential or Random write test
     log_info(f"{pattern.capitalize()} write test...")
+    # Use 1GB test file size to ensure meaningful results
+    test_file_size = '1G'
     fio_write = f"""
 [global]
 ioengine=libaio
 direct=1
 runtime={runtime_sec}
 time_based
+size={test_file_size}
 filename={test_file}
 
 [seqwrite]
@@ -365,6 +368,7 @@ ioengine=libaio
 direct=1
 runtime={runtime_sec}
 time_based
+size={test_file_size}
 filename={test_file}
 
 [seqread]
