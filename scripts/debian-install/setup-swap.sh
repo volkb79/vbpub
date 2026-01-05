@@ -44,18 +44,33 @@ if [ "$DEBUG_MODE" = "yes" ]; then
 fi
 
 # Configuration variables with defaults (NEW NAMING CONVENTION)
+# Load benchmark-optimized configuration if available
+if [ -n "$SWAP_BENCHMARK_CONFIG" ] && [ -f "$SWAP_BENCHMARK_CONFIG" ]; then
+    # Security: Only source files from /tmp with expected name pattern
+    case "$SWAP_BENCHMARK_CONFIG" in
+        /tmp/benchmark-*.sh)
+            echo "[INFO] Loading benchmark-optimized configuration from $SWAP_BENCHMARK_CONFIG"
+            # Source the benchmark config which may override defaults
+            . "$SWAP_BENCHMARK_CONFIG"
+            ;;
+        *)
+            echo "[WARN] Ignoring SWAP_BENCHMARK_CONFIG from unexpected location: $SWAP_BENCHMARK_CONFIG"
+            ;;
+    esac
+fi
+
 # RAM-based swap configuration
-SWAP_RAM_SOLUTION="${SWAP_RAM_SOLUTION:-}"  # zram, zswap, none (empty = auto-detect)
+SWAP_RAM_SOLUTION="${SWAP_RAM_SOLUTION:-auto}"  # zram, zswap, none (auto = auto-detect)
 SWAP_RAM_TOTAL_GB="${SWAP_RAM_TOTAL_GB:-auto}"  # RAM dedicated to compression (auto = calculated)
-ZRAM_COMPRESSOR="${ZRAM_COMPRESSOR:-lz4}"  # lz4, zstd, lzo-rle
-ZRAM_ALLOCATOR="${ZRAM_ALLOCATOR:-zsmalloc}"  # zsmalloc, z3fold, zbud
+ZRAM_COMPRESSOR="${ZRAM_COMPRESSOR:-lz4}"  # lz4, zstd, lzo-rle (can be overridden by benchmark)
+ZRAM_ALLOCATOR="${ZRAM_ALLOCATOR:-zsmalloc}"  # zsmalloc, z3fold, zbud (can be overridden by benchmark)
 ZRAM_PRIORITY="${ZRAM_PRIORITY:-100}"  # Priority for ZRAM (higher = preferred)
-ZSWAP_COMPRESSOR="${ZSWAP_COMPRESSOR:-lz4}"  # lz4, zstd, lzo-rle
+ZSWAP_COMPRESSOR="${ZSWAP_COMPRESSOR:-lz4}"  # lz4, zstd, lzo-rle (can be overridden by benchmark)
 ZSWAP_ZPOOL="${ZSWAP_ZPOOL:-z3fold}"  # z3fold, zbud, zsmalloc
 
 # Disk-based swap configuration
 SWAP_DISK_TOTAL_GB="${SWAP_DISK_TOTAL_GB:-auto}"  # Total disk-based swap (auto = calculated)
-SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE:-}"  # files_in_root, partitions_swap, partitions_zvol, files_in_partitions, none (empty = auto-detect)
+SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE:-auto}"  # files_in_root, partitions_swap, partitions_zvol, files_in_partitions, none (auto = auto-detect)
 SWAP_STRIPE_WIDTH="${SWAP_STRIPE_WIDTH:-8}"  # Number of parallel swap devices (for I/O striping)
 SWAP_PRIORITY="${SWAP_PRIORITY:-10}"  # Priority for disk swap (lower than RAM)
 EXTEND_ROOT="${EXTEND_ROOT:-no}"  # Extend root partition when creating swap partitions at end of disk
@@ -219,8 +234,8 @@ detect_system() {
 auto_detect_swap_configuration() {
     log_step "Auto-detecting optimal swap configuration"
     
-    # Auto-detect SWAP_RAM_SOLUTION if not set
-    if [ -z "$SWAP_RAM_SOLUTION" ]; then
+    # Auto-detect SWAP_RAM_SOLUTION if not set or set to "auto"
+    if [ -z "$SWAP_RAM_SOLUTION" ] || [ "$SWAP_RAM_SOLUTION" = "auto" ]; then
         # Decision tree based on RAM and storage type
         if [ "$RAM_GB" -ge 16 ]; then
             # High RAM systems: ZSWAP is optimal (low overhead, good compression)
@@ -239,8 +254,8 @@ auto_detect_swap_configuration() {
         log_info "SWAP_RAM_SOLUTION explicitly set: $SWAP_RAM_SOLUTION"
     fi
     
-    # Auto-detect SWAP_BACKING_TYPE if not set  
-    if [ -z "$SWAP_BACKING_TYPE" ]; then
+    # Auto-detect SWAP_BACKING_TYPE if not set or set to "auto"
+    if [ -z "$SWAP_BACKING_TYPE" ] || [ "$SWAP_BACKING_TYPE" = "auto" ]; then
         # Decision tree based on available disk space and storage type
         if [ "$DISK_GB" -lt 20 ]; then
             # Very low disk space: no disk swap
@@ -1425,12 +1440,20 @@ configure_kernel_params() {
         swappiness=10  # Less aggressive for high RAM
     fi
     
-    # Calculate page-cluster based on storage type
+    # Calculate page-cluster based on storage type or use benchmark result
     local page_cluster=3
-    if [ "$STORAGE_TYPE" = "hdd" ]; then
-        page_cluster=4  # 64KB for HDD
-    elif [ "$STORAGE_TYPE" = "ssd" ]; then
-        page_cluster=3  # 32KB for SSD
+    
+    # Check if benchmark provided an optimal page-cluster value
+    if [ -n "$SWAP_PAGE_CLUSTER" ]; then
+        page_cluster=$SWAP_PAGE_CLUSTER
+        log_info "Using benchmark-optimized page-cluster: $page_cluster"
+    else
+        # Default based on storage type
+        if [ "$STORAGE_TYPE" = "hdd" ]; then
+            page_cluster=4  # 64KB for HDD
+        elif [ "$STORAGE_TYPE" = "ssd" ]; then
+            page_cluster=3  # 32KB for SSD
+        fi
     fi
     
     log_info "Writing kernel parameters to $SYSCTL_CONF"

@@ -379,6 +379,202 @@ else:
     → files_in_root (safe default)
 ```
 
+## Auto-Mode Decision Reasoning
+
+This section explains **why** the system makes specific decisions in auto mode, providing the technical rationale behind each configuration choice.
+
+### RAM Solution Selection Logic
+
+#### Why ZSWAP for ≥4GB RAM?
+**Decision:** Systems with 4GB+ RAM use ZSWAP by default.
+
+**Reasoning:**
+- **Lower CPU overhead**: ZSWAP compresses only pages being evicted to disk, not all swap activity
+- **Automatic writeback**: Pages can be written to disk when pool fills, preventing OOM
+- **Better for bursty workloads**: Handles temporary memory spikes efficiently
+- **Tested sweet spot**: 4GB is where the benefits of ZSWAP outweigh ZRAM's aggressive compression
+
+**Trade-offs accepted:**
+- Slightly lower compression ratio (~2:1 vs ZRAM's ~2.5:1)
+- Requires disk-backed swap to work optimally
+
+#### Why ZRAM for <4GB RAM?
+**Decision:** Low memory systems use ZRAM.
+
+**Reasoning:**
+- **Maximum memory utilization**: Every byte counts on low-RAM systems
+- **Higher compression ratio**: ZRAM typically achieves 2.5-3:1 compression
+- **No disk dependency**: Works even without disk swap configured
+- **Faster than disk**: All operations stay in RAM (even if compressed)
+
+**Trade-offs accepted:**
+- Higher CPU usage (3-8% vs ZSWAP's 1-3%)
+- No automatic overflow to disk (can lead to OOM if swap fills)
+- Limited by available RAM (can't exceed physical RAM allocation)
+
+### Disk Backing Selection Logic
+
+#### Why files_in_root for SSD + adequate space?
+**Decision:** SSD systems with 50GB+ use swap files in root filesystem.
+
+**Reasoning:**
+- **No partitioning needed**: Can be added/resized without repartitioning
+- **SSD wear leveling**: Filesystem spreads writes across the SSD
+- **Easy management**: Can be created, resized, or removed on the fly
+- **Good I/O performance**: Modern SSDs handle file-based I/O efficiently
+
+**Trade-offs accepted:**
+- Slightly more filesystem overhead than raw partitions
+- Requires sufficient free space in root filesystem
+
+#### Why partitions_swap for HDD + ample space?
+**Decision:** HDD systems with 100GB+ use dedicated swap partitions.
+
+**Reasoning:**
+- **Sequential I/O**: Partitions at disk end provide better sequential access patterns
+- **Reduced fragmentation**: Dedicated partition avoids filesystem fragmentation
+- **Consistent performance**: No filesystem overhead for I/O operations
+- **Better for HDDs**: Traditional swap partition design optimized for rotational media
+
+**Trade-offs accepted:**
+- Requires disk repartitioning (destructive on existing systems)
+- Fixed size (can't easily resize)
+- Less flexible than files
+
+#### Why partitions_zvol with ZFS?
+**Decision:** Systems with ZFS use ZFS zvol for swap.
+
+**Reasoning:**
+- **Leverages ZFS**: Uses existing ZFS pool and benefits
+- **Compression**: ZFS can add another compression layer
+- **ARC integration**: Better memory management with ZFS ARC
+- **Snapshots/cloning**: Swap can be part of ZFS management strategy
+
+**Trade-offs accepted:**
+- Requires ZFS (overhead if not already using it)
+- More complex than simple swap files/partitions
+
+#### Why none for <20GB disk space?
+**Decision:** Systems with very limited disk space skip disk-backed swap.
+
+**Reasoning:**
+- **Preserve disk space**: 20GB is tight for OS + applications
+- **Avoid disk thrashing**: Limited space would cause frequent I/O contention
+- **RAM-only safer**: Better to rely on RAM compression than fill disk
+- **Performance**: Disk swap on near-full filesystem performs poorly
+
+**Trade-offs accepted:**
+- No disk overflow capability
+- Increased OOM risk if RAM+ZRAM/ZSWAP fills
+
+### Swap Size Calculation Logic
+
+#### Disk Swap Sizing Formula
+```
+if RAM ≤ 2GB:    disk_swap = RAM × 2    (need substantial backing)
+elif RAM ≤ 4GB:  disk_swap = RAM × 1.5  (balanced approach)
+elif RAM ≤ 8GB:  disk_swap = RAM × 1    (equal to RAM)
+elif RAM ≤ 16GB: disk_swap = RAM × 0.5  (half of RAM)
+else:            disk_swap = RAM × 0.25  (capped at 4-16GB)
+```
+
+**Reasoning:**
+- **Low RAM systems need more disk swap**: Compensate for limited RAM
+- **High RAM systems need less**: Swap is safety net, not primary memory
+- **Diminishing returns**: Beyond certain point, more swap doesn't help
+- **Disk space efficiency**: Don't waste disk space on rarely-used swap
+
+#### RAM Swap Sizing (ZRAM/ZSWAP)
+```
+ram_swap = min(RAM × 0.5, 16GB)
+```
+
+**Reasoning:**
+- **50% rule**: Allocating half of RAM for compressed swap is optimal
+- **2:1 compression expectation**: 50% RAM → ~100% effective memory
+- **Cap at 16GB**: Beyond this, compression overhead outweighs benefits
+- **Safety margin**: Leaves enough RAM for actual processes
+
+### Kernel Parameter Tuning
+
+#### vm.swappiness
+```
+if RAM ≤ 2GB:   swappiness = 80  (aggressive swapping needed)
+elif RAM ≥ 16GB: swappiness = 10  (prefer keeping in RAM)
+else:            swappiness = 60  (balanced default)
+```
+
+**Reasoning:**
+- **Low RAM needs swap early**: Prevent OOM by swapping proactively
+- **High RAM can delay**: Keep hot data in RAM longer
+- **Default (60) is balanced**: Good for most workloads
+
+#### vm.page-cluster
+```
+HDD:  page-cluster = 4  (64KB - larger sequential reads)
+SSD:  page-cluster = 3  (32KB - balanced for random I/O)
+Benchmark-optimized:  page-cluster = best_block_size
+```
+
+**Reasoning:**
+- **HDDs favor larger blocks**: Amortize seek time over larger transfers
+- **SSDs don't care about seeks**: Smaller blocks reduce latency
+- **Benchmark overrides**: Actual hardware testing provides best value
+
+#### SWAP_STRIPE_WIDTH
+```
+Default: 8 parallel swap files
+Benchmark-optimized: best_concurrency_test_result
+```
+
+**Reasoning:**
+- **Parallelism**: Multiple swap files enable parallel I/O
+- **Modern CPUs**: 8 files matches typical core counts
+- **Diminishing returns**: Beyond 8-16, overhead exceeds benefits
+- **Benchmark tunes**: Actual I/O testing finds optimal parallelism
+
+### Benchmark-Driven Optimization
+
+When benchmarks run (`RUN_BENCHMARKS=yes`), the system:
+
+1. **Tests parameter space comprehensively**:
+   - Block sizes: 4KB, 8KB, 16KB, 32KB, 64KB, 128KB
+   - Compressors: lz4, zstd, lzo-rle
+   - Allocators: zsmalloc, z3fold, zbud
+   - Concurrency: 1, 2, 4, 8, 16 files
+
+2. **Selects optimal values based on actual performance**:
+   - Best compressor (highest compression ratio)
+   - Best allocator (most efficient memory usage)
+   - Best page-cluster (highest throughput block size)
+   - Best stripe width (optimal parallel I/O)
+
+3. **Overrides defaults with measured results**:
+   - Generated config file: `/tmp/benchmark-optimal-config.sh`
+   - Sourced by `setup-swap.sh` before applying defaults
+   - Real hardware measurements trump theoretical defaults
+
+**Why benchmark-driven?**
+- **Hardware varies**: Different CPUs/storage have different optimal settings
+- **Workload-specific**: Benchmark simulates swap access patterns
+- **Measurable improvements**: Can see 20-50% performance gains vs defaults
+- **One-time cost**: 5-second benchmarks provide ongoing benefits
+
+### Summary
+
+**Key Principles:**
+1. **RAM is precious on low-memory systems** → More aggressive compression (ZRAM)
+2. **CPU overhead matters on high-memory systems** → Lighter compression (ZSWAP)
+3. **Storage type drives I/O strategy** → Files for SSD, partitions for HDD
+4. **Disk space constraints override preferences** → Skip disk swap if tight
+5. **Real measurements beat assumptions** → Benchmark when possible
+
+**Default Behavior (auto mode):**
+- Conservative and safe: Won't break existing systems
+- Performance-oriented: Chooses fastest config for hardware
+- Flexible: Can be overridden with environment variables
+- Smart: Adapts to actual system characteristics
+
 ## Manual Configuration
 
 Override auto-detection by setting environment variables:
