@@ -305,9 +305,12 @@ def calculate_optimal_compression_size(ram_gb, small_tests=False):
     """
     Calculate optimal compression test size based on available RAM
     
+    Scales test size to be appropriate for the system's RAM capacity,
+    balancing test thoroughness with execution time.
+    
     Args:
         ram_gb: Total RAM in GB
-        small_tests: If True, use smaller test sizes (64MB max)
+        small_tests: If True, use smaller test sizes (64MB max) for quick testing
     
     Returns:
         Test size in MB
@@ -316,19 +319,16 @@ def calculate_optimal_compression_size(ram_gb, small_tests=False):
         # Small tests mode: 64MB for systems with >=8GB RAM, 32MB otherwise
         return 64 if ram_gb >= 8 else 32
     
-    # Scale based on RAM: use 10-20% of total RAM
-    # But cap at reasonable values to avoid excessive test times
-    if ram_gb <= 4:
-        # For 4GB systems: 128MB (12.5% of RAM, manageable)
-        return 128
-    elif ram_gb <= 8:
-        # For 8GB systems: 128MB (10% of RAM)
+    # Scale based on RAM to keep tests manageable
+    # Smaller systems use proportionally smaller tests to avoid excessive swapping
+    if ram_gb <= 8:
+        # For 4-8GB systems: 128MB (~1.5-3% of RAM)
         return 128
     elif ram_gb <= 16:
-        # For 16GB systems: 256MB (10% of RAM)
+        # For 16GB systems: 256MB (~1.5% of RAM)
         return 256
     elif ram_gb <= 32:
-        # For 32GB systems: 512MB (10% of RAM)
+        # For 32GB systems: 512MB (~1.5% of RAM)
         return 512
     else:
         # For >32GB systems: 1024MB (cap at 1GB)
@@ -1387,8 +1387,10 @@ Examples:
             # Show if we're using a reduced size
             default_size = COMPRESSION_TEST_SIZE_MB
             if compression_test_size < default_size:
-                percent_of_ram = (compression_test_size / (system_info['ram_gb'] * 1024)) * 100
-                log_warn_ts(f"Using reduced test size: {compression_test_size}MB ({percent_of_ram:.0f}% of RAM) for {system_info['ram_gb']}GB system")
+                # Calculate actual percentage (compression_test_size in MB, ram_gb needs to be converted to MB)
+                ram_mb = system_info['ram_gb'] * 1024
+                percent_of_ram = (compression_test_size / ram_mb) * 100
+                log_warn_ts(f"Using reduced test size: {compression_test_size}MB ({percent_of_ram:.1f}% of {system_info['ram_gb']}GB RAM)")
             else:
                 log_info_ts(f"Using compression test size: {compression_test_size}MB")
     
