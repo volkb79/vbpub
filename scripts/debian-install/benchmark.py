@@ -593,8 +593,7 @@ def export_shell_config(results, output_file):
             f.write(f"# Best block size: {best_block['block_size_kb']}KB\n")
             f.write(f"# (Read: {best_block.get('read_mb_per_sec', 0)} MB/s, ")
             f.write(f"Write: {best_block.get('write_mb_per_sec', 0)} MB/s)\n")
-            f.write(f"# sysctl setting (not a bash variable, parsed by setup-swap.sh):\n")
-            f.write(f"# vm.page-cluster={cluster}\n")
+            f.write(f"# Optimal page-cluster value: vm.page-cluster={cluster}\n")
             f.write(f"SWAP_PAGE_CLUSTER={cluster}\n\n")
         
         # Find best compressor

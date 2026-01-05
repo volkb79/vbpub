@@ -46,9 +46,17 @@ fi
 # Configuration variables with defaults (NEW NAMING CONVENTION)
 # Load benchmark-optimized configuration if available
 if [ -n "$SWAP_BENCHMARK_CONFIG" ] && [ -f "$SWAP_BENCHMARK_CONFIG" ]; then
-    echo "[INFO] Loading benchmark-optimized configuration from $SWAP_BENCHMARK_CONFIG"
-    # Source the benchmark config which may override defaults
-    . "$SWAP_BENCHMARK_CONFIG"
+    # Security: Only source files from /tmp with expected name pattern
+    case "$SWAP_BENCHMARK_CONFIG" in
+        /tmp/benchmark-*.sh)
+            echo "[INFO] Loading benchmark-optimized configuration from $SWAP_BENCHMARK_CONFIG"
+            # Source the benchmark config which may override defaults
+            . "$SWAP_BENCHMARK_CONFIG"
+            ;;
+        *)
+            echo "[WARN] Ignoring SWAP_BENCHMARK_CONFIG from unexpected location: $SWAP_BENCHMARK_CONFIG"
+            ;;
+    esac
 fi
 
 # RAM-based swap configuration
