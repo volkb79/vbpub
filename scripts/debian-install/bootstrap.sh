@@ -205,17 +205,20 @@ main() {
         log_info "==> Running system benchmarks (for smart swap auto-configuration)"
         BENCHMARK_DURATION="${BENCHMARK_DURATION:-5}"  # Default to 5 seconds per test
         BENCHMARK_OUTPUT="/tmp/benchmark-results-$(date +%Y%m%d-%H%M%S).json"
+        BENCHMARK_CONFIG="/tmp/benchmark-optimal-config.sh"
         
-        # Run benchmark with telegram notification if configured
+        # Run benchmark with telegram notification if configured, and export optimal config
         if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-            BENCHMARK_ARGS="--test-all --duration $BENCHMARK_DURATION --output $BENCHMARK_OUTPUT --telegram"
+            BENCHMARK_ARGS="--test-all --duration $BENCHMARK_DURATION --output $BENCHMARK_OUTPUT --shell-config $BENCHMARK_CONFIG --telegram"
         else
-            BENCHMARK_ARGS="--test-all --duration $BENCHMARK_DURATION --output $BENCHMARK_OUTPUT"
+            BENCHMARK_ARGS="--test-all --duration $BENCHMARK_DURATION --output $BENCHMARK_OUTPUT --shell-config $BENCHMARK_CONFIG"
         fi
         
         if ./benchmark.py $BENCHMARK_ARGS 2>&1 | tee -a "$LOG_FILE"; then
             log_info "✓ Benchmarks complete"
             # Benchmark results are automatically sent via Telegram if configured
+            # Optimal configuration exported to $BENCHMARK_CONFIG for use by setup-swap.sh
+            export SWAP_BENCHMARK_CONFIG="$BENCHMARK_CONFIG"
         else
             log_warn "Benchmarks had issues (non-critical, continuing)"
         fi
@@ -223,9 +226,8 @@ main() {
         log_info "==> Benchmarks skipped (RUN_BENCHMARKS=$RUN_BENCHMARKS)"
     fi
 
-    # Note: Benchmarks are currently run for informational purposes only.
-    # Future improvement: setup-swap.sh could use benchmark results to optimize
-    # swap configuration (e.g., selecting best compressor, allocator, stripe width).
+    # Benchmark results will be used by setup-swap.sh to optimize swap configuration
+    # (compressor, allocator, stripe width, page-cluster)
     
     # Run swap setup
     log_info "==> Configuring swap"

@@ -44,13 +44,20 @@ if [ "$DEBUG_MODE" = "yes" ]; then
 fi
 
 # Configuration variables with defaults (NEW NAMING CONVENTION)
+# Load benchmark-optimized configuration if available
+if [ -n "$SWAP_BENCHMARK_CONFIG" ] && [ -f "$SWAP_BENCHMARK_CONFIG" ]; then
+    echo "[INFO] Loading benchmark-optimized configuration from $SWAP_BENCHMARK_CONFIG"
+    # Source the benchmark config which may override defaults
+    . "$SWAP_BENCHMARK_CONFIG"
+fi
+
 # RAM-based swap configuration
 SWAP_RAM_SOLUTION="${SWAP_RAM_SOLUTION:-auto}"  # zram, zswap, none (auto = auto-detect)
 SWAP_RAM_TOTAL_GB="${SWAP_RAM_TOTAL_GB:-auto}"  # RAM dedicated to compression (auto = calculated)
-ZRAM_COMPRESSOR="${ZRAM_COMPRESSOR:-lz4}"  # lz4, zstd, lzo-rle
-ZRAM_ALLOCATOR="${ZRAM_ALLOCATOR:-zsmalloc}"  # zsmalloc, z3fold, zbud
+ZRAM_COMPRESSOR="${ZRAM_COMPRESSOR:-lz4}"  # lz4, zstd, lzo-rle (can be overridden by benchmark)
+ZRAM_ALLOCATOR="${ZRAM_ALLOCATOR:-zsmalloc}"  # zsmalloc, z3fold, zbud (can be overridden by benchmark)
 ZRAM_PRIORITY="${ZRAM_PRIORITY:-100}"  # Priority for ZRAM (higher = preferred)
-ZSWAP_COMPRESSOR="${ZSWAP_COMPRESSOR:-lz4}"  # lz4, zstd, lzo-rle
+ZSWAP_COMPRESSOR="${ZSWAP_COMPRESSOR:-lz4}"  # lz4, zstd, lzo-rle (can be overridden by benchmark)
 ZSWAP_ZPOOL="${ZSWAP_ZPOOL:-z3fold}"  # z3fold, zbud, zsmalloc
 
 # Disk-based swap configuration
@@ -1425,12 +1432,20 @@ configure_kernel_params() {
         swappiness=10  # Less aggressive for high RAM
     fi
     
-    # Calculate page-cluster based on storage type
+    # Calculate page-cluster based on storage type or use benchmark result
     local page_cluster=3
-    if [ "$STORAGE_TYPE" = "hdd" ]; then
-        page_cluster=4  # 64KB for HDD
-    elif [ "$STORAGE_TYPE" = "ssd" ]; then
-        page_cluster=3  # 32KB for SSD
+    
+    # Check if benchmark provided an optimal page-cluster value
+    if [ -n "$SWAP_PAGE_CLUSTER" ]; then
+        page_cluster=$SWAP_PAGE_CLUSTER
+        log_info "Using benchmark-optimized page-cluster: $page_cluster"
+    else
+        # Default based on storage type
+        if [ "$STORAGE_TYPE" = "hdd" ]; then
+            page_cluster=4  # 64KB for HDD
+        elif [ "$STORAGE_TYPE" = "ssd" ]; then
+            page_cluster=3  # 32KB for SSD
+        fi
     fi
     
     log_info "Writing kernel parameters to $SYSCTL_CONF"

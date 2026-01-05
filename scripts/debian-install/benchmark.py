@@ -593,7 +593,9 @@ def export_shell_config(results, output_file):
             f.write(f"# Best block size: {best_block['block_size_kb']}KB\n")
             f.write(f"# (Read: {best_block.get('read_mb_per_sec', 0)} MB/s, ")
             f.write(f"Write: {best_block.get('write_mb_per_sec', 0)} MB/s)\n")
-            f.write(f"vm.page-cluster={cluster}\n\n")
+            f.write(f"# sysctl setting (not a bash variable, parsed by setup-swap.sh):\n")
+            f.write(f"# vm.page-cluster={cluster}\n")
+            f.write(f"SWAP_PAGE_CLUSTER={cluster}\n\n")
         
         # Find best compressor
         if 'compressors' in results and results['compressors']:
@@ -616,8 +618,10 @@ def export_shell_config(results, output_file):
         if 'concurrency' in results and results['concurrency']:
             best_concur = max(results['concurrency'], 
                             key=lambda x: x.get('write_mb_per_sec', 0) + x.get('read_mb_per_sec', 0))
-            f.write(f"# Optimal swap file count: {best_concur['num_files']}\n")
-            f.write(f"SWAP_FILES={best_concur['num_files']}\n")
+            f.write(f"# Optimal swap file count (stripe width): {best_concur['num_files']}\n")
+            f.write(f"# (Write: {best_concur.get('write_mb_per_sec', 0)} MB/s, ")
+            f.write(f"Read: {best_concur.get('read_mb_per_sec', 0)} MB/s)\n")
+            f.write(f"SWAP_STRIPE_WIDTH={best_concur['num_files']}\n")
     
     log_info(f"Configuration saved to {output_file}")
 
