@@ -303,13 +303,13 @@ def get_system_info():
 
 def calculate_optimal_compression_size(ram_gb, small_tests=False):
     """
-    Calculate optimal compression test size based on available RAM
+    Calculate optimal compression test size based on total system RAM
     
     Scales test size to be appropriate for the system's RAM capacity,
     balancing test thoroughness with execution time.
     
     Args:
-        ram_gb: Total RAM in GB
+        ram_gb: Total system RAM in GB (not available RAM)
         small_tests: If True, use smaller test sizes (64MB max) for quick testing
     
     Returns:
@@ -322,13 +322,13 @@ def calculate_optimal_compression_size(ram_gb, small_tests=False):
     # Scale based on RAM to keep tests manageable
     # Smaller systems use proportionally smaller tests to avoid excessive swapping
     if ram_gb <= 8:
-        # For 4-8GB systems: 128MB (~1.5-3% of RAM)
+        # For 4-8GB systems: 128MB (~1.6-3.1% of RAM)
         return 128
     elif ram_gb <= 16:
-        # For 16GB systems: 256MB (~1.5% of RAM)
+        # For 16GB systems: 256MB (~1.6% of RAM)
         return 256
     elif ram_gb <= 32:
-        # For 32GB systems: 512MB (~1.5% of RAM)
+        # For 32GB systems: 512MB (~1.6% of RAM)
         return 512
     else:
         # For >32GB systems: 1024MB (cap at 1GB)
