@@ -162,10 +162,14 @@ class Colors:
 # Benchmark configuration constants
 COMPRESSION_TEST_SIZE_MB = 256  # Default compression test size
 COMPRESSION_MEMORY_PERCENT = 90  # Percentage of test size to allocate (90%)
+COMPRESSION_MEMORY_PASSES = 3  # Number of passes over memory to ensure swapping
 COMPRESSION_MIN_SWAP_PERCENT = 50  # Minimum expected swap activity (50% of test size)
 COMPRESSION_RATIO_MIN = 1.5  # Minimum expected compression ratio
 COMPRESSION_RATIO_MAX = 4.0  # Maximum typical compression ratio
 COMPRESSION_RATIO_SUSPICIOUS = 10.0  # Ratio above this is suspicious
+
+# FIO test configuration constants
+FIO_TEST_FILE_SIZE = '1G'  # Test file size for fio benchmarks
 
 def log_info(msg):
     print(f"{Colors.GREEN}[INFO]{Colors.NC} {msg}")
@@ -319,15 +323,14 @@ def benchmark_block_size_fio(size_kb, test_file='/tmp/fio_test', runtime_sec=5, 
     
     # Sequential or Random write test
     log_info(f"{pattern.capitalize()} write test...")
-    # Use 1GB test file size to ensure meaningful results
-    test_file_size = '1G'
+    # Use configured test file size to ensure meaningful results
     fio_write = f"""
 [global]
 ioengine=libaio
 direct=1
 runtime={runtime_sec}
 time_based
-size={test_file_size}
+size={FIO_TEST_FILE_SIZE}
 filename={test_file}
 
 [seqwrite]
@@ -376,7 +379,7 @@ ioengine=libaio
 direct=1
 runtime={runtime_sec}
 time_based
-size={test_file_size}
+size={FIO_TEST_FILE_SIZE}
 filename={test_file}
 
 [seqread]
@@ -509,7 +512,7 @@ for i in range(0, len(data), 4096):
 
 # Touch all memory multiple times to ensure it's allocated and swapped
 print("Forcing memory to swap (multiple passes)...", file=sys.stderr)
-for pass_num in range(3):
+for pass_num in range({COMPRESSION_MEMORY_PASSES}):
     for i in range(0, len(data), 4096):
         data[i] = (data[i] + 1) % 256
     time.sleep(0.5)
