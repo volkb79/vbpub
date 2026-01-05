@@ -176,7 +176,7 @@ install_essential_packages() {
     local additional_packages="ripgrep fd-find tree fzf tldr httpie"
     
     # Benchmark/system tools
-    local system_packages="fio sysstat"
+    local system_packages="fio sysstat python3-matplotlib"
     
     log_info "Installing core packages..."
     apt-get update -qq
@@ -234,6 +234,10 @@ main() {
     # Test Telegram connectivity if configured
     if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
         test_telegram || log_warn "Telegram test failed, but continuing with bootstrap"
+        
+        # Send BEFORE system info
+        log_info "==> Sending system info (BEFORE setup)"
+        ./sysinfo-notify.py --notify --caption "📊 System Info (BEFORE setup)" 2>&1 | tee -a "$LOG_FILE" || true
     fi
     
     # Configure APT repositories BEFORE installing packages
@@ -352,17 +356,17 @@ main() {
         log_info "==> Geekbench skipped (RUN_GEEKBENCH=$RUN_GEEKBENCH)"
     fi
     
-    # System info
+    # System info (AFTER all modifications)
     if [ "$SEND_SYSINFO" = "yes" ] && [ -n "$TELEGRAM_BOT_TOKEN" ]; then
-        log_info "==> Sending system info"
+        log_info "==> Sending system info (AFTER setup)"
         # System information is collected using the unified system_info.py module.
         # This module is shared between:
         # - get_system_summary(): Uses system_info.py with --format text for bootstrap summary
         # - sysinfo-notify.py: Uses system_info.py with HTML formatting for telegram notifications
         # This ensures DRY (Don't Repeat Yourself) - single source of truth for system info collection.
         
-        # Send formatted notification via telegram
-        ./sysinfo-notify.py --notify 2>&1 | tee -a "$LOG_FILE" || true
+        # Send formatted notification via telegram with AFTER caption
+        ./sysinfo-notify.py --notify --caption "📊 System Info (AFTER setup - root partition still shows original size before reboot)" 2>&1 | tee -a "$LOG_FILE" || true
         
         # Optionally save detailed info to file and send as attachment
         SYSINFO_FILE="/tmp/system-info-$(date +%Y%m%d-%H%M%S).json"

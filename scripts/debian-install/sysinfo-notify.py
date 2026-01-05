@@ -67,6 +67,8 @@ IMPORTANT: Send a message to your bot first before it can message you!
                        help='Telegram chat ID or channel username')
     parser.add_argument('--output', '-o', metavar='FILE',
                        help='Save system info to JSON file')
+    parser.add_argument('--caption', metavar='TEXT',
+                       help='Custom caption/header for system info message')
     
     args = parser.parse_args()
     
@@ -122,6 +124,10 @@ IMPORTANT: Send a message to your bot first before it can message you!
         if args.notify:
             print("Sending system info to Telegram...")
             message = collector.format_html()
+            
+            # Add custom caption if provided
+            if args.caption:
+                message = f"<b>{args.caption}</b>\n\n{message}"
             
             if telegram.send_message(message):
                 print("✓ System info sent successfully!")

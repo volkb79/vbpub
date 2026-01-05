@@ -558,6 +558,104 @@ print_system_analysis_and_plan() {
         echo ""
     fi
     
+    # Send configuration plan to Telegram
+    if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+        local telegram_msg="🔧 <b>Swap Configuration Plan</b>
+
+📊 <b>System Analysis:</b>
+• RAM: ${RAM_GB}GB
+• Disk: ${DISK_GB}GB available
+• Storage: ${STORAGE_TYPE}
+• CPU: ${CPU_CORES} cores
+
+⚙️ <b>Auto-Detected Config:</b>"
+        
+        # RAM Solution details
+        if [ "$SWAP_RAM_SOLUTION" != "none" ] && [ "$SWAP_RAM_TOTAL_GB" -gt 0 ]; then
+            telegram_msg="${telegram_msg}
+• <b>RAM Solution:</b> ${SWAP_RAM_SOLUTION} ($([ "$RAM_GB" -le 4 ] && echo "low RAM system" || [ "$RAM_GB" -ge 16 ] && echo "high RAM system" || echo "medium RAM system"))"
+            if [ "$SWAP_RAM_SOLUTION" = "zram" ]; then
+                telegram_msg="${telegram_msg}
+  - Compressor: ${ZRAM_COMPRESSOR}
+  - Allocator: ${ZRAM_ALLOCATOR}
+  - Priority: ${ZRAM_PRIORITY}"
+            elif [ "$SWAP_RAM_SOLUTION" = "zswap" ]; then
+                telegram_msg="${telegram_msg}
+  - Compressor: ${ZSWAP_COMPRESSOR}
+  - Pool: 20% of RAM
+  - Zpool: ${ZSWAP_ZPOOL}"
+            fi
+        fi
+        
+        # Disk backing details
+        if [ "$SWAP_BACKING_TYPE" != "none" ] && [ "$SWAP_DISK_TOTAL_GB" -gt 0 ]; then
+            telegram_msg="${telegram_msg}
+• <b>Disk Backing:</b> ${SWAP_BACKING_TYPE}
+  - Size: ${SWAP_DISK_TOTAL_GB}GB"
+            if [ "$SWAP_BACKING_TYPE" = "files_in_root" ]; then
+                telegram_msg="${telegram_msg}
+  - Stripe Width: ${SWAP_STRIPE_WIDTH} files × ${SWAP_DEVICE_SIZE_GB}GB
+  - Priority: ${SWAP_PRIORITY} (lower than RAM)"
+            elif [ "$SWAP_BACKING_TYPE" = "partitions_swap" ]; then
+                telegram_msg="${telegram_msg}
+  - Partitions: ${SWAP_STRIPE_WIDTH} × ${SWAP_DEVICE_SIZE_GB}GB"
+            fi
+        fi
+        
+        # Execution plan
+        telegram_msg="${telegram_msg}
+
+📋 <b>Execution Plan:</b>
+1. Disable existing swap"
+        
+        local step=2
+        if [ "$SWAP_RAM_SOLUTION" = "zram" ] && [ "$SWAP_RAM_TOTAL_GB" -gt 0 ]; then
+            telegram_msg="${telegram_msg}
+${step}. Create ZRAM device (${SWAP_RAM_TOTAL_GB}GB compressed)"
+            ((step++))
+        elif [ "$SWAP_RAM_SOLUTION" = "zswap" ] && [ "$SWAP_RAM_TOTAL_GB" -gt 0 ]; then
+            telegram_msg="${telegram_msg}
+${step}. Enable ZSWAP (20% pool, ${ZSWAP_COMPRESSOR} compression)"
+            ((step++))
+        fi
+        
+        if [ "$SWAP_BACKING_TYPE" != "none" ] && [ "$SWAP_DISK_TOTAL_GB" -gt 0 ]; then
+            case "$SWAP_BACKING_TYPE" in
+                files_in_root)
+                    telegram_msg="${telegram_msg}
+${step}. Create ${SWAP_STRIPE_WIDTH} swap files in /var/swap/"
+                    ;;
+                partitions_swap)
+                    telegram_msg="${telegram_msg}
+${step}. Create ${SWAP_STRIPE_WIDTH} swap partitions at end of disk"
+                    ;;
+                partitions_zvol)
+                    telegram_msg="${telegram_msg}
+${step}. Create ZFS zvol for swap (${SWAP_DISK_TOTAL_GB}GB)"
+                    ;;
+                files_in_partitions)
+                    telegram_msg="${telegram_msg}
+${step}. Create ext4 partition and ${SWAP_STRIPE_WIDTH} swap files"
+                    ;;
+            esac
+            ((step++))
+        fi
+        
+        telegram_msg="${telegram_msg}
+${step}. Configure kernel parameters
+$((step+1)). Add swap to /etc/fstab for persistence"
+        
+        # Add warnings
+        if [ "$DISK_GB" -lt 30 ] && [ "$SWAP_DISK_TOTAL_GB" -gt 0 ]; then
+            telegram_msg="${telegram_msg}
+
+⚠️ <b>Warnings:</b>
+• Low disk space (&lt;30GB) - swap may impact storage"
+        fi
+        
+        telegram_send "$telegram_msg"
+    fi
+    
     log_info "Press Ctrl+C within 5 seconds to cancel, or wait to proceed..."
     sleep 5
     echo ""
