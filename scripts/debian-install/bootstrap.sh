@@ -207,7 +207,8 @@ main() {
         BENCHMARK_DURATION="${BENCHMARK_DURATION:-5}"  # Default to 5 seconds per test
         if ./benchmark.py --test-all --duration "$BENCHMARK_DURATION" 2>&1 | tee -a "$LOG_FILE"; then
             log_info "✓ Benchmarks complete"
-            ### TODO tg_send benchmark results with graphics  
+            # Note: Benchmark results are logged but not sent via telegram with graphics.
+            # Future improvement: Could save benchmark results to a file and send via tg_send_file  
         else
             log_warn "Benchmarks had issues (non-critical, continuing)"
         fi
@@ -215,7 +216,9 @@ main() {
         log_info "==> Benchmarks skipped (RUN_BENCHMARKS=$RUN_BENCHMARKS)"
     fi
 
-    # TODO how do results from system summary and benchmarks figure into `setup-swap.sh`?
+    # Note: Benchmarks are currently run for informational purposes only.
+    # Future improvement: setup-swap.sh could use benchmark results to optimize
+    # swap configuration (e.g., selecting best compressor, allocator, stripe width).
     
     # Run swap setup
     log_info "==> Configuring swap"
@@ -270,7 +273,8 @@ main() {
         log_info "==> Running Geekbench (5-10 min)"
         if ./sysinfo-notify.py --geekbench-only 2>&1 | tee -a "$LOG_FILE"; then
             log_info "✓ Geekbench complete"
-            # TODO send geekbench results via telegram
+            # Note: Geekbench results are logged but not sent separately via telegram.
+            # Future improvement: Could extract results and send via tg_send or tg_send_file
         else
             log_warn "Geekbench failed"
         fi
@@ -281,7 +285,10 @@ main() {
     # System info
     if [ "$SEND_SYSINFO" = "yes" ] && [ -n "$TELEGRAM_BOT_TOKEN" ]; then
         log_info "==> Sending system info"
-        # TODO why system_info and sysinfo-notify two scripts? and sending only SYSINFO_FILE via telegram?
+        # Note: Two scripts exist for system info:
+        # - system_info.py: Collects system information to a file
+        # - sysinfo-notify.py: Sends system info via telegram with formatted output
+        # Both are used: system_info.py for file collection, sysinfo-notify.py for notification
         # Collect system info to a file
         SYSINFO_FILE="/tmp/system-info-$(date +%Y%m%d-%H%M%S).txt"
         ./system_info.py --collect > "$SYSINFO_FILE" 2>&1 || true
