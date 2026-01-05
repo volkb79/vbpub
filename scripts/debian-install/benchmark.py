@@ -140,6 +140,15 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# Optional telegram client import (for --telegram flag)
+try:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from telegram_client import TelegramClient
+    TELEGRAM_AVAILABLE = True
+except ImportError:
+    TELEGRAM_AVAILABLE = False
+    TelegramClient = None
+
 # Colors for output
 class Colors:
     GREEN = '\033[0;32m'
@@ -783,24 +792,22 @@ Examples:
     
     # Send to Telegram if requested
     if args.telegram:
-        try:
-            import sys
-            from pathlib import Path
-            sys.path.insert(0, str(Path(__file__).parent))
-            from telegram_client import TelegramClient
-            
-            telegram = TelegramClient()
-            html_message = format_benchmark_html(results)
-            
-            log_info("Sending benchmark results to Telegram...")
-            if telegram.send_message(html_message):
-                log_info("✓ Benchmark results sent to Telegram successfully!")
-            else:
-                log_error("✗ Failed to send benchmark results to Telegram")
-        except ImportError as e:
-            log_error(f"Cannot send to Telegram: {e}")
-        except ValueError as e:
-            log_error(f"Telegram configuration error: {e}")
+        if not TELEGRAM_AVAILABLE:
+            log_error("Cannot send to Telegram: telegram_client module not available")
+        else:
+            try:
+                telegram = TelegramClient()
+                html_message = format_benchmark_html(results)
+                
+                log_info("Sending benchmark results to Telegram...")
+                if telegram.send_message(html_message):
+                    log_info("✓ Benchmark results sent to Telegram successfully!")
+                else:
+                    log_error("✗ Failed to send benchmark results to Telegram")
+            except ValueError as e:
+                log_error(f"Telegram configuration error: {e}")
+            except Exception as e:
+                log_error(f"Failed to send to Telegram: {e}")
     
     log_info("Benchmark complete!")
 

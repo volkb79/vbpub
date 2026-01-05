@@ -259,11 +259,11 @@ class SystemInfo:
     def format_text(self):
         """Format system info as plain text"""
         text = "# System Summary\n"
-        text += f"Hostname:  {self.info['hostname']}\n"
+        text += f"Hostname: {self.info['hostname']}\n"
         
         # Network
         if 'network' in self.info and 'public_ip' in self.info['network']:
-            text += f"IP:        {self.info['network']['public_ip']}\n"
+            text += f"IP:       {self.info['network']['public_ip']}\n"
         text += "\n"
         
         # Hardware
@@ -294,10 +294,9 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='System Information Collector')
-    parser.add_argument('--collect', action='store_true', help='Collect system info (JSON)')
-    parser.add_argument('--html', action='store_true', help='Output as HTML')
     parser.add_argument('--format', choices=['json', 'html', 'text'], default='json',
                        help='Output format (default: json)')
+    parser.add_argument('--html', action='store_true', help='Output as HTML (deprecated, use --format html)')
     parser.add_argument('--output', '-o', metavar='FILE', help='Save to file')
     
     args = parser.parse_args()

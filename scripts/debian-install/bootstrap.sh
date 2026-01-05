@@ -90,7 +90,7 @@ get_system_summary() {
     if [ -f "${SCRIPT_DIR}/system_info.py" ]; then
         echo "Bootstrap Installation started."
         echo ""
-        python3 "${SCRIPT_DIR}/system_info.py" --format text 2>/dev/null || {
+        python3 "${SCRIPT_DIR}/system_info.py" --format text 2>> "$LOG_FILE" || {
             # Fallback to basic info if system_info.py fails
             echo "System: $(hostname -f 2>/dev/null || hostname) ($(hostname -I 2>/dev/null | awk '{print $1}'))"
             echo "RAM: $(free -h | awk '/^Mem:/{print $2}'), Cores: $(nproc)"
