@@ -162,6 +162,9 @@ class Colors:
 def log_info(msg):
     print(f"{Colors.GREEN}[INFO]{Colors.NC} {msg}")
 
+def log_debug(msg):
+    print(f"{Colors.CYAN}[DEBUG]{Colors.NC} {msg}")
+
 def log_warn(msg):
     print(f"{Colors.YELLOW}[WARN]{Colors.NC} {msg}")
 
@@ -278,7 +281,7 @@ def ensure_zram_loaded():
         log_error(f"Failed to ensure ZRAM loaded: {e}")
         return False
 
-def benchmark_block_size_fio(size_kb, test_file='/tmp/fio_test', runtime_sec=5):
+def benchmark_block_size_fio(size_kb, test_file='/tmp/fio_test', runtime_sec=5, pattern='sequential'):
     """
     Benchmark I/O performance with fio (more accurate than dd)
     
@@ -286,17 +289,28 @@ def benchmark_block_size_fio(size_kb, test_file='/tmp/fio_test', runtime_sec=5):
         size_kb: Block size in KB
         test_file: Path to test file
         runtime_sec: Test runtime in seconds (default: 5)
+        pattern: 'sequential' or 'random' I/O pattern
     """
-    log_step(f"Benchmarking block size: {size_kb}KB with fio (runtime: {runtime_sec}s)")
+    log_step(f"Benchmarking block size: {size_kb}KB with fio ({pattern} I/O, runtime: {runtime_sec}s)")
     
     results = {
         'block_size_kb': size_kb,
         'runtime_sec': runtime_sec,
+        'io_pattern': pattern,
+        'concurrency': 1,
         'timestamp': datetime.now().isoformat()
     }
     
-    # Sequential write test
-    log_info("Sequential write test...")
+    # Determine I/O type based on pattern
+    if pattern == 'random':
+        write_rw = 'randwrite'
+        read_rw = 'randread'
+    else:  # sequential
+        write_rw = 'write'
+        read_rw = 'read'
+    
+    # Sequential or Random write test
+    log_info(f"{pattern.capitalize()} write test...")
     fio_write = f"""
 [global]
 ioengine=libaio
@@ -306,7 +320,7 @@ time_based
 filename={test_file}
 
 [seqwrite]
-rw=write
+rw={write_rw}
 bs={size_kb}k
 """
     
@@ -332,8 +346,8 @@ bs={size_kb}k
         log_error(f"Write test failed: {e}")
         results['write_error'] = str(e)
     
-    # Sequential read test
-    log_info("Sequential read test...")
+    # Sequential or Random read test
+    log_info(f"{pattern.capitalize()} read test...")
     fio_read = f"""
 [global]
 ioengine=libaio
@@ -343,7 +357,7 @@ time_based
 filename={test_file}
 
 [seqread]
-rw=read
+rw={read_rw}
 bs={size_kb}k
 """
     
@@ -468,22 +482,49 @@ PYEOF
         # Get stats
         if os.path.exists('/sys/block/zram0/mm_stat'):
             stats = run_command('cat /sys/block/zram0/mm_stat').split()
+            
+            # Debug: show raw stats
+            log_debug(f"Raw mm_stat: {stats}")
+            
             if len(stats) >= 3:
                 orig_size = int(stats[0])
                 compr_size = int(stats[1])
                 mem_used = int(stats[2])
                 
+                # Validation: catch impossible values
+                if orig_size == 0:
+                    log_warn("No data swapped to ZRAM (orig_size = 0)")
+                    results['error'] = 'No swap activity detected'
+                    return results
+                
+                if compr_size == 0:
+                    log_error("Compressed size is zero - invalid ZRAM state")
+                    results['error'] = 'Invalid ZRAM compression state'
+                    return results
+                
+                if mem_used > orig_size * 2:
+                    log_warn(f"Memory overhead detected: used {mem_used} > orig {orig_size}")
+                
+                # Calculate with proper bounds checking
                 results['orig_size_mb'] = round(orig_size / 1024 / 1024, 2)
                 results['compr_size_mb'] = round(compr_size / 1024 / 1024, 2)
                 results['mem_used_mb'] = round(mem_used / 1024 / 1024, 2)
                 
-                if compr_size > 0:
-                    results['compression_ratio'] = round(orig_size / compr_size, 2)
-                    results['efficiency_pct'] = round((1 - mem_used / orig_size) * 100, 2) if orig_size > 0 else 0
-                    
-                    log_info(f"  Compression ratio: {results['compression_ratio']}x")
-                    log_info(f"  Space efficiency: {results['efficiency_pct']}%")
-                    log_info(f"  Memory saved: {results['orig_size_mb'] - results['mem_used_mb']:.2f} MB")
+                # Compression ratio: should be 1.0 - 4.0 typically
+                ratio = orig_size / compr_size
+                if ratio < 1.0 or ratio > 100.0:
+                    log_warn(f"Suspicious compression ratio: {ratio:.2f}x")
+                
+                results['compression_ratio'] = round(ratio, 2)
+                
+                # Efficiency: (orig - mem_used) / orig as percentage
+                # Negative values indicate allocator overhead
+                efficiency = ((orig_size - mem_used) / orig_size) * 100 if orig_size > 0 else 0
+                results['efficiency_pct'] = round(efficiency, 2)
+                
+                log_info(f"  Compression ratio: {ratio:.2f}x")
+                log_info(f"  Space efficiency: {efficiency:.1f}%")
+                log_info(f"  Memory saved: {results['orig_size_mb'] - results['mem_used_mb']:.2f} MB")
         
         results['duration_sec'] = round(duration, 2)
         
@@ -551,21 +592,25 @@ stonewall
             ['fio', '--output-format=json', '/tmp/fio_concurrent.job'],
             capture_output=True,
             text=True,
-            timeout=600
+            timeout=600  # 10 minute timeout
         )
         
         if result.returncode == 0:
             data = json.loads(result.stdout)
             
+            # Validate data structure
+            if 'jobs' not in data or len(data['jobs']) < 2:
+                raise ValueError("Incomplete fio results")
+            
             # Extract write performance
             write_bw = data['jobs'][0]['write']['bw'] / 1024  # MB/s
             results['write_mb_per_sec'] = round(write_bw, 2)
-            results['write_iops'] = data['jobs'][0]['write']['iops']
+            results['write_iops'] = int(round(data['jobs'][0]['write']['iops'], 0))
             
             # Extract read performance
             read_bw = data['jobs'][1]['read']['bw'] / 1024  # MB/s
             results['read_mb_per_sec'] = round(read_bw, 2)
-            results['read_iops'] = data['jobs'][1]['read']['iops']
+            results['read_iops'] = int(round(data['jobs'][1]['read']['iops'], 0))
             
             # Calculate scaling efficiency
             # Baseline is single file, so efficiency = actual / (baseline * num_files)
@@ -573,9 +618,14 @@ stonewall
             results['write_scaling_efficiency'] = round(100, 2)  # Placeholder, needs baseline
             results['read_scaling_efficiency'] = round(100, 2)  # Placeholder, needs baseline
             
-            log_info(f"  Write: {write_bw:.2f} MB/s, {results['write_iops']:.0f} IOPS")
-            log_info(f"  Read: {read_bw:.2f} MB/s, {results['read_iops']:.0f} IOPS")
+            log_info(f"  Write: {write_bw:.2f} MB/s, {results['write_iops']} IOPS")
+            log_info(f"  Read: {read_bw:.2f} MB/s, {results['read_iops']} IOPS")
+        else:
+            raise subprocess.CalledProcessError(result.returncode, 'fio', result.stderr)
     
+    except subprocess.TimeoutExpired:
+        log_error(f"Concurrency test with {num_files} files timed out after 10 minutes")
+        results['error'] = 'Timeout'
     except Exception as e:
         log_error(f"Concurrency test failed: {e}")
         results['error'] = str(e)
@@ -680,6 +730,7 @@ def format_benchmark_html(results):
     # Block size tests with visual bar chart
     if 'block_sizes' in results and results['block_sizes']:
         html += "<b>📦 Block Size Performance:</b>\n"
+        html += "<i>(Sequential I/O, single-threaded)</i>\n"
         max_total = max((b.get('write_mb_per_sec', 0) + b.get('read_mb_per_sec', 0)) for b in results['block_sizes'])
         for block in results['block_sizes']:
             size_kb = block.get('block_size_kb', 'N/A')
@@ -688,7 +739,7 @@ def format_benchmark_html(results):
             total = write_mb + read_mb
             bar_length = int((total / max_total) * 10) if max_total > 0 else 0
             bar = '█' * bar_length + '░' * (10 - bar_length)
-            html += f"  {size_kb}KB: {bar} ↑{write_mb:.1f} ↓{read_mb:.1f} MB/s\n"
+            html += f"  {size_kb:3d}KB: {bar} ↑{write_mb:6.1f} ↓{read_mb:6.1f} MB/s\n"
         html += "\n"
     
     # Compressor comparison with visual indicators
@@ -698,12 +749,12 @@ def format_benchmark_html(results):
         for comp in results['compressors']:
             name = comp.get('compressor', 'N/A')
             ratio = comp.get('compression_ratio', 0)
-            cpu = comp.get('cpu_usage', 0)
+            eff = comp.get('efficiency_pct', 0)
             bar_length = int((ratio / max_ratio) * 10) if max_ratio > 0 else 0
             bar = '▓' * bar_length + '░' * (10 - bar_length)
             is_best = ratio == max_ratio
             marker = " ⭐" if is_best else ""
-            html += f"  {name}: {bar} {ratio:.1f}x, {cpu:.1f}% CPU{marker}\n"
+            html += f"  {name:8s}: {bar} {ratio:.1f}x ratio, {eff:+.0f}% eff{marker}\n"
         html += "\n"
     
     # Allocator comparison
@@ -713,12 +764,12 @@ def format_benchmark_html(results):
         for alloc in results['allocators']:
             name = alloc.get('allocator', 'N/A')
             ratio = alloc.get('compression_ratio', 0)
-            cpu = alloc.get('cpu_usage', 0)
+            eff = alloc.get('efficiency_pct', 0)
             bar_length = int((ratio / max_ratio) * 10) if max_ratio > 0 else 0
             bar = '▓' * bar_length + '░' * (10 - bar_length)
             is_best = ratio == max_ratio
             marker = " ⭐" if is_best else ""
-            html += f"  {name}: {bar} {ratio:.1f}x, {cpu:.1f}% CPU{marker}\n"
+            html += f"  {name:8s}: {bar} {ratio:.1f}x ratio, {eff:+.0f}% eff{marker}\n"
         html += "\n"
     
     # Concurrency tests with scaling chart
@@ -811,8 +862,17 @@ Examples:
         results['block_sizes'] = []
         for size in block_sizes:
             try:
-                result = benchmark_block_size_fio(size, runtime_sec=args.duration)
-                results['block_sizes'].append(result)
+                # Test sequential
+                seq_result = benchmark_block_size_fio(size, runtime_sec=args.duration, pattern='sequential')
+                
+                # Test random (if --test-all)
+                if args.test_all:
+                    rand_result = benchmark_block_size_fio(size, runtime_sec=args.duration, pattern='random')
+                    # Merge results
+                    seq_result['rand_write_mb_per_sec'] = rand_result.get('write_mb_per_sec', 0)
+                    seq_result['rand_read_mb_per_sec'] = rand_result.get('read_mb_per_sec', 0)
+                
+                results['block_sizes'].append(seq_result)
             except Exception as e:
                 log_error(f"Block size {size}KB failed: {e}")
     

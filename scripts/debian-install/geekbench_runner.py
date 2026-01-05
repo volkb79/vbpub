@@ -135,14 +135,36 @@ class GeekbenchRunner:
         print("This may take 5-10 minutes...\n")
         
         try:
-            # Run benchmark with JSON output
-            result = subprocess.run(
-                [self.geekbench_path, '--export-json', '--no-upload'],
-                cwd=os.path.dirname(self.geekbench_path),
+            # Check if Pro version by checking help output for --export-json
+            help_result = subprocess.run(
+                [self.geekbench_path, '--help'],
                 capture_output=True,
                 text=True,
-                timeout=900  # 15 minutes max
+                timeout=10
             )
+            
+            is_pro = '--export-json' in help_result.stdout
+            
+            if is_pro:
+                print("Detected Geekbench Pro - using JSON export")
+                # Run benchmark with JSON output
+                result = subprocess.run(
+                    [self.geekbench_path, '--export-json', '--no-upload'],
+                    cwd=os.path.dirname(self.geekbench_path),
+                    capture_output=True,
+                    text=True,
+                    timeout=900  # 15 minutes max
+                )
+            else:
+                print("Detected Geekbench Free - running without JSON export")
+                # Run benchmark without JSON export (not available in free version)
+                result = subprocess.run(
+                    [self.geekbench_path, '--no-upload'],
+                    cwd=os.path.dirname(self.geekbench_path),
+                    capture_output=True,
+                    text=True,
+                    timeout=900  # 15 minutes max
+                )
             
             # Print stdout for debugging
             if result.stdout:
@@ -161,40 +183,76 @@ class GeekbenchRunner:
                 self.results['stdout'] = result.stdout
                 return False
             
-            # Find JSON result file
-            result_file = None
-            for root, dirs, files in os.walk(os.path.dirname(self.geekbench_path)):
-                for file in files:
-                    if file.endswith('.gb' + str(self.version)):
-                        result_file = os.path.join(root, file)
-                        break
-                if result_file:
-                    break
-            
-            if result_file and os.path.exists(result_file):
-                with open(result_file, 'r') as f:
-                    self.results = json.load(f)
-                print(f"✓ Results saved to {result_file}")
-                return True
-            else:
-                error_msg = "✗ Result file not found after benchmark completed"
-                print(error_msg)
-                # Search for any .gb files for debugging
-                all_gb_files = []
+            if is_pro:
+                # Find JSON result file
+                result_file = None
                 for root, dirs, files in os.walk(os.path.dirname(self.geekbench_path)):
                     for file in files:
-                        if '.gb' in file:
-                            all_gb_files.append(os.path.join(root, file))
+                        if file.endswith('.gb' + str(self.version)):
+                            result_file = os.path.join(root, file)
+                            break
+                    if result_file:
+                        break
                 
-                if all_gb_files:
-                    print(f"Found these .gb files: {all_gb_files}")
-                    error_msg += f". Found: {all_gb_files}"
+                if result_file and os.path.exists(result_file):
+                    with open(result_file, 'r') as f:
+                        self.results = json.load(f)
+                    print(f"✓ Results saved to {result_file}")
+                    return True
                 else:
-                    print("No .gb files found in working directory")
+                    error_msg = "✗ Result file not found after benchmark completed"
+                    print(error_msg)
+                    # Search for any .gb files for debugging
+                    all_gb_files = []
+                    for root, dirs, files in os.walk(os.path.dirname(self.geekbench_path)):
+                        for file in files:
+                            if '.gb' in file:
+                                all_gb_files.append(os.path.join(root, file))
+                    
+                    if all_gb_files:
+                        print(f"Found these .gb files: {all_gb_files}")
+                        error_msg += f". Found: {all_gb_files}"
+                    else:
+                        print("No .gb files found in working directory")
+                    
+                    self.results['error'] = error_msg
+                    self.results['stdout'] = result.stdout
+                    return False
+            else:
+                # Free version - parse stdout for results
+                print("✓ Benchmark completed (Free version)")
+                print("⚠ JSON results not available in Geekbench Free")
                 
-                self.results['error'] = error_msg
-                self.results['stdout'] = result.stdout
-                return False
+                # Try to extract basic scores from stdout
+                import re
+                single_score = None
+                multi_score = None
+                
+                single_match = re.search(r'Single-Core Score\s+(\d+)', result.stdout)
+                if single_match:
+                    single_score = int(single_match.group(1))
+                
+                multi_match = re.search(r'Multi-Core Score\s+(\d+)', result.stdout)
+                if multi_match:
+                    multi_score = int(multi_match.group(1))
+                
+                if single_score or multi_score:
+                    self.results = {
+                        'score': {
+                            'singlecore_score': single_score,
+                            'multicore_score': multi_score
+                        },
+                        'free_version': True
+                    }
+                    print(f"✓ Extracted scores - Single: {single_score}, Multi: {multi_score}")
+                else:
+                    self.results = {
+                        'free_version': True,
+                        'stdout': result.stdout
+                    }
+                    print("⚠ Could not extract scores from output")
+                
+                return True
                 
         except subprocess.TimeoutExpired:
             error_msg = "✗ Benchmark timed out after 15 minutes"
