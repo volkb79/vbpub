@@ -242,20 +242,20 @@ def ensure_zram_loaded():
     except:
         return False
 
-def benchmark_block_size_fio(size_kb, test_file='/tmp/fio_test', size_mb=512):
+def benchmark_block_size_fio(size_kb, test_file='/tmp/fio_test', runtime_sec=5):
     """
     Benchmark I/O performance with fio (more accurate than dd)
     
     Args:
         size_kb: Block size in KB
         test_file: Path to test file
-        size_mb: Test file size in MB
+        runtime_sec: Test runtime in seconds (default: 5)
     """
-    log_step(f"Benchmarking block size: {size_kb}KB with fio")
+    log_step(f"Benchmarking block size: {size_kb}KB with fio (runtime: {runtime_sec}s)")
     
     results = {
         'block_size_kb': size_kb,
-        'test_size_mb': size_mb,
+        'runtime_sec': runtime_sec,
         'timestamp': datetime.now().isoformat()
     }
     
@@ -265,7 +265,8 @@ def benchmark_block_size_fio(size_kb, test_file='/tmp/fio_test', size_mb=512):
 [global]
 ioengine=libaio
 direct=1
-size={size_mb}m
+runtime={runtime_sec}
+time_based
 filename={test_file}
 
 [seqwrite]
@@ -301,7 +302,8 @@ bs={size_kb}k
 [global]
 ioengine=libaio
 direct=1
-size={size_mb}m
+runtime={runtime_sec}
+time_based
 filename={test_file}
 
 [seqread]
@@ -638,6 +640,8 @@ Examples:
                        help='Compare ZRAM configurations')
     parser.add_argument('--test-concurrency', type=int, metavar='N',
                        help='Test concurrency with N swap files')
+    parser.add_argument('--duration', type=int, metavar='SEC', default=5,
+                       help='Test duration in seconds for each I/O parameter set (default: 5)')
     parser.add_argument('--output', '-o', metavar='FILE',
                        help='Output JSON results to file')
     parser.add_argument('--shell-config', metavar='FILE',
@@ -664,7 +668,7 @@ Examples:
         results['block_sizes'] = []
         for size in block_sizes:
             try:
-                result = benchmark_block_size_fio(size)
+                result = benchmark_block_size_fio(size, runtime_sec=args.duration)
                 results['block_sizes'].append(result)
             except Exception as e:
                 log_error(f"Block size {size}KB failed: {e}")

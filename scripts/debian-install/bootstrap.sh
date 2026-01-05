@@ -59,6 +59,7 @@ RUN_JOURNALD_CONFIG="${RUN_JOURNALD_CONFIG:-yes}"
 RUN_DOCKER_INSTALL="${RUN_DOCKER_INSTALL:-no}"
 RUN_GEEKBENCH="${RUN_GEEKBENCH:-yes}"
 RUN_BENCHMARKS="${RUN_BENCHMARKS:-yes}"
+BENCHMARK_DURATION="${BENCHMARK_DURATION:-5}"  # Duration in seconds for each benchmark test
 SEND_SYSINFO="${SEND_SYSINFO:-yes}"
 
 # Telegram
@@ -111,6 +112,45 @@ get_system_summary() {
     lsblk -o NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null || df -h
 }
 
+# Install essential packages early
+install_essential_packages() {
+    log_info "==> Installing essential packages"
+    
+    export DEBIAN_FRONTEND=noninteractive
+    
+    # Core utilities
+    local core_packages="ca-certificates gnupg lsb-release curl wget git vim less jq bash-completion"
+    
+    # Network tools
+    local network_packages="netcat-traditional iputils-ping dnsutils iproute2"
+    
+    # Additional useful tools
+    local additional_packages="ripgrep fd-find tree fzf tldr httpie"
+    
+    # Benchmark/system tools
+    local system_packages="fio sysstat"
+    
+    log_info "Installing core packages..."
+    apt-get update -qq
+    apt-get install -y -qq $core_packages $network_packages $system_packages || log_warn "Some core packages failed to install"
+    
+    log_info "Installing additional packages..."
+    apt-get install -y -qq $additional_packages 2>/dev/null || log_warn "Some additional packages unavailable (non-critical)"
+    
+    # Install yq (go-based, not the old Python version)
+    if ! command -v yq >/dev/null 2>&1; then
+        log_info "Installing yq (go-based) from GitHub..."
+        if wget -q https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq; then
+            chmod +x /usr/local/bin/yq
+            log_info "✓ yq installed"
+        else
+            log_warn "Failed to install yq"
+        fi
+    fi
+    
+    log_info "✓ Essential packages installed"
+}
+
 main() {
     mkdir -p "$LOG_DIR"
     log_info "Debian System Setup Bootstrap"
@@ -119,7 +159,7 @@ main() {
     
     if [ "$EUID" -ne 0 ]; then log_error "Must run as root"; exit 1; fi
     
-    # Install git
+    # Install git first
     if ! command -v git >/dev/null 2>&1; then
         log_info "Installing git..."
         apt-get update -qq && apt-get install -y -qq git
@@ -138,6 +178,9 @@ main() {
     chmod +x "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/*.py 2>/dev/null || true
     cd "$SCRIPT_DIR"
     
+    # Install essential packages early
+    install_essential_packages
+    
     # Export all config (new naming convention)
     export SWAP_ARCH
     export SWAP_RAM_SOLUTION SWAP_RAM_TOTAL_GB
@@ -154,6 +197,19 @@ main() {
     SYSTEM_SUMMARY=$(get_system_summary)
     echo "$SYSTEM_SUMMARY" | tee -a "$LOG_FILE"
     tg_send "$SYSTEM_SUMMARY"
+    
+    # Run benchmarks BEFORE swap setup for smart auto-configuration
+    if [ "$RUN_BENCHMARKS" = "yes" ]; then
+        log_info "==> Running system benchmarks (for smart swap auto-configuration)"
+        BENCHMARK_DURATION="${BENCHMARK_DURATION:-5}"  # Default to 5 seconds per test
+        if ./benchmark.py --test-all --duration "$BENCHMARK_DURATION" 2>&1 | tee -a "$LOG_FILE"; then
+            log_info "✓ Benchmarks complete"
+        else
+            log_warn "Benchmarks had issues (non-critical, continuing)"
+        fi
+    else
+        log_info "==> Benchmarks skipped (RUN_BENCHMARKS=$RUN_BENCHMARKS)"
+    fi
     
     # Run swap setup
     log_info "==> Configuring swap (arch=$SWAP_ARCH)"
@@ -179,6 +235,8 @@ main() {
         else
             log_warn "User config had issues"
         fi
+    else
+        log_info "==> User configuration skipped (RUN_USER_CONFIG=$RUN_USER_CONFIG)"
     fi
     
     # APT configuration
@@ -190,6 +248,8 @@ main() {
         else
             log_warn "APT config had issues"
         fi
+    else
+        log_info "==> APT configuration skipped (RUN_APT_CONFIG=$RUN_APT_CONFIG)"
     fi
     
     # Journald configuration
@@ -201,6 +261,8 @@ main() {
         else
             log_warn "Journald config had issues"
         fi
+    else
+        log_info "==> Journald configuration skipped (RUN_JOURNALD_CONFIG=$RUN_JOURNALD_CONFIG)"
     fi
     
     # Docker installation
@@ -212,6 +274,8 @@ main() {
         else
             log_warn "Docker installation had issues"
         fi
+    else
+        log_info "==> Docker installation skipped (RUN_DOCKER_INSTALL=$RUN_DOCKER_INSTALL)"
     fi
     
     # Geekbench
@@ -222,16 +286,8 @@ main() {
         else
             log_warn "Geekbench failed"
         fi
-    fi
-    
-    # Benchmarks
-    if [ "$RUN_BENCHMARKS" = "yes" ]; then
-        log_info "==> Running swap benchmarks"
-        if ./benchmark.py --test-all 2>&1 | tee -a "$LOG_FILE"; then
-            log_info "✓ Benchmarks complete"
-        else
-            log_warn "Benchmarks had issues"
-        fi
+    else
+        log_info "==> Geekbench skipped (RUN_GEEKBENCH=$RUN_GEEKBENCH)"
     fi
     
     # System info
