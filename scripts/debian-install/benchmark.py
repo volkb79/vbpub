@@ -605,12 +605,12 @@ stonewall
             # Extract write performance
             write_bw = data['jobs'][0]['write']['bw'] / 1024  # MB/s
             results['write_mb_per_sec'] = round(write_bw, 2)
-            results['write_iops'] = round(data['jobs'][0]['write']['iops'], 0)
+            results['write_iops'] = int(round(data['jobs'][0]['write']['iops'], 0))
             
             # Extract read performance
             read_bw = data['jobs'][1]['read']['bw'] / 1024  # MB/s
             results['read_mb_per_sec'] = round(read_bw, 2)
-            results['read_iops'] = round(data['jobs'][1]['read']['iops'], 0)
+            results['read_iops'] = int(round(data['jobs'][1]['read']['iops'], 0))
             
             # Calculate scaling efficiency
             # Baseline is single file, so efficiency = actual / (baseline * num_files)
@@ -618,8 +618,8 @@ stonewall
             results['write_scaling_efficiency'] = round(100, 2)  # Placeholder, needs baseline
             results['read_scaling_efficiency'] = round(100, 2)  # Placeholder, needs baseline
             
-            log_info(f"  Write: {write_bw:.2f} MB/s, {results['write_iops']:.0f} IOPS")
-            log_info(f"  Read: {read_bw:.2f} MB/s, {results['read_iops']:.0f} IOPS")
+            log_info(f"  Write: {write_bw:.2f} MB/s, {results['write_iops']} IOPS")
+            log_info(f"  Read: {read_bw:.2f} MB/s, {results['read_iops']} IOPS")
         else:
             raise subprocess.CalledProcessError(result.returncode, 'fio', result.stderr)
     
