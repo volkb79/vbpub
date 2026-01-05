@@ -22,29 +22,26 @@ LOG_DIR="${LOG_DIR:-/var/log/debian-install}"
 LOG_FILE="${LOG_DIR}/bootstrap-$(date +%Y%m%d-%H%M%S).log"
 
 # Swap configuration (NEW NAMING CONVENTION)
-# Legacy SWAP_ARCH support (now used as configuration presets)
-SWAP_ARCH="${SWAP_ARCH:-3}"
-
 # RAM-based swap
-SWAP_RAM_SOLUTION="${SWAP_RAM_SOLUTION:-zswap}"
-SWAP_RAM_TOTAL_GB="${SWAP_RAM_TOTAL_GB:-auto}"
-ZRAM_COMPRESSOR="${ZRAM_COMPRESSOR:-lz4}"
-ZRAM_ALLOCATOR="${ZRAM_ALLOCATOR:-zsmalloc}"
-ZRAM_PRIORITY="${ZRAM_PRIORITY:-100}"
-ZSWAP_COMPRESSOR="${ZSWAP_COMPRESSOR:-lz4}"
-ZSWAP_ZPOOL="${ZSWAP_ZPOOL:-z3fold}"
+SWAP_RAM_SOLUTION="${SWAP_RAM_SOLUTION:-}"  # zram, zswap, none (auto-detected if not set)
+SWAP_RAM_TOTAL_GB="${SWAP_RAM_TOTAL_GB:-auto}"  # RAM dedicated to compression (auto = calculated)
+ZRAM_COMPRESSOR="${ZRAM_COMPRESSOR:-lz4}"  # lz4, zstd, lzo-rle
+ZRAM_ALLOCATOR="${ZRAM_ALLOCATOR:-zsmalloc}"  # zsmalloc, z3fold, zbud
+ZRAM_PRIORITY="${ZRAM_PRIORITY:-100}"  # Priority for ZRAM (higher = preferred)
+ZSWAP_COMPRESSOR="${ZSWAP_COMPRESSOR:-lz4}"  # lz4, zstd, lzo-rle
+ZSWAP_ZPOOL="${ZSWAP_ZPOOL:-z3fold}"  # z3fold, zbud, zsmalloc
 
 # Disk-based swap
-SWAP_DISK_TOTAL_GB="${SWAP_DISK_TOTAL_GB:-auto}"
+SWAP_DISK_TOTAL_GB="${SWAP_DISK_TOTAL_GB:-auto}"  # Total disk-based swap (auto = calculated)
 # Track if SWAP_BACKING_TYPE was explicitly set by user (not defaulted)
-if [ -n "${SWAP_BACKING_TYPE+x}" ] && [ "$SWAP_BACKING_TYPE" != "files_in_root" ]; then
+if [ -n "${SWAP_BACKING_TYPE+x}" ] && [ -n "$SWAP_BACKING_TYPE" ]; then
     SWAP_BACKING_TYPE_EXPLICIT="yes"
 else
     SWAP_BACKING_TYPE_EXPLICIT="no"
 fi
-SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE:-files_in_root}"
-SWAP_STRIPE_WIDTH="${SWAP_STRIPE_WIDTH:-8}"
-SWAP_PRIORITY="${SWAP_PRIORITY:-10}"
+SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE:-}"  # files_in_root, partitions_swap, partitions_zvol, files_in_partitions, none (auto-detected if not set)
+SWAP_STRIPE_WIDTH="${SWAP_STRIPE_WIDTH:-8}"  # Number of parallel swap devices (for I/O striping)
+SWAP_PRIORITY="${SWAP_PRIORITY:-10}"  # Priority for disk swap (lower than RAM)
 EXTEND_ROOT="${EXTEND_ROOT:-no}"
 
 # ZFS-specific
@@ -182,7 +179,6 @@ main() {
     install_essential_packages
     
     # Export all config (new naming convention)
-    export SWAP_ARCH
     export SWAP_RAM_SOLUTION SWAP_RAM_TOTAL_GB
     export ZRAM_COMPRESSOR ZRAM_ALLOCATOR ZRAM_PRIORITY
     export ZSWAP_COMPRESSOR ZSWAP_ZPOOL
@@ -212,7 +208,7 @@ main() {
     fi
     
     # Run swap setup
-    log_info "==> Configuring swap (arch=$SWAP_ARCH)"
+    log_info "==> Configuring swap"
     if ./setup-swap.sh 2>&1 | tee -a "$LOG_FILE"; then
         log_info "✓ Swap configured"
         tg_send "✅ Swap configured"
