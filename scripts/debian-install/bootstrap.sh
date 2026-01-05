@@ -31,7 +31,6 @@ SWAP_RAM_TOTAL_GB="${SWAP_RAM_TOTAL_GB:-auto}"
 ZRAM_COMPRESSOR="${ZRAM_COMPRESSOR:-lz4}"
 ZRAM_ALLOCATOR="${ZRAM_ALLOCATOR:-zsmalloc}"
 ZRAM_PRIORITY="${ZRAM_PRIORITY:-100}"
-ZSWAP_POOL_PERCENT="${ZSWAP_POOL_PERCENT:-20}"
 ZSWAP_COMPRESSOR="${ZSWAP_COMPRESSOR:-lz4}"
 ZSWAP_ZPOOL="${ZSWAP_ZPOOL:-z3fold}"
 
@@ -39,18 +38,13 @@ ZSWAP_ZPOOL="${ZSWAP_ZPOOL:-z3fold}"
 SWAP_DISK_TOTAL_GB="${SWAP_DISK_TOTAL_GB:-auto}"
 SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE:-files_in_root}"
 SWAP_STRIPE_WIDTH="${SWAP_STRIPE_WIDTH:-8}"
-SWAP_PARTITION_SIZE_GB="${SWAP_PARTITION_SIZE_GB:-auto}"
 SWAP_PRIORITY="${SWAP_PRIORITY:-10}"
 EXTEND_ROOT="${EXTEND_ROOT:-no}"
 
 # ZFS-specific
 ZFS_POOL="${ZFS_POOL:-tank}"
 
-# Backward compatibility - old variable names
-SWAP_TOTAL_GB="${SWAP_TOTAL_GB:-}"
-SWAP_FILES="${SWAP_FILES:-}"
-USE_PARTITION="${USE_PARTITION:-}"
-ZRAM_SIZE_GB="${ZRAM_SIZE_GB:-}"
+
 
 # Bootstrap options
 RUN_USER_CONFIG="${RUN_USER_CONFIG:-yes}"
@@ -72,32 +66,50 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $*" | tee -a "$LOG_FILE"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*" | tee -a "$LOG_FILE"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*" | tee -a "$LOG_FILE" >&2; }
 
-get_system_id() {
-    # Get FQDN (fully qualified domain name)
-    local hostname=$(hostname -f 2>/dev/null || hostname)
-    local ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "unknown")
-    echo "${hostname} (${ip})"
-}
-
-telegram_send() {
+# Helper function to send telegram messages using telegram_client.py
+tg_send() {
+    local msg="$1"
     [ -z "$TELEGRAM_BOT_TOKEN" ] && return 0
     [ -z "$TELEGRAM_CHAT_ID" ] && return 0
-    local msg="$1"
-    local system_id=$(get_system_id)
-    # Use printf to properly interpret escape sequences
-    local prefixed_msg="<b>${system_id}</b>
-${msg}"
-    curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-        -d "chat_id=${TELEGRAM_CHAT_ID}" \
-        -d "text=${prefixed_msg}" \
-        -d "parse_mode=HTML" >/dev/null 2>&1 || true
+    python3 "${SCRIPT_DIR}/telegram_client.py" --send "$msg" 2>/dev/null || true
+}
+
+# Helper function to send files via telegram
+tg_send_file() {
+    local file="$1"
+    local caption="${2:-}"
+    [ -z "$TELEGRAM_BOT_TOKEN" ] && return 0
+    [ -z "$TELEGRAM_CHAT_ID" ] && return 0
+    if [ -n "$caption" ]; then
+        python3 "${SCRIPT_DIR}/telegram_client.py" --file "$file" --caption "$caption" 2>/dev/null || true
+    else
+        python3 "${SCRIPT_DIR}/telegram_client.py" --file "$file" 2>/dev/null || true
+    fi
+}
+
+# Collect system summary
+get_system_summary() {
+    echo "📊 System Summary"
+    echo "================"
+    echo "Hostname: $(hostname -f 2>/dev/null || hostname)"
+    echo "IP: $(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo ""
+    echo "CPU: $(grep 'model name' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)"
+    echo "CPU Cores: $(nproc)"
+    echo "RAM: $(free -h | awk '/^Mem:/{print $2}')"
+    echo ""
+    echo "OS: $(cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '"')"
+    echo "Kernel: $(uname -r)"
+    echo ""
+    echo "Disk Layout:"
+    lsblk -o NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null || df -h
 }
 
 main() {
     mkdir -p "$LOG_DIR"
     log_info "Debian System Setup Bootstrap"
     log_info "Log: $LOG_FILE"
-    telegram_send "🚀 Starting system setup"
+    tg_send "🚀 Starting system setup"
     
     if [ "$EUID" -ne 0 ]; then log_error "Must run as root"; exit 1; fi
     
@@ -124,36 +136,40 @@ main() {
     export SWAP_ARCH
     export SWAP_RAM_SOLUTION SWAP_RAM_TOTAL_GB
     export ZRAM_COMPRESSOR ZRAM_ALLOCATOR ZRAM_PRIORITY
-    export ZSWAP_POOL_PERCENT ZSWAP_COMPRESSOR ZSWAP_ZPOOL
+    export ZSWAP_COMPRESSOR ZSWAP_ZPOOL
     export SWAP_DISK_TOTAL_GB SWAP_BACKING_TYPE SWAP_STRIPE_WIDTH
-    export SWAP_PARTITION_SIZE_GB SWAP_PRIORITY EXTEND_ROOT
+    export SWAP_PRIORITY EXTEND_ROOT
     export ZFS_POOL
     export TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID LOG_FILE
     export DEBUG_MODE
     
-    # Export backward compat variables if set
-    [ -n "$SWAP_TOTAL_GB" ] && export SWAP_TOTAL_GB
-    [ -n "$SWAP_FILES" ] && export SWAP_FILES
-    [ -n "$USE_PARTITION" ] && export USE_PARTITION
-    [ -n "$ZRAM_SIZE_GB" ] && export ZRAM_SIZE_GB
+    # Send system summary
+    log_info "==> Collecting system summary"
+    SYSTEM_SUMMARY=$(get_system_summary)
+    echo "$SYSTEM_SUMMARY" | tee -a "$LOG_FILE"
+    tg_send "$SYSTEM_SUMMARY"
     
     # Run swap setup
     log_info "==> Configuring swap (arch=$SWAP_ARCH)"
     if ./setup-swap.sh 2>&1 | tee -a "$LOG_FILE"; then
         log_info "✓ Swap configured"
-        telegram_send "✅ Swap configured"
+        tg_send "✅ Swap configured"
     else
         log_error "✗ Swap config failed"
-        telegram_send "❌ Swap config failed"
+        tg_send "❌ Swap config failed"
         exit 1
     fi
+    
+    # Sync and send log file
+    sync
+    tg_send_file "$LOG_FILE" "📋 Swap Configuration Log"
     
     # User configuration
     if [ "$RUN_USER_CONFIG" = "yes" ]; then
         log_info "==> Configuring users"
         if ./configure-users.sh 2>&1 | tee -a "$LOG_FILE"; then
             log_info "✓ Users configured"
-            telegram_send "✅ User configs applied"
+            tg_send "✅ User configs applied"
         else
             log_warn "User config had issues"
         fi
@@ -164,7 +180,7 @@ main() {
         log_info "==> Configuring APT repositories"
         if ./configure-apt.sh 2>&1 | tee -a "$LOG_FILE"; then
             log_info "✓ APT configured"
-            telegram_send "✅ APT repos configured"
+            tg_send "✅ APT repos configured"
         else
             log_warn "APT config had issues"
         fi
@@ -175,7 +191,7 @@ main() {
         log_info "==> Configuring journald"
         if ./configure-journald.sh 2>&1 | tee -a "$LOG_FILE"; then
             log_info "✓ Journald configured"
-            telegram_send "✅ Journald configured"
+            tg_send "✅ Journald configured"
         else
             log_warn "Journald config had issues"
         fi
@@ -186,7 +202,7 @@ main() {
         log_info "==> Installing Docker"
         if ./install-docker.sh 2>&1 | tee -a "$LOG_FILE"; then
             log_info "✓ Docker installed"
-            telegram_send "✅ Docker installed"
+            tg_send "✅ Docker installed"
         else
             log_warn "Docker installation had issues"
         fi
@@ -225,13 +241,7 @@ main() {
         # Send file as attachment if available
         if [ -f "$SYSINFO_FILE" ]; then
             log_info "Sending system info file as attachment..."
-            python3 -c "
-import sys
-sys.path.insert(0, '${SCRIPT_DIR}')
-from telegram_client import TelegramClient
-client = TelegramClient()
-client.send_document('${SYSINFO_FILE}', caption='📊 Detailed System Information')
-" 2>&1 | tee -a "$LOG_FILE" || true
+            tg_send_file "$SYSINFO_FILE" "📊 Detailed System Information"
             rm -f "$SYSINFO_FILE"
         fi
     fi
@@ -240,16 +250,11 @@ client.send_document('${SYSINFO_FILE}', caption='📊 Detailed System Informatio
     log_info "Log: $LOG_FILE"
     
     # Send completion message with log file as attachment
-    telegram_send "🎉 System setup complete"
+    tg_send "🎉 System setup complete"
     if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -f "$LOG_FILE" ]; then
-        log_info "Sending log file as attachment..."
-        python3 -c "
-import sys
-sys.path.insert(0, '${SCRIPT_DIR}')
-from telegram_client import TelegramClient
-client = TelegramClient()
-client.send_document('${LOG_FILE}', caption='📋 Bootstrap Log')
-" || log_warn "Failed to send log file"
+        log_info "Sending final log file as attachment..."
+        sync
+        tg_send_file "$LOG_FILE" "📋 Bootstrap Complete - Full Log"
     fi
 }
 
