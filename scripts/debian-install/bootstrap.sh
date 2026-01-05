@@ -175,7 +175,19 @@ main() {
     chmod +x "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/*.py 2>/dev/null || true
     cd "$SCRIPT_DIR"
     
-    # Install essential packages early
+    # Configure APT repositories BEFORE installing packages
+    if [ "$RUN_APT_CONFIG" = "yes" ]; then
+        log_info "==> Configuring APT repositories (before package installation)"
+        if ./configure-apt.sh 2>&1 | tee -a "$LOG_FILE"; then
+            log_info "✓ APT configured"
+        else
+            log_warn "APT config had issues (non-critical, continuing)"
+        fi
+    else
+        log_info "==> APT configuration skipped (RUN_APT_CONFIG=$RUN_APT_CONFIG)"
+    fi
+    
+    # Install essential packages early (after APT configuration)
     install_essential_packages
     
     # Export all config (new naming convention)
@@ -233,19 +245,6 @@ main() {
         fi
     else
         log_info "==> User configuration skipped (RUN_USER_CONFIG=$RUN_USER_CONFIG)"
-    fi
-    
-    # APT configuration
-    if [ "$RUN_APT_CONFIG" = "yes" ]; then
-        log_info "==> Configuring APT repositories"
-        if ./configure-apt.sh 2>&1 | tee -a "$LOG_FILE"; then
-            log_info "✓ APT configured"
-            tg_send "✅ APT repos configured"
-        else
-            log_warn "APT config had issues"
-        fi
-    else
-        log_info "==> APT configuration skipped (RUN_APT_CONFIG=$RUN_APT_CONFIG)"
     fi
     
     # Journald configuration
