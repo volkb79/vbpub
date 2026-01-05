@@ -186,40 +186,43 @@ MEMORY_ACCESS_STEP_SIZE = 65536  # 64KB steps for memory access patterns
 # FIO test configuration constants
 FIO_TEST_FILE_SIZE = '1G'  # Test file size for fio benchmarks
 
-def log_info(msg):
-    print(f"{Colors.GREEN}[INFO]{Colors.NC} {msg}")
-
-def log_debug(msg):
-    print(f"{Colors.CYAN}[DEBUG]{Colors.NC} {msg}")
-
-def log_warn(msg):
-    print(f"{Colors.YELLOW}[WARN]{Colors.NC} {msg}")
-
-def log_error(msg):
-    print(f"{Colors.RED}[ERROR]{Colors.NC} {msg}", file=sys.stderr)
-
-def log_step(msg):
-    print(f"{Colors.BLUE}[STEP]{Colors.NC} {msg}")
-
 def format_timestamp():
     """Return formatted timestamp for logging"""
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
+   
 def log_info_ts(msg):
     """Log info message with timestamp"""
-    print(f"{Colors.GREEN}[INFO]{Colors.NC} {format_timestamp()} {msg}")
+    print(f"{Colors.GREEN}[INFO]{Colors.NC} {format_timestamp()} {msg}", flush=True)
 
 def log_warn_ts(msg):
     """Log warning message with timestamp"""
-    print(f"{Colors.YELLOW}[WARN]{Colors.NC} {format_timestamp()} {msg}")
+    print(f"{Colors.YELLOW}[WARN]{Colors.NC} {format_timestamp()} {msg}", flush=True)
 
 def log_step_ts(msg):
     """Log step message with timestamp"""
-    print(f"{Colors.BLUE}[STEP]{Colors.NC} {format_timestamp()} {msg}")
+    print(f"{Colors.BLUE}[STEP]{Colors.NC} {format_timestamp()} {msg}", flush=True)
 
 def log_debug_ts(msg):
     """Log debug message with timestamp"""
-    print(f"{Colors.CYAN}[DEBUG]{Colors.NC} {format_timestamp()} {msg}")
+    print(f"{Colors.CYAN}[DEBUG]{Colors.NC} {format_timestamp()} {msg}", flush=True)
+
+
+def log_info(msg):
+    print(f"{Colors.GREEN}[INFO]{Colors.NC} {msg}", flush=True)
+
+def log_debug(msg):
+    print(f"{Colors.CYAN}[DEBUG]{Colors.NC} {msg}", flush=True)
+
+def log_warn(msg):
+    print(f"{Colors.YELLOW}[WARN]{Colors.NC} {msg}", flush=True)
+
+def log_error(msg):
+    print(f"{Colors.RED}[ERROR]{Colors.NC} {msg}", file=sys.stderr, flush=True)
+
+def log_step(msg):
+    print(f"{Colors.BLUE}[STEP]{Colors.NC} {msg}", flush=True)
+
+
 
 def check_root():
     """Check if running as root"""
