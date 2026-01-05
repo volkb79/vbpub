@@ -230,44 +230,65 @@ apply_swap_arch_preset() {
         1)
             # ZRAM Only (no disk swap)
             SWAP_RAM_SOLUTION="zram"
-            SWAP_BACKING_TYPE="none"
-            log_info "Preset 1: ZRAM only, no disk swap"
+            # Only override SWAP_BACKING_TYPE if it's still at default value
+            if [ "${SWAP_BACKING_TYPE_EXPLICIT:-}" != "yes" ]; then
+                SWAP_BACKING_TYPE="none"
+            fi
+            log_info "Preset 1: ZRAM only (backing: $SWAP_BACKING_TYPE)"
             ;;
         2)
             # ZRAM + Disk Swap (two-tier)
             SWAP_RAM_SOLUTION="zram"
-            [ "$SWAP_BACKING_TYPE" = "files_in_root" ] || SWAP_BACKING_TYPE="files_in_root"
-            log_info "Preset 2: ZRAM + Disk swap files"
+            # Only override SWAP_BACKING_TYPE if it's still at default value
+            if [ "${SWAP_BACKING_TYPE_EXPLICIT:-}" != "yes" ]; then
+                SWAP_BACKING_TYPE="files_in_root"
+            fi
+            log_info "Preset 2: ZRAM + Disk swap (backing: $SWAP_BACKING_TYPE)"
             ;;
         3)
             # ZSWAP + Disk Swap (recommended)
             SWAP_RAM_SOLUTION="zswap"
-            [ "$SWAP_BACKING_TYPE" = "files_in_root" ] || SWAP_BACKING_TYPE="files_in_root"
-            log_info "Preset 3: ZSWAP + Disk swap files (recommended)"
+            # Only override SWAP_BACKING_TYPE if it's still at default value
+            if [ "${SWAP_BACKING_TYPE_EXPLICIT:-}" != "yes" ]; then
+                SWAP_BACKING_TYPE="files_in_root"
+            fi
+            log_info "Preset 3: ZSWAP + Disk swap (backing: $SWAP_BACKING_TYPE)"
             ;;
         4)
             # Disk Swap Only
             SWAP_RAM_SOLUTION="none"
-            [ "$SWAP_BACKING_TYPE" = "files_in_root" ] || SWAP_BACKING_TYPE="files_in_root"
-            log_info "Preset 4: Disk swap only, no RAM compression"
+            # Only override SWAP_BACKING_TYPE if it's still at default value
+            if [ "${SWAP_BACKING_TYPE_EXPLICIT:-}" != "yes" ]; then
+                SWAP_BACKING_TYPE="files_in_root"
+            fi
+            log_info "Preset 4: Disk swap only (backing: $SWAP_BACKING_TYPE)"
             ;;
         5)
             # ZFS zvol Compressed Swap
             SWAP_RAM_SOLUTION="none"
-            SWAP_BACKING_TYPE="partitions_zvol"
-            log_info "Preset 5: ZFS zvol compressed swap"
+            # Only override SWAP_BACKING_TYPE if it's still at default value
+            if [ "${SWAP_BACKING_TYPE_EXPLICIT:-}" != "yes" ]; then
+                SWAP_BACKING_TYPE="partitions_zvol"
+            fi
+            log_info "Preset 5: ZFS zvol compressed swap (backing: $SWAP_BACKING_TYPE)"
             ;;
         6)
             # ZRAM + ZFS zvol
             SWAP_RAM_SOLUTION="zram"
-            SWAP_BACKING_TYPE="partitions_zvol"
-            log_info "Preset 6: ZRAM + ZFS zvol"
+            # Only override SWAP_BACKING_TYPE if it's still at default value
+            if [ "${SWAP_BACKING_TYPE_EXPLICIT:-}" != "yes" ]; then
+                SWAP_BACKING_TYPE="partitions_zvol"
+            fi
+            log_info "Preset 6: ZRAM + ZFS zvol (backing: $SWAP_BACKING_TYPE)"
             ;;
         7)
             # ZRAM + Uncompressed Partition
             SWAP_RAM_SOLUTION="zram"
-            SWAP_BACKING_TYPE="partitions_swap"
-            log_info "Preset 7: ZRAM + Native swap partitions"
+            # Only override SWAP_BACKING_TYPE if it's still at default value
+            if [ "${SWAP_BACKING_TYPE_EXPLICIT:-}" != "yes" ]; then
+                SWAP_BACKING_TYPE="partitions_swap"
+            fi
+            log_info "Preset 7: ZRAM + Native swap partitions (backing: $SWAP_BACKING_TYPE)"
             ;;
         *)
             log_warn "Unknown SWAP_ARCH: $SWAP_ARCH, ignoring"

@@ -242,6 +242,46 @@ alias egrep='egrep --color=auto'
 alias df='df -h'
 alias du='du -h'
 alias free='free -h'
+
+# Pretty print log file interpreting ANSI control codes and create line breaks on ^M
+alias catlog='_catlog() { cat "$1" | tr '\''\r'\'' '\''\n'\'' | less -R; }; _catlog'
+EOF
+}
+
+# Top configuration content
+get_toprc_content() {
+    cat <<'EOF'
+top's Config File (Linux processes with windows)
+Id:k, Mode_altscr=0, Mode_irixps=1, Delay_time=2.0, Curwin=0
+Def     fieldscur=  75  107   81  103  105  119  163  123  121  129  161  159  136  111  223  117  115  220   76   78
+                    82   84   86   88   90   92   94   96   98  100  108  112  124  126  130  132  206  210  134  208
+                   212  140  142  146  148  150  152  154  164  166  168  170  172  174  176  178  180  182  184  194
+                   188  139  187  144  157  190  192  196  198  200  202  204  214  216  218  224  226  228  230  232
+                   234  236  238  240  242  244  246  248  250  252  254  256  258  260  262  264  266  268  270  272
+        winflags=671540, sortindx=18, maxtasks=0, graph_cpus=0, graph_mems=0, double_up=0, combine_cpus=0, core_types=0
+        summclr=6, msgsclr=1, headclr=4, taskclr=4
+Job     fieldscur=  75   77  115  111  117   80  103  105  137  119  123  128  120   79  139   82   84   86   88   90
+                    92   94   96   98  100  106  108  112  124  126  130  132  134  140  142  144  146  148  150  152
+                   154  156  158  160  162  164  166  168  170  172  174  176  178  180  182  184  186  188  190  192
+                   194  196  198  200  202  204  206  208  210  212  214  216  218  220  222  224  226  228  230  232
+                   234  236  238  240  242  244  246  248  250  252  254  256  258  260  262  264  266  268  270  272
+        winflags=193844, sortindx=0, maxtasks=0, graph_cpus=0, graph_mems=0, double_up=0, combine_cpus=0, core_types=0
+        summclr=6, msgsclr=6, headclr=7, taskclr=6
+Mem     fieldscur=  75  117  119  120  123  125  127  129  131  154  132  156  135  136  102  104  111  139   76   78
+                    80   82   84   86   88   90   92   94   96   98  100  106  108  112  114  140  142  144  146  148
+                   150  152  158  160  162  164  166  168  170  172  174  176  178  180  182  184  186  188  190  192
+                   194  196  198  200  202  204  206  208  210  212  214  216  218  220  222  224  226  228  230  232
+                   234  236  238  240  242  244  246  248  250  252  254  256  258  260  262  264  266  268  270  272
+        winflags=193844, sortindx=21, maxtasks=0, graph_cpus=0, graph_mems=0, double_up=0, combine_cpus=0, core_types=0
+        summclr=5, msgsclr=5, headclr=4, taskclr=5
+Usr     fieldscur=  75   77   79   81   85   97  115  111  117  137  139   82   86   88   90   92   94   98  100  102
+                   104  106  108  112  118  120  122  124  126  128  130  132  134  140  142  144  146  148  150  152
+                   154  156  158  160  162  164  166  168  170  172  174  176  178  180  182  184  186  188  190  192
+                   194  196  198  200  202  204  206  208  210  212  214  216  218  220  222  224  226  228  230  232
+                   234  236  238  240  242  244  246  248  250  252  254  256  258  260  262  264  266  268  270  272
+        winflags=193844, sortindx=3, maxtasks=0, graph_cpus=0, graph_mems=0, double_up=0, combine_cpus=0, core_types=0
+        summclr=3, msgsclr=3, headclr=2, taskclr=3
+Fixed_widest=0, Summ_mscale=1, Task_mscale=1, Zero_suppress=0, Tics_scaled=0
 EOF
 }
 
@@ -284,13 +324,47 @@ configure_htop() {
     chmod -R 755 "$htop_dir"
 }
 
+# Configure top for a user/directory
+configure_top() {
+    local target_dir="$1"
+    local top_dir="${target_dir}/.config/procps"
+    
+    mkdir -p "$top_dir"
+    get_toprc_content > "${top_dir}/toprc"
+    chmod -R 755 "$top_dir"
+}
+
 # Configure bash aliases for a user/directory
 configure_bash_aliases() {
     local target_dir="$1"
     local bash_aliases="${target_dir}/.bash_aliases"
+    local bashrc="${target_dir}/.bashrc"
     
     get_bash_aliases_content > "$bash_aliases"
     chmod 644 "$bash_aliases"
+    
+    # Ensure .bashrc sources .bash_aliases if it exists
+    if [ -f "$bashrc" ]; then
+        # Check if .bash_aliases is already sourced
+        if ! grep -q "\.bash_aliases" "$bashrc"; then
+            cat >> "$bashrc" <<'BASHRC_EOF'
+
+# Source bash aliases if available
+if [ -f ~/.bash_aliases ]; then
+    . ~/.bash_aliases
+fi
+BASHRC_EOF
+        fi
+    else
+        # Create minimal .bashrc if it doesn't exist
+        cat > "$bashrc" <<'BASHRC_EOF'
+# Source bash aliases if available
+if [ -f ~/.bash_aliases ]; then
+    . ~/.bash_aliases
+fi
+BASHRC_EOF
+        chmod 644 "$bashrc"
+    fi
 }
 
 # Configure all tools for a user
@@ -309,6 +383,7 @@ configure_user() {
     configure_mc "$target_home"
     configure_iftop "$target_home"
     configure_htop "$target_home"
+    configure_top "$target_home"
     configure_bash_aliases "$target_home"
     
     # Set ownership for user configs
@@ -332,6 +407,7 @@ configure_skel() {
     configure_mc "$skel_dir"
     configure_iftop "$skel_dir"
     configure_htop "$skel_dir"
+    configure_top "$skel_dir"
     configure_bash_aliases "$skel_dir"
     
     log_success "/etc/skel configured for new users"
