@@ -342,8 +342,19 @@ bs={size_kb}k
             results['write_mb_per_sec'] = round(write_bw, 2)
             results['write_latency_ms'] = round(write_lat, 2)
             log_info(f"  Write: {write_bw:.2f} MB/s, Latency: {write_lat:.2f} ms")
+        else:
+            log_error(f"Write test exited with code {result.returncode}")
+            log_debug(f"Stderr: {result.stderr}")
+            results['write_mb_per_sec'] = 0
+            results['write_error'] = f'Exit code {result.returncode}'
+    except json.JSONDecodeError as e:
+        log_error(f"Failed to parse fio JSON output: {e}")
+        log_debug(f"Output: {result.stdout[:200]}")
+        results['write_mb_per_sec'] = 0
+        results['write_error'] = f'JSON parse error: {e}'
     except Exception as e:
         log_error(f"Write test failed: {e}")
+        results['write_mb_per_sec'] = 0
         results['write_error'] = str(e)
     
     # Sequential or Random read test
@@ -382,8 +393,19 @@ bs={size_kb}k
             results['read_mb_per_sec'] = round(read_bw, 2)
             results['read_latency_ms'] = round(read_lat, 2)
             log_info(f"  Read: {read_bw:.2f} MB/s, Latency: {read_lat:.2f} ms")
+        else:
+            log_error(f"Read test exited with code {result.returncode}")
+            log_debug(f"Stderr: {result.stderr}")
+            results['read_mb_per_sec'] = 0
+            results['read_error'] = f'Exit code {result.returncode}'
+    except json.JSONDecodeError as e:
+        log_error(f"Failed to parse fio JSON output: {e}")
+        log_debug(f"Output: {result.stdout[:200]}")
+        results['read_mb_per_sec'] = 0
+        results['read_error'] = f'JSON parse error: {e}'
     except Exception as e:
         log_error(f"Read test failed: {e}")
+        results['read_mb_per_sec'] = 0
         results['read_error'] = str(e)
     
     # Cleanup
