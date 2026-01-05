@@ -50,7 +50,6 @@ SWAP_RAM_TOTAL_GB="${SWAP_RAM_TOTAL_GB:-auto}"  # RAM dedicated to compression (
 ZRAM_COMPRESSOR="${ZRAM_COMPRESSOR:-lz4}"  # lz4, zstd, lzo-rle
 ZRAM_ALLOCATOR="${ZRAM_ALLOCATOR:-zsmalloc}"  # zsmalloc, z3fold, zbud
 ZRAM_PRIORITY="${ZRAM_PRIORITY:-100}"  # Priority for ZRAM (higher = preferred)
-ZSWAP_POOL_PERCENT="${ZSWAP_POOL_PERCENT:-20}"  # ZSWAP pool as % of RAM
 ZSWAP_COMPRESSOR="${ZSWAP_COMPRESSOR:-lz4}"  # lz4, zstd, lzo-rle
 ZSWAP_ZPOOL="${ZSWAP_ZPOOL:-z3fold}"  # z3fold, zbud, zsmalloc
 
@@ -58,38 +57,11 @@ ZSWAP_ZPOOL="${ZSWAP_ZPOOL:-z3fold}"  # z3fold, zbud, zsmalloc
 SWAP_DISK_TOTAL_GB="${SWAP_DISK_TOTAL_GB:-auto}"  # Total disk-based swap (auto = calculated)
 SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE:-files_in_root}"  # files_in_root, partitions_swap, partitions_zvol, files_in_partitions, none
 SWAP_STRIPE_WIDTH="${SWAP_STRIPE_WIDTH:-8}"  # Number of parallel swap devices (for I/O striping)
-SWAP_PARTITION_SIZE_GB="${SWAP_PARTITION_SIZE_GB:-auto}"  # Size for each partition when using striping
 SWAP_PRIORITY="${SWAP_PRIORITY:-10}"  # Priority for disk swap (lower than RAM)
-EXTEND_ROOT="${EXTEND_ROOT:-yes}"  # Extend root partition before creating swap partitions
+EXTEND_ROOT="${EXTEND_ROOT:-yes}"  # Extend root partition AFTER creating swap partitions at end of disk
 
 # ZFS-specific
 ZFS_POOL="${ZFS_POOL:-tank}"  # ZFS pool name for zvol-based swap
-
-# Backward compatibility layer - map old variables to new ones
-if [ -n "${SWAP_TOTAL_GB:-}" ] && [ "${SWAP_TOTAL_GB}" != "auto" ] && [ -z "${SWAP_DISK_TOTAL_GB:-}" ]; then
-    SWAP_DISK_TOTAL_GB="$SWAP_TOTAL_GB"
-    log_debug "Backward compat: SWAP_TOTAL_GB=$SWAP_TOTAL_GB mapped to SWAP_DISK_TOTAL_GB"
-fi
-
-if [ -n "${SWAP_FILES:-}" ] && [ "${SWAP_FILES}" != "8" ] && [ "${SWAP_STRIPE_WIDTH}" = "8" ]; then
-    SWAP_STRIPE_WIDTH="$SWAP_FILES"
-    log_debug "Backward compat: SWAP_FILES=$SWAP_FILES mapped to SWAP_STRIPE_WIDTH"
-fi
-
-if [ -n "${ZRAM_SIZE_GB:-}" ] && [ -z "${SWAP_RAM_TOTAL_GB:-}" ]; then
-    SWAP_RAM_TOTAL_GB="$ZRAM_SIZE_GB"
-    SWAP_RAM_SOLUTION="zram"
-    log_debug "Backward compat: ZRAM_SIZE_GB=$ZRAM_SIZE_GB mapped to SWAP_RAM_TOTAL_GB"
-fi
-
-if [ -n "${USE_PARTITION:-}" ] && [ "${USE_PARTITION}" = "yes" ]; then
-    if [ "${SWAP_BACKING:-direct}" = "ext4" ]; then
-        SWAP_BACKING_TYPE="files_in_partitions"
-    else
-        SWAP_BACKING_TYPE="partitions_swap"
-    fi
-    log_debug "Backward compat: USE_PARTITION=yes, SWAP_BACKING=${SWAP_BACKING:-direct} mapped to SWAP_BACKING_TYPE=$SWAP_BACKING_TYPE"
-fi
 
 # Legacy SWAP_ARCH support (now used as configuration presets)
 SWAP_ARCH="${SWAP_ARCH:-}"
@@ -439,7 +411,7 @@ print_system_analysis_and_plan() {
             echo "  Allocator:     ${ZRAM_ALLOCATOR}"
             echo "  Priority:      ${ZRAM_PRIORITY}"
         elif [ "$SWAP_RAM_SOLUTION" = "zswap" ]; then
-            echo "  Pool Size:     ${ZSWAP_POOL_PERCENT}% of RAM"
+            echo "  Pool Size:     20% of RAM (fixed)"
             echo "  Compressor:    ${ZSWAP_COMPRESSOR}"
             echo "  Zpool:         ${ZSWAP_ZPOOL}"
         fi
@@ -503,7 +475,7 @@ print_system_analysis_and_plan() {
         echo "  ${step}. Create ZRAM device (${SWAP_RAM_TOTAL_GB}GB compressed)"
         ((step++))
     elif [ "$SWAP_RAM_SOLUTION" = "zswap" ] && [ "$SWAP_RAM_TOTAL_GB" -gt 0 ]; then
-        echo "  ${step}. Enable ZSWAP (${ZSWAP_POOL_PERCENT}% pool, ${ZSWAP_COMPRESSOR} compression)"
+        echo "  ${step}. Enable ZSWAP (20% pool, ${ZSWAP_COMPRESSOR} compression)"
         ((step++))
     fi
     
@@ -646,8 +618,8 @@ setup_zram() {
     }
     
     # Set size
-    local zram_size_bytes=$((ZRAM_SIZE_GB * 1024 * 1024 * 1024))
-    log_info "Setting ZRAM size: ${ZRAM_SIZE_GB}GB"
+    local zram_size_bytes=$((SWAP_RAM_TOTAL_GB * 1024 * 1024 * 1024))
+    log_info "Setting ZRAM size: ${SWAP_RAM_TOTAL_GB}GB"
     echo "$zram_size_bytes" > /sys/block/zram0/disksize
     
     # Format and activate
@@ -684,6 +656,9 @@ EOF
 # Setup ZSWAP
 setup_zswap() {
     log_step "Setting up ZSWAP"
+    
+    # Use fixed 20% pool size
+    local ZSWAP_POOL_PERCENT=20
     
     # Enable ZSWAP
     if [ -d /sys/module/zswap ]; then
@@ -724,19 +699,19 @@ create_swap_files() {
     # Create directory
     mkdir -p "$SWAP_DIR"
     
-    log_info "Creating $SWAP_FILES swap files of ${SWAP_FILE_SIZE_GB}GB each..."
+    log_info "Creating $SWAP_STRIPE_WIDTH swap files of ${SWAP_DEVICE_SIZE_GB}GB each..."
     
-    for i in $(seq 1 "$SWAP_FILES"); do
+    for i in $(seq 1 "$SWAP_STRIPE_WIDTH"); do
         local swapfile="${SWAP_DIR}/swapfile${i}"
         
-        log_debug "Creating $swapfile (${SWAP_FILE_SIZE_GB}GB)..."
+        log_debug "Creating $swapfile (${SWAP_DEVICE_SIZE_GB}GB)..."
         
         # Use fallocate for speed (if supported) or dd
-        if fallocate -l "${SWAP_FILE_SIZE_GB}G" "$swapfile" 2>/dev/null; then
+        if fallocate -l "${SWAP_DEVICE_SIZE_GB}G" "$swapfile" 2>/dev/null; then
             log_debug "  Created with fallocate"
         else
             log_debug "  Creating with dd (slower)..."
-            dd if=/dev/zero of="$swapfile" bs=1M count=$((SWAP_FILE_SIZE_GB * 1024)) status=progress
+            dd if=/dev/zero of="$swapfile" bs=1M count=$((SWAP_DEVICE_SIZE_GB * 1024)) status=progress
         fi
         
         # Set permissions
@@ -781,7 +756,7 @@ setup_zfs_zvol() {
         *) volblocksize="64k" ;;
     esac
     
-    log_info "Creating ZFS zvol: ${SWAP_TOTAL_GB}GB with volblocksize=$volblocksize"
+    log_info "Creating ZFS zvol: ${SWAP_DISK_TOTAL_GB}GB with volblocksize=$volblocksize"
     
     # Destroy if exists
     if zfs list "$zvol_name" >/dev/null 2>&1; then
@@ -790,7 +765,7 @@ setup_zfs_zvol() {
     fi
     
     # Create zvol
-    zfs create -V "${SWAP_TOTAL_GB}G" \
+    zfs create -V "${SWAP_DISK_TOTAL_GB}G" \
         -o compression=lz4 \
         -o sync=always \
         -o primarycache=metadata \
@@ -868,15 +843,16 @@ create_swap_partition() {
         return 1
     fi
     
-    # Calculate swap partition size
-    if [ "$SWAP_PARTITION_SIZE_GB" = "auto" ]; then
-        SWAP_PARTITION_SIZE_GB=$SWAP_TOTAL_GB
+    # Calculate swap partition size - now derived internally
+    SWAP_DEVICE_SIZE_GB=$((SWAP_DISK_TOTAL_GB / SWAP_STRIPE_WIDTH))
+    if [ "$SWAP_DEVICE_SIZE_GB" -lt 1 ]; then
+        SWAP_DEVICE_SIZE_GB=1
     fi
     
     # Convert GB to MiB for sfdisk (1GB = 1024 MiB)
-    SWAP_SIZE_MIB=$((SWAP_PARTITION_SIZE_GB * 1024))
+    SWAP_SIZE_MIB=$((SWAP_DEVICE_SIZE_GB * 1024))
     
-    log_info "Creating ${SWAP_PARTITION_SIZE_GB}GB (${SWAP_SIZE_MIB}MiB) swap partition"
+    log_info "Creating ${SWAP_DEVICE_SIZE_GB}GB (${SWAP_SIZE_MIB}MiB) swap partition"
     
     # Backup current partition table
     BACKUP_FILE="/tmp/ptable-backup-$(date +%s).dump"
@@ -1148,21 +1124,24 @@ create_swap_partition() {
         fi
         
         # Create swap files on the ext4 partition
-        log_info "Creating ${SWAP_FILES} swap files on ext4 partition..."
-        local SWAP_FILE_SIZE_GB=$((SWAP_PARTITION_SIZE_GB / SWAP_FILES))
+        log_info "Creating ${SWAP_STRIPE_WIDTH} swap files on ext4 partition..."
+        local file_size_gb=$((SWAP_DEVICE_SIZE_GB / SWAP_STRIPE_WIDTH))
+        if [ "$file_size_gb" -lt 1 ]; then
+            file_size_gb=1
+        fi
         
-        for i in $(seq 1 "$SWAP_FILES"); do
+        for i in $(seq 1 "$SWAP_STRIPE_WIDTH"); do
             local swapfile="${SWAP_MOUNT}/swapfile${i}"
             
-            log_info "Creating ${swapfile} (${SWAP_FILE_SIZE_GB}GB)..."
+            log_info "Creating ${swapfile} (${file_size_gb}GB)..."
             
             # Use fallocate for speed
-            if fallocate -l "${SWAP_FILE_SIZE_GB}G" "$swapfile" 2>/dev/null; then
+            if fallocate -l "${file_size_gb}G" "$swapfile" 2>/dev/null; then
                 log_debug "Used fallocate for $swapfile"
             else
                 # Fallback to dd if fallocate not supported
                 log_debug "Using dd for $swapfile (slower)..."
-                dd if=/dev/zero of="$swapfile" bs=1M count=$((SWAP_FILE_SIZE_GB * 1024)) status=progress 2>&1 | tee -a "$LOG_FILE"
+                dd if=/dev/zero of="$swapfile" bs=1M count=$((file_size_gb * 1024)) status=progress 2>&1 | tee -a "$LOG_FILE"
             fi
             
             # Set permissions
@@ -1179,10 +1158,10 @@ create_swap_partition() {
                 echo "$swapfile none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
             fi
             
-            log_success "Swap file ${i}/${SWAP_FILES} created and activated"
+            log_success "Swap file ${i}/${SWAP_STRIPE_WIDTH} created and activated"
         done
         
-        log_success "Ext4-backed swap setup complete: ${SWAP_FILES} files on ${SWAP_PARTITION}"
+        log_success "Ext4-backed swap setup complete: ${SWAP_STRIPE_WIDTH} files on ${SWAP_PARTITION}"
         log_info "Note: All swap files have equal priority (${SWAP_PRIORITY}) for I/O striping"
         
     else
@@ -1263,7 +1242,7 @@ extend_root_partition() {
     
     # Calculate new size for root partition
     # Formula: Total sectors - start of root - space for swap - 1 (for rounding)
-    SWAP_SIZE_MIB=$((SWAP_PARTITION_SIZE_GB * 1024))
+    SWAP_SIZE_MIB=$((SWAP_DEVICE_SIZE_GB * 1024))
     SWAP_SIZE_SECTORS=$((SWAP_SIZE_MIB * 2048))
     
     # Calculate remaining space for root in MiB
@@ -1361,13 +1340,12 @@ setup_zram_with_partition() {
     setup_zram
     
     # Then setup partition-based swap with lower priority
-    if [ "$USE_PARTITION" = "yes" ]; then
-        log_warn "Partition-based overflow not yet fully automated"
-        log_info "To set up manually:"
-        log_info "  1. Create partition with create_swap_partition"
-        log_info "  2. Format: mkswap /dev/sdXN"
-        log_info "  3. Activate with lower priority: swapon -p 10 /dev/sdXN"
-        log_info "  4. ZRAM will use priority 100 (higher), partition priority 10 (lower)"
+    if [[ "$SWAP_BACKING_TYPE" == "partitions_swap" || "$SWAP_BACKING_TYPE" == "partitions_zvol" || "$SWAP_BACKING_TYPE" == "files_in_partitions" ]]; then
+        log_info "Setting up partition-based swap overflow"
+        create_swap_partition
+    else
+        log_warn "SWAP_BACKING_TYPE not set to partition mode - skipping partition setup"
+        log_info "Current SWAP_BACKING_TYPE: $SWAP_BACKING_TYPE"
     fi
 }
 
@@ -1476,8 +1454,8 @@ setup_architecture() {
         2)
             log_info "Architecture 2: ZRAM + Swap Files (Two-Tier)"
             setup_zram
-            if [ "$USE_PARTITION" = "yes" ]; then
-                log_info "  Using partition instead of files"
+            if [[ "$SWAP_BACKING_TYPE" == "partitions_swap" || "$SWAP_BACKING_TYPE" == "partitions_zvol" || "$SWAP_BACKING_TYPE" == "files_in_partitions" ]]; then
+                log_info "  Using partition-based swap"
                 setup_zram_with_partition
             else
                 create_swap_files
@@ -1486,8 +1464,8 @@ setup_architecture() {
         3)
             log_info "Architecture 3: ZSWAP + Swap Files (Recommended)"
             setup_zswap
-            if [ "$USE_PARTITION" = "yes" ]; then
-                log_info "  Using partition instead of files"
+            if [[ "$SWAP_BACKING_TYPE" == "partitions_swap" || "$SWAP_BACKING_TYPE" == "partitions_zvol" || "$SWAP_BACKING_TYPE" == "files_in_partitions" ]]; then
+                log_info "  Using partition-based swap"
                 create_swap_partition
             else
                 create_swap_files
@@ -1495,8 +1473,8 @@ setup_architecture() {
             ;;
         4)
             log_info "Architecture 4: Swap Files Only"
-            if [ "$USE_PARTITION" = "yes" ]; then
-                log_info "  Using partition instead of files"
+            if [[ "$SWAP_BACKING_TYPE" == "partitions_swap" || "$SWAP_BACKING_TYPE" == "partitions_zvol" || "$SWAP_BACKING_TYPE" == "files_in_partitions" ]]; then
+                log_info "  Using partition-based swap"
                 create_swap_partition
             else
                 create_swap_files

@@ -154,6 +154,7 @@ def main():
     parser.add_argument('--test', action='store_true', help='Test connection')
     parser.add_argument('--send', metavar='TEXT', help='Send message')
     parser.add_argument('--file', metavar='PATH', help='Send file')
+    parser.add_argument('--caption', metavar='TEXT', help='Caption for file (used with --file)')
     parser.add_argument('--bot-token', help='Bot token (or use TELEGRAM_BOT_TOKEN env)')
     parser.add_argument('--chat-id', help='Chat ID (or use TELEGRAM_CHAT_ID env)')
     
@@ -174,7 +175,7 @@ def main():
         return 0 if success else 1
     
     if args.file:
-        success = client.send_document(args.file)
+        success = client.send_document(args.file, caption=args.caption)
         print("✓ File sent" if success else "✗ Failed to send file")
         return 0 if success else 1
     
