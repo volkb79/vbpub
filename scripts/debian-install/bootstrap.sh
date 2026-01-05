@@ -83,25 +83,24 @@ tg_send_file() {
     fi
 }
 
-# Collect system summary
+# Collect system summary using unified system_info.py module
 get_system_summary() {
-    echo "Boostrap Installation started."
-    echo "```"
-    echo "# System Summary"
-    echo "Hostname:  $(hostname -f 2>/dev/null || hostname)"
-    echo "IP:        $(hostname -I 2>/dev/null | awk '{print $1}')"
-    echo ""
-    echo "CPU:   $(grep 'model name' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)"
-    echo "Cores: $(nproc)"
-    echo "RAM:   $(free -h | awk '/^Mem:/{print $2}')"
-    echo ""
-    echo "OS:     $(cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '"')"
-    echo "Kernel: $(uname -r)"
-    echo "User:   $(whoami)"
-    echo ""
-    echo "Disk Layout:"
-    lsblk -o NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null || df -h
-    echo "```"
+    # Use system_info.py for consistent system information collection
+    # This replaces the old bash implementation and uses the same module as sysinfo-notify.py
+    if [ -f "${SCRIPT_DIR}/system_info.py" ]; then
+        echo "Bootstrap Installation started."
+        echo ""
+        python3 "${SCRIPT_DIR}/system_info.py" --format text 2>/dev/null || {
+            # Fallback to basic info if system_info.py fails
+            echo "System: $(hostname -f 2>/dev/null || hostname) ($(hostname -I 2>/dev/null | awk '{print $1}'))"
+            echo "RAM: $(free -h | awk '/^Mem:/{print $2}'), Cores: $(nproc)"
+            echo "OS: $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2 | tr -d '"')"
+        }
+    else
+        # Minimal fallback if system_info.py doesn't exist yet
+        echo "Bootstrap Installation started."
+        echo "System: $(hostname) - $(hostname -I 2>/dev/null | awk '{print $1}')"
+    fi
 }
 
 # Install essential packages early
@@ -205,10 +204,17 @@ main() {
     if [ "$RUN_BENCHMARKS" = "yes" ]; then
         log_info "==> Running system benchmarks (for smart swap auto-configuration)"
         BENCHMARK_DURATION="${BENCHMARK_DURATION:-5}"  # Default to 5 seconds per test
-        if ./benchmark.py --test-all --duration "$BENCHMARK_DURATION" 2>&1 | tee -a "$LOG_FILE"; then
+        BENCHMARK_OUTPUT="/tmp/benchmark-results-$(date +%Y%m%d-%H%M%S).json"
+        
+        # Run benchmark with telegram notification if configured
+        BENCHMARK_CMD="./benchmark.py --test-all --duration $BENCHMARK_DURATION --output $BENCHMARK_OUTPUT"
+        if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            BENCHMARK_CMD="$BENCHMARK_CMD --telegram"
+        fi
+        
+        if $BENCHMARK_CMD 2>&1 | tee -a "$LOG_FILE"; then
             log_info "✓ Benchmarks complete"
-            # Note: Benchmark results are logged but not sent via telegram with graphics.
-            # Future improvement: Could save benchmark results to a file and send via tg_send_file  
+            # Benchmark results are automatically sent via Telegram if configured
         else
             log_warn "Benchmarks had issues (non-critical, continuing)"
         fi
@@ -273,8 +279,7 @@ main() {
         log_info "==> Running Geekbench (5-10 min)"
         if ./sysinfo-notify.py --geekbench-only 2>&1 | tee -a "$LOG_FILE"; then
             log_info "✓ Geekbench complete"
-            # Note: Geekbench results are logged but not sent separately via telegram.
-            # Future improvement: Could extract results and send via tg_send or tg_send_file
+            # Geekbench results are automatically sent via telegram by sysinfo-notify.py
         else
             log_warn "Geekbench failed"
         fi
@@ -285,21 +290,22 @@ main() {
     # System info
     if [ "$SEND_SYSINFO" = "yes" ] && [ -n "$TELEGRAM_BOT_TOKEN" ]; then
         log_info "==> Sending system info"
-        # Note: Two scripts exist for system info:
-        # - system_info.py: Collects system information to a file
-        # - sysinfo-notify.py: Sends system info via telegram with formatted output
-        # Both are used: system_info.py for file collection, sysinfo-notify.py for notification
-        # Collect system info to a file
-        SYSINFO_FILE="/tmp/system-info-$(date +%Y%m%d-%H%M%S).txt"
-        ./system_info.py --collect > "$SYSINFO_FILE" 2>&1 || true
+        # System information is collected using the unified system_info.py module.
+        # This module is shared between:
+        # - get_system_summary(): Uses system_info.py with --format text for bootstrap summary
+        # - sysinfo-notify.py: Uses system_info.py with HTML formatting for telegram notifications
+        # This ensures DRY (Don't Repeat Yourself) - single source of truth for system info collection.
         
-        # Send as message
+        # Send formatted notification via telegram
         ./sysinfo-notify.py --notify 2>&1 | tee -a "$LOG_FILE" || true
         
-        # Send file as attachment if available
+        # Optionally save detailed info to file and send as attachment
+        SYSINFO_FILE="/tmp/system-info-$(date +%Y%m%d-%H%M%S).json"
+        ./system_info.py --output "$SYSINFO_FILE" 2>&1 || true
+        
         if [ -f "$SYSINFO_FILE" ]; then
-            log_info "Sending system info file as attachment..."
-            tg_send_file "$SYSINFO_FILE" "📊 Detailed System Information"
+            log_info "Sending detailed system info as attachment..."
+            tg_send_file "$SYSINFO_FILE" "📊 Detailed System Information (JSON)"
             rm -f "$SYSINFO_FILE"
         fi
     fi

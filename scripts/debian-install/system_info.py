@@ -255,6 +255,38 @@ class SystemInfo:
             html += f"  Public IP: {self.info['network']['public_ip']}\n"
         
         return html
+    
+    def format_text(self):
+        """Format system info as plain text"""
+        text = "# System Summary\n"
+        text += f"Hostname:  {self.info['hostname']}\n"
+        
+        # Network
+        if 'network' in self.info and 'public_ip' in self.info['network']:
+            text += f"IP:        {self.info['network']['public_ip']}\n"
+        text += "\n"
+        
+        # Hardware
+        text += f"CPU:   {self.info['hardware'].get('cpu_model', 'Unknown')}\n"
+        text += f"Cores: {self.info['hardware']['cpu_cores']}\n"
+        
+        # Memory
+        if 'memory' in self.info and 'total_gb' in self.info['memory']:
+            text += f"RAM:   {self.info['memory']['total_gb']} GB\n"
+        text += "\n"
+        
+        # OS
+        if 'distribution' in self.info['os']:
+            text += f"OS:     {self.info['os']['distribution']}\n"
+        text += f"Kernel: {self.info['os']['release']}\n"
+        
+        # Disk
+        if 'disk' in self.info and 'total_gb' in self.info['disk']:
+            text += f"\nDisk:   {self.info['disk']['total_gb']} GB total, "
+            text += f"{self.info['disk']['available_gb']} GB available "
+            text += f"({self.info['disk'].get('used_percent', 0)}% used)\n"
+        
+        return text
 
 
 def main():
@@ -262,23 +294,31 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='System Information Collector')
-    parser.add_argument('--collect', action='store_true', help='Collect system info')
+    parser.add_argument('--collect', action='store_true', help='Collect system info (JSON)')
     parser.add_argument('--html', action='store_true', help='Output as HTML')
-    parser.add_argument('--output', '-o', metavar='FILE', help='Save to JSON file')
+    parser.add_argument('--format', choices=['json', 'html', 'text'], default='json',
+                       help='Output format (default: json)')
+    parser.add_argument('--output', '-o', metavar='FILE', help='Save to file')
     
     args = parser.parse_args()
     
     collector = SystemInfo()
     info = collector.collect()
     
-    if args.html:
-        print(collector.format_html())
-    elif args.output:
+    # Determine output format
+    if args.html or args.format == 'html':
+        output = collector.format_html()
+    elif args.format == 'text':
+        output = collector.format_text()
+    else:
+        output = json.dumps(info, indent=2)
+    
+    if args.output:
         with open(args.output, 'w') as f:
-            json.dump(info, f, indent=2)
+            f.write(output)
         print(f"System info saved to {args.output}")
     else:
-        print(json.dumps(info, indent=2))
+        print(output)
     
     return 0
 
