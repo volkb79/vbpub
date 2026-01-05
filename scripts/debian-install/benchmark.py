@@ -266,8 +266,9 @@ def ensure_zram_loaded():
                 with open('/sys/block/zram0/disksize', 'r') as f:
                     current_size = f.read().strip()
                     if current_size != '0':
-                        # Device is configured, need to reset
-                        run_command('echo 1 > /sys/block/zram0/reset', check=False)
+                        # Device is configured, need to reset using direct file I/O
+                        with open('/sys/block/zram0/reset', 'w') as reset_f:
+                            reset_f.write('1\n')
                         time.sleep(0.5)
             except:
                 pass
@@ -404,14 +405,16 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=100):
         # Check if we can set allocator (may not be available)
         if os.path.exists('/sys/block/zram0/mem_pool'):
             try:
-                run_command(f'echo {allocator} > /sys/block/zram0/mem_pool', check=False)
+                with open('/sys/block/zram0/mem_pool', 'w') as f:
+                    f.write(f'{allocator}\n')
             except:
                 log_warn(f"Could not set allocator to {allocator}, using default")
         
         # Set compressor
         if os.path.exists('/sys/block/zram0/comp_algorithm'):
             try:
-                run_command(f'echo {compressor} > /sys/block/zram0/comp_algorithm', check=False)
+                with open('/sys/block/zram0/comp_algorithm', 'w') as f:
+                    f.write(f'{compressor}\n')
             except:
                 log_warn(f"Could not set compressor to {compressor}, using default")
         
@@ -491,7 +494,11 @@ PYEOF
         # Cleanup
         run_command('swapoff /dev/zram0', check=False)
         if os.path.exists('/sys/block/zram0/reset'):
-            run_command('echo 1 > /sys/block/zram0/reset', check=False)
+            try:
+                with open('/sys/block/zram0/reset', 'w') as f:
+                    f.write('1\n')
+            except:
+                pass
     
     return results
 

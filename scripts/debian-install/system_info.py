@@ -99,9 +99,11 @@ class SystemInfo:
                 text=True,
                 check=True
             )
-            if lsblk_full.returncode == 0:
-                info['lsblk_output'] = lsblk_full.stdout.strip()
-        except:
+            info['lsblk_output'] = lsblk_full.stdout.strip()
+        except subprocess.CalledProcessError:
+            # lsblk failed, continue without this info
+            pass
+        except Exception:
             pass
         
         try:

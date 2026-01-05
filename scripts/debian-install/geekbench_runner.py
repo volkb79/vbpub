@@ -19,6 +19,9 @@ from pathlib import Path
 class GeekbenchRunner:
     """Download, install and run Geekbench benchmarks"""
     
+    # Constants
+    URL_CHECK_TIMEOUT = 5  # Seconds to wait for URL validation
+    
     def __init__(self, version=6, work_dir=None):
         self.version = version
         self.work_dir = work_dir or tempfile.mkdtemp(prefix='geekbench_')
@@ -58,13 +61,13 @@ class GeekbenchRunner:
             version_str = f"{self.version}.{minor}.{patch}"
             url = f"https://cdn.geekbench.com/{base_filename}.{minor}.{patch}{suffix}"
             
-            # Quick check if URL is valid with HEAD request (5 second timeout)
+            # Quick check if URL is valid with HEAD request
             try:
                 result = subprocess.run(
-                    ['curl', '-sI', '--max-time', '5', '-o', '/dev/null', '-w', '%{http_code}', url],
+                    ['curl', '-sI', '--max-time', str(self.URL_CHECK_TIMEOUT), '-o', '/dev/null', '-w', '%{http_code}', url],
                     capture_output=True,
                     text=True,
-                    timeout=6
+                    timeout=self.URL_CHECK_TIMEOUT + 1  # Allow 1 extra second for subprocess overhead
                 )
                 if result.returncode == 0 and result.stdout.strip() == '200':
                     print(f"Found Geekbench version {version_str}")
