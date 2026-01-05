@@ -1218,7 +1218,7 @@ create_swap_partition() {
             fi
         fi
         
-        log_success "Direct swap partition setup complete: ${SWAP_PARTITION} (${SWAP_PARTITION_SIZE_GB}GB)"
+        log_success "Direct swap partition setup complete: ${SWAP_PARTITION} (${SWAP_DEVICE_SIZE_GB}GB)"
     fi
     
     return 0
