@@ -159,6 +159,18 @@ class Colors:
     BOLD = '\033[1m'
     NC = '\033[0m'
 
+# Benchmark configuration constants
+COMPRESSION_TEST_SIZE_MB = 256  # Default compression test size
+COMPRESSION_MEMORY_PERCENT = 90  # Percentage of test size to allocate (90%)
+COMPRESSION_MEMORY_PASSES = 3  # Number of passes over memory to ensure swapping
+COMPRESSION_MIN_SWAP_PERCENT = 50  # Minimum expected swap activity (50% of test size)
+COMPRESSION_RATIO_MIN = 1.5  # Minimum expected compression ratio
+COMPRESSION_RATIO_MAX = 4.0  # Maximum typical compression ratio
+COMPRESSION_RATIO_SUSPICIOUS = 10.0  # Ratio above this is suspicious
+
+# FIO test configuration constants
+FIO_TEST_FILE_SIZE = '1G'  # Test file size for fio benchmarks
+
 def log_info(msg):
     print(f"{Colors.GREEN}[INFO]{Colors.NC} {msg}")
 
@@ -311,12 +323,14 @@ def benchmark_block_size_fio(size_kb, test_file='/tmp/fio_test', runtime_sec=5, 
     
     # Sequential or Random write test
     log_info(f"{pattern.capitalize()} write test...")
+    # Use configured test file size to ensure meaningful results
     fio_write = f"""
 [global]
 ioengine=libaio
 direct=1
 runtime={runtime_sec}
 time_based
+size={FIO_TEST_FILE_SIZE}
 filename={test_file}
 
 [seqwrite]
@@ -342,8 +356,19 @@ bs={size_kb}k
             results['write_mb_per_sec'] = round(write_bw, 2)
             results['write_latency_ms'] = round(write_lat, 2)
             log_info(f"  Write: {write_bw:.2f} MB/s, Latency: {write_lat:.2f} ms")
+        else:
+            log_error(f"Write test exited with code {result.returncode}")
+            log_debug(f"Stderr: {result.stderr}")
+            results['write_mb_per_sec'] = 0
+            results['write_error'] = f'Exit code {result.returncode}'
+    except json.JSONDecodeError as e:
+        log_error(f"Failed to parse fio JSON output: {e}")
+        log_debug(f"Output: {result.stdout[:200]}")
+        results['write_mb_per_sec'] = 0
+        results['write_error'] = f'JSON parse error: {e}'
     except Exception as e:
         log_error(f"Write test failed: {e}")
+        results['write_mb_per_sec'] = 0
         results['write_error'] = str(e)
     
     # Sequential or Random read test
@@ -354,6 +379,7 @@ ioengine=libaio
 direct=1
 runtime={runtime_sec}
 time_based
+size={FIO_TEST_FILE_SIZE}
 filename={test_file}
 
 [seqread]
@@ -382,8 +408,19 @@ bs={size_kb}k
             results['read_mb_per_sec'] = round(read_bw, 2)
             results['read_latency_ms'] = round(read_lat, 2)
             log_info(f"  Read: {read_bw:.2f} MB/s, Latency: {read_lat:.2f} ms")
+        else:
+            log_error(f"Read test exited with code {result.returncode}")
+            log_debug(f"Stderr: {result.stderr}")
+            results['read_mb_per_sec'] = 0
+            results['read_error'] = f'Exit code {result.returncode}'
+    except json.JSONDecodeError as e:
+        log_error(f"Failed to parse fio JSON output: {e}")
+        log_debug(f"Output: {result.stdout[:200]}")
+        results['read_mb_per_sec'] = 0
+        results['read_error'] = f'JSON parse error: {e}'
     except Exception as e:
         log_error(f"Read test failed: {e}")
+        results['read_mb_per_sec'] = 0
         results['read_error'] = str(e)
     
     # Cleanup
@@ -396,7 +433,7 @@ bs={size_kb}k
     
     return results
 
-def benchmark_compression(compressor, allocator='zsmalloc', size_mb=100):
+def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_TEST_SIZE_MB):
     """
     Benchmark compression algorithm with specific allocator
     Tests with semi-realistic memory workload
@@ -449,29 +486,39 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=100):
         # Create memory pressure with mixed data patterns
         start = time.time()
         
-        # Test with different data patterns
+        # Test with different data patterns - use configured percentage to ensure memory swapping
         test_script = f"""
 python3 << 'PYEOF'
 import time
 import random
+import sys
 
-# Allocate memory (80% of test size to trigger swapping)
-size = {size_mb * 1024 * 1024 * 8 // 10}
-data = bytearray(size)
+# Allocate memory (90% of test size to trigger swapping)
+size = {size_mb * 1024 * 1024 * COMPRESSION_MEMORY_PERCENT // 100}
+size_mb_actual = size // 1024 // 1024
+print("Allocating " + str(size_mb_actual) + "MB of memory...", file=sys.stderr)
+
+try:
+    data = bytearray(size)
+except MemoryError as e:
+    print("Failed to allocate memory: " + str(e), file=sys.stderr)
+    sys.exit(1)
 
 # Fill with mixed patterns (more realistic than pure zeros)
-print("Filling memory with mixed patterns...")
+print("Filling memory with mixed patterns...", file=sys.stderr)
 for i in range(0, len(data), 4096):
     pattern = random.choice([0, 255, i % 256, random.randint(0, 255)])
     data[i:min(i+4096, len(data))] = bytes([pattern] * min(4096, len(data)-i))
 
-# Touch all memory to ensure it's allocated
-print("Touching all memory...")
-for i in range(0, len(data), 4096):
-    data[i] = (data[i] + 1) % 256
+# Touch all memory multiple times to ensure it's allocated and swapped
+print("Forcing memory to swap (multiple passes)...", file=sys.stderr)
+for pass_num in range({COMPRESSION_MEMORY_PASSES}):
+    for i in range(0, len(data), 4096):
+        data[i] = (data[i] + 1) % 256
+    time.sleep(0.5)
 
+print("Memory pressure test complete", file=sys.stderr)
 time.sleep(2)
-print("Memory pressure test complete")
 PYEOF
 """
         
@@ -497,6 +544,13 @@ PYEOF
                     results['error'] = 'No swap activity detected'
                     return results
                 
+                # VALIDATION: Ensure meaningful data was swapped (at least 50% of test size)
+                min_expected_bytes = size_mb * 1024 * 1024 * COMPRESSION_MIN_SWAP_PERCENT // 100
+                if orig_size < min_expected_bytes:
+                    log_warn(f"Insufficient swap activity: only {orig_size/1024/1024:.1f}MB of {size_mb}MB swapped (expected at least {COMPRESSION_MIN_SWAP_PERCENT}%)")
+                    log_warn("Consider increasing test size or memory pressure")
+                    results['warning'] = f'Low swap activity: {orig_size/1024/1024:.1f}MB < {size_mb*COMPRESSION_MIN_SWAP_PERCENT/100:.1f}MB expected'
+                
                 if compr_size == 0:
                     log_error("Compressed size is zero - invalid ZRAM state")
                     results['error'] = 'Invalid ZRAM compression state'
@@ -510,10 +564,10 @@ PYEOF
                 results['compr_size_mb'] = round(compr_size / 1024 / 1024, 2)
                 results['mem_used_mb'] = round(mem_used / 1024 / 1024, 2)
                 
-                # Compression ratio: should be 1.0 - 4.0 typically
+                # Compression ratio: should be 1.5 - 4.0 typically
                 ratio = orig_size / compr_size
-                if ratio < 1.0 or ratio > 100.0:
-                    log_warn(f"Suspicious compression ratio: {ratio:.2f}x")
+                if ratio < COMPRESSION_RATIO_MIN or ratio > COMPRESSION_RATIO_SUSPICIOUS:
+                    log_warn(f"Suspicious compression ratio: {ratio:.2f}x (expected {COMPRESSION_RATIO_MIN}-{COMPRESSION_RATIO_MAX}x for typical data)")
                 
                 results['compression_ratio'] = round(ratio, 2)
                 
@@ -731,11 +785,26 @@ def format_benchmark_html(results):
     if 'block_sizes' in results and results['block_sizes']:
         html += "<b>📦 Block Size Performance:</b>\n"
         html += "<i>(Sequential I/O, single-threaded)</i>\n"
+        
+        # DEBUG: Log what we're working with
+        log_debug(f"Block sizes data: {results['block_sizes']}")
+        
         max_total = max((b.get('write_mb_per_sec', 0) + b.get('read_mb_per_sec', 0)) for b in results['block_sizes'])
+        
+        # VALIDATION: Check if max_total is actually 0
+        if max_total == 0:
+            log_warn("All block size results show 0 MB/s - check data structure and test execution")
+            log_warn(f"Sample block data: {results['block_sizes'][0] if results['block_sizes'] else 'No data'}")
+        
         for block in results['block_sizes']:
             size_kb = block.get('block_size_kb', 'N/A')
             write_mb = block.get('write_mb_per_sec', 0)
             read_mb = block.get('read_mb_per_sec', 0)
+            
+            # DEBUG: Log individual block results
+            if write_mb == 0 and read_mb == 0:
+                log_debug(f"Block {size_kb}KB: No throughput data. Keys present: {list(block.keys())}")
+            
             total = write_mb + read_mb
             bar_length = int((total / max_total) * 10) if max_total > 0 else 0
             bar = '█' * bar_length + '░' * (10 - bar_length)
@@ -745,11 +814,27 @@ def format_benchmark_html(results):
     # Compressor comparison with visual indicators
     if 'compressors' in results and results['compressors']:
         html += "<b>🗜️ Compressor Performance:</b>\n"
+        
+        # DEBUG: Log compressor data
+        log_debug(f"Compressor data: {results['compressors']}")
+        
         max_ratio = max(c.get('compression_ratio', 0) for c in results['compressors'])
+        
+        # VALIDATION: Check for unrealistic ratios
+        if max_ratio > COMPRESSION_RATIO_SUSPICIOUS:
+            log_warn(f"Suspicious max compression ratio: {max_ratio:.1f}x (expected {COMPRESSION_RATIO_MIN}-{COMPRESSION_RATIO_MAX}x for typical data)")
+        
         for comp in results['compressors']:
             name = comp.get('compressor', 'N/A')
             ratio = comp.get('compression_ratio', 0)
             eff = comp.get('efficiency_pct', 0)
+            
+            # VALIDATION: Check for issues
+            if 'error' in comp:
+                log_warn(f"Compressor {name} had error: {comp['error']}")
+            if 'warning' in comp:
+                log_warn(f"Compressor {name} warning: {comp['warning']}")
+            
             bar_length = int((ratio / max_ratio) * 10) if max_ratio > 0 else 0
             bar = '▓' * bar_length + '░' * (10 - bar_length)
             is_best = ratio == max_ratio

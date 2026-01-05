@@ -135,7 +135,7 @@ class GeekbenchRunner:
         print("This may take 5-10 minutes...\n")
         
         try:
-            # Check if Pro version by checking help output for --export-json
+            # Check if Pro version by checking help output
             help_result = subprocess.run(
                 [self.geekbench_path, '--help'],
                 capture_output=True,
@@ -143,11 +143,14 @@ class GeekbenchRunner:
                 timeout=10
             )
             
-            is_pro = '--export-json' in help_result.stdout
+            # Check for both --export-json and --no-upload availability
+            has_export_json = '--export-json' in help_result.stdout
+            has_no_upload = '--no-upload' in help_result.stdout
+            is_pro = has_export_json and has_no_upload
             
             if is_pro:
-                print("Detected Geekbench Pro - using JSON export")
-                # Run benchmark with JSON output
+                print("Detected Geekbench Pro - using JSON export without upload")
+                # Run benchmark with JSON output and no upload
                 result = subprocess.run(
                     [self.geekbench_path, '--export-json', '--no-upload'],
                     cwd=os.path.dirname(self.geekbench_path),
@@ -156,10 +159,12 @@ class GeekbenchRunner:
                     timeout=900  # 15 minutes max
                 )
             else:
-                print("Detected Geekbench Free - running without JSON export")
-                # Run benchmark without JSON export (not available in free version)
+                print("Detected Geekbench Free - running without restricted flags")
+                print("⚠ Results will be uploaded to Geekbench Browser (free version limitation)")
+                # Run benchmark without any restricted flags (free version)
+                # Free version will upload results automatically
                 result = subprocess.run(
-                    [self.geekbench_path, '--no-upload'],
+                    [self.geekbench_path],
                     cwd=os.path.dirname(self.geekbench_path),
                     capture_output=True,
                     text=True,
