@@ -200,6 +200,9 @@ main() {
         exit 1
     fi
     
+    # Detect release first
+    local release=$(detect_release)
+    
     # Configure APT sources
     configure_apt_sources
     

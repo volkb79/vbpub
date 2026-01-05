@@ -45,7 +45,7 @@ fi
 
 # Configuration variables with defaults (NEW NAMING CONVENTION)
 # RAM-based swap configuration
-SWAP_RAM_SOLUTION="${SWAP_RAM_SOLUTION:-zswap}"  # zram, zswap, none
+SWAP_RAM_SOLUTION="${SWAP_RAM_SOLUTION:-}"  # zram, zswap, none (empty = auto-detect)
 SWAP_RAM_TOTAL_GB="${SWAP_RAM_TOTAL_GB:-auto}"  # RAM dedicated to compression (auto = calculated)
 ZRAM_COMPRESSOR="${ZRAM_COMPRESSOR:-lz4}"  # lz4, zstd, lzo-rle
 ZRAM_ALLOCATOR="${ZRAM_ALLOCATOR:-zsmalloc}"  # zsmalloc, z3fold, zbud
@@ -55,16 +55,13 @@ ZSWAP_ZPOOL="${ZSWAP_ZPOOL:-z3fold}"  # z3fold, zbud, zsmalloc
 
 # Disk-based swap configuration
 SWAP_DISK_TOTAL_GB="${SWAP_DISK_TOTAL_GB:-auto}"  # Total disk-based swap (auto = calculated)
-SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE:-files_in_root}"  # files_in_root, partitions_swap, partitions_zvol, files_in_partitions, none
+SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE:-}"  # files_in_root, partitions_swap, partitions_zvol, files_in_partitions, none (empty = auto-detect)
 SWAP_STRIPE_WIDTH="${SWAP_STRIPE_WIDTH:-8}"  # Number of parallel swap devices (for I/O striping)
 SWAP_PRIORITY="${SWAP_PRIORITY:-10}"  # Priority for disk swap (lower than RAM)
-EXTEND_ROOT="${EXTEND_ROOT:-yes}"  # Extend root partition AFTER creating swap partitions at end of disk
+EXTEND_ROOT="${EXTEND_ROOT:-no}"  # Extend root partition when creating swap partitions at end of disk
 
 # ZFS-specific
 ZFS_POOL="${ZFS_POOL:-tank}"  # ZFS pool name for zvol-based swap
-
-# Legacy SWAP_ARCH support (now used as configuration presets)
-SWAP_ARCH="${SWAP_ARCH:-}"
 
 # Telegram
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
@@ -131,7 +128,7 @@ print_banner() {
     cat <<'EOF'
 ╔═══════════════════════════════════════════════════════╗
 ║   Debian Swap Configuration Toolkit                   ║
-║   Supporting 7 swap architectures                     ║
+║   Intelligent auto-configuration for optimal swap     ║
 ╚═══════════════════════════════════════════════════════╝
 EOF
 }
@@ -218,61 +215,59 @@ detect_system() {
     fi
 }
 
-# Apply SWAP_ARCH preset configurations (backward compatibility)
-apply_swap_arch_preset() {
-    if [ -z "$SWAP_ARCH" ]; then
-        return 0  # No preset specified
+# Auto-detect optimal swap configuration based on system characteristics
+auto_detect_swap_configuration() {
+    log_step "Auto-detecting optimal swap configuration"
+    
+    # Auto-detect SWAP_RAM_SOLUTION if not set
+    if [ -z "$SWAP_RAM_SOLUTION" ]; then
+        # Decision tree based on RAM and storage type
+        if [ "$RAM_GB" -ge 16 ]; then
+            # High RAM systems: ZSWAP is optimal (low overhead, good compression)
+            SWAP_RAM_SOLUTION="zswap"
+            log_info "Auto-selected: ZSWAP (high RAM system ≥16GB)"
+        elif [ "$RAM_GB" -ge 4 ]; then
+            # Medium RAM: ZSWAP recommended for balanced performance
+            SWAP_RAM_SOLUTION="zswap"
+            log_info "Auto-selected: ZSWAP (medium RAM system)"
+        else
+            # Low RAM: ZRAM for maximum compression and performance
+            SWAP_RAM_SOLUTION="zram"
+            log_info "Auto-selected: ZRAM (low RAM system <4GB, maximizes available memory)"
+        fi
+    else
+        log_info "SWAP_RAM_SOLUTION explicitly set: $SWAP_RAM_SOLUTION"
     fi
     
-    log_step "Applying SWAP_ARCH preset: Architecture $SWAP_ARCH"
-    
-    case $SWAP_ARCH in
-        1)
-            # ZRAM Only (no disk swap)
-            SWAP_RAM_SOLUTION="zram"
+    # Auto-detect SWAP_BACKING_TYPE if not set  
+    if [ -z "$SWAP_BACKING_TYPE" ]; then
+        # Decision tree based on available disk space and storage type
+        if [ "$DISK_GB" -lt 20 ]; then
+            # Very low disk space: no disk swap
             SWAP_BACKING_TYPE="none"
-            log_info "Preset 1: ZRAM only, no disk swap"
-            ;;
-        2)
-            # ZRAM + Disk Swap (two-tier)
-            SWAP_RAM_SOLUTION="zram"
-            [ "$SWAP_BACKING_TYPE" = "files_in_root" ] || SWAP_BACKING_TYPE="files_in_root"
-            log_info "Preset 2: ZRAM + Disk swap files"
-            ;;
-        3)
-            # ZSWAP + Disk Swap (recommended)
-            SWAP_RAM_SOLUTION="zswap"
-            [ "$SWAP_BACKING_TYPE" = "files_in_root" ] || SWAP_BACKING_TYPE="files_in_root"
-            log_info "Preset 3: ZSWAP + Disk swap files (recommended)"
-            ;;
-        4)
-            # Disk Swap Only
-            SWAP_RAM_SOLUTION="none"
-            [ "$SWAP_BACKING_TYPE" = "files_in_root" ] || SWAP_BACKING_TYPE="files_in_root"
-            log_info "Preset 4: Disk swap only, no RAM compression"
-            ;;
-        5)
-            # ZFS zvol Compressed Swap
-            SWAP_RAM_SOLUTION="none"
+            log_info "Auto-selected: No disk swap (low disk space <20GB)"
+        elif [ "$ZFS_AVAILABLE" -eq 1 ]; then
+            # ZFS available: use zvol for compressed swap
             SWAP_BACKING_TYPE="partitions_zvol"
-            log_info "Preset 5: ZFS zvol compressed swap"
-            ;;
-        6)
-            # ZRAM + ZFS zvol
-            SWAP_RAM_SOLUTION="zram"
-            SWAP_BACKING_TYPE="partitions_zvol"
-            log_info "Preset 6: ZRAM + ZFS zvol"
-            ;;
-        7)
-            # ZRAM + Uncompressed Partition
-            SWAP_RAM_SOLUTION="zram"
+            log_info "Auto-selected: ZFS zvol swap (ZFS available)"
+        elif [ "$STORAGE_TYPE" = "ssd" ] && [ "$DISK_GB" -ge 50 ]; then
+            # SSD with sufficient space: use files for flexibility
+            SWAP_BACKING_TYPE="files_in_root"
+            log_info "Auto-selected: Swap files (SSD with adequate space)"
+        elif [ "$STORAGE_TYPE" = "hdd" ] && [ "$DISK_GB" -ge 100 ]; then
+            # HDD with good space: use partitions for better I/O
             SWAP_BACKING_TYPE="partitions_swap"
-            log_info "Preset 7: ZRAM + Native swap partitions"
-            ;;
-        *)
-            log_warn "Unknown SWAP_ARCH: $SWAP_ARCH, ignoring"
-            ;;
-    esac
+            log_info "Auto-selected: Swap partitions (HDD with ample space)"
+        else
+            # Default fallback: files in root (safest, most flexible)
+            SWAP_BACKING_TYPE="files_in_root"
+            log_info "Auto-selected: Swap files in root (default/fallback)"
+        fi
+    else
+        log_info "SWAP_BACKING_TYPE explicitly set: $SWAP_BACKING_TYPE"
+    fi
+    
+    log_info "Final configuration: RAM=$SWAP_RAM_SOLUTION, Backing=$SWAP_BACKING_TYPE"
 }
 
 # Calculate dynamic swap sizes
@@ -386,21 +381,10 @@ print_system_analysis_and_plan() {
     echo "╚═══════════════════════════════════════════════════════╝"
     echo ""
     
-    # Show configuration preset if using SWAP_ARCH
-    if [ -n "$SWAP_ARCH" ]; then
-        echo "Configuration Preset: Architecture $SWAP_ARCH"
-        case $SWAP_ARCH in
-            1) echo "  Preset: ZRAM Only" ;;
-            2) echo "  Preset: ZRAM + Disk Swap (two-tier)" ;;
-            3) echo "  Preset: ZSWAP + Disk Swap (recommended)" ;;
-            4) echo "  Preset: Disk Swap Only" ;;
-            5) echo "  Preset: ZFS zvol Compressed Swap" ;;
-            6) echo "  Preset: ZRAM + ZFS zvol" ;;
-            7) echo "  Preset: ZRAM + Native Swap Partitions" ;;
-        esac
-        echo ""
-    fi
-    
+    echo "Configuration Method: Intelligent Auto-Detection"
+    echo "  RAM Solution:  $SWAP_RAM_SOLUTION"
+    echo "  Backing Type:  $SWAP_BACKING_TYPE"
+    echo ""
     # RAM-based swap configuration
     if [ "$SWAP_RAM_SOLUTION" != "none" ] && [ "$SWAP_RAM_TOTAL_GB" -gt 0 ]; then
         echo "RAM-based Swap Configuration:"
@@ -862,8 +846,24 @@ create_swap_partition() {
     # Handle based on disk layout type
     if [ "$DISK_LAYOUT" = "minimal_root" ]; then
         # Scenario 1: Minimal root with free space
-        # Just append swap partition to the free space
-        log_info "Layout: Minimal root - appending swap to free space"
+        log_info "Layout: Minimal root - managing root extension and swap"
+        
+        # If EXTEND_ROOT is yes, extend root partition first, then add swap at the end
+        if [ "$EXTEND_ROOT" = "yes" ]; then
+            log_info "EXTEND_ROOT=yes: Will extend root partition and place swap at end"
+            
+            # Call the extend_root_partition function which handles both root extension and swap creation
+            if ! extend_root_partition; then
+                log_error "Failed to extend root partition"
+                return 1
+            fi
+            # extend_root_partition already creates the swap partition at the end
+            # So we're done here for this scenario
+            return 0
+        else
+            # EXTEND_ROOT=no: Just append swap partition to the free space
+            log_info "EXTEND_ROOT=no: Appending swap to existing free space (root stays as-is)"
+        fi
         
         # Check if we have enough free space
         FREE_MIB=$((FREE_SECTORS / 2048))
@@ -1329,6 +1329,70 @@ extend_root_partition() {
     
     log_success "Root partition extended successfully"
     
+    # Now create swap partition at the end of the disk
+    log_info "Creating swap partition at end of disk..."
+    
+    # Find next partition number after root
+    LAST_PART_NUM=$(sfdisk -l "/dev/$ROOT_DISK" 2>/dev/null | grep "^/dev/" | grep -oE '[0-9]+' | tail -1)
+    if [ -z "$LAST_PART_NUM" ]; then
+        LAST_PART_NUM=$ROOT_PART_NUM
+    fi
+    SWAP_PART_NUM=$((LAST_PART_NUM + 1))
+    
+    # Handle device naming (nvme uses p prefix, others don't)
+    if [[ "$ROOT_DISK" =~ nvme ]]; then
+        SWAP_PARTITION="/dev/${ROOT_DISK}p${SWAP_PART_NUM}"
+    else
+        SWAP_PARTITION="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
+    fi
+    
+    log_info "Creating swap partition ${SWAP_PART_NUM} as ${SWAP_PARTITION}"
+    
+    # Append swap partition (all remaining space)
+    # Format: ",S" means use remaining space with type=swap
+    if echo ",S" | sfdisk --force --no-reread --append "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
+        log_info "Swap partition created successfully"
+    else
+        log_warn "sfdisk reported errors for swap partition"
+    fi
+    
+    # Inform kernel again
+    if command -v partprobe >/dev/null 2>&1; then
+        partprobe "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
+    else
+        partx --update "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
+    fi
+    
+    # Wait for device to appear
+    sleep 2
+    
+    # Format and enable swap partition
+    log_info "Formatting swap partition..."
+    if mkswap "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
+        log_success "Swap partition formatted"
+    else
+        log_error "Failed to format swap partition"
+        return 1
+    fi
+    
+    log_info "Enabling swap partition..."
+    if swapon -p "$SWAP_PRIORITY" "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
+        log_success "Swap partition enabled"
+    else
+        log_error "Failed to enable swap partition"
+        return 1
+    fi
+    
+    # Add to fstab with PARTUUID for stability
+    PARTUUID=$(blkid -s PARTUUID -o value "$SWAP_PARTITION" 2>/dev/null)
+    if [ -n "$PARTUUID" ]; then
+        echo "PARTUUID=${PARTUUID} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+        log_info "Added swap to /etc/fstab using PARTUUID"
+    else
+        echo "${SWAP_PARTITION} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+        log_info "Added swap to /etc/fstab using device path"
+    fi
+    
     return 0
 }
 
@@ -1404,8 +1468,9 @@ EOF
 print_final_config() {
     log_step "Final Swap Configuration (AFTER changes)"
     echo ""
-    echo "=== Architecture ===" 
-    echo "Selected: Architecture $SWAP_ARCH"
+    echo "=== Configuration ===" 
+    echo "RAM Solution: $SWAP_RAM_SOLUTION"
+    echo "Backing Type: $SWAP_BACKING_TYPE"
     
     echo ""
     echo "=== Kernel Parameters ==="
@@ -1421,7 +1486,7 @@ print_final_config() {
     echo "=== Memory Status ==="
     free -h
     
-    if [ "$SWAP_ARCH" -eq 1 ] || [ "$SWAP_ARCH" -eq 2 ] || [ "$SWAP_ARCH" -eq 6 ]; then
+    if [ "$SWAP_RAM_SOLUTION" = "zram" ]; then
         echo ""
         echo "=== ZRAM Statistics ==="
         if [ -f /sys/block/zram0/mm_stat ]; then
@@ -1429,7 +1494,7 @@ print_final_config() {
         fi
     fi
     
-    if [ "$SWAP_ARCH" -eq 3 ]; then
+    if [ "$SWAP_RAM_SOLUTION" = "zswap" ]; then
         echo ""
         echo "=== ZSWAP Configuration ==="
         if [ -d /sys/module/zswap ]; then
@@ -1442,62 +1507,54 @@ print_final_config() {
     echo ""
 }
 
-# Architecture-specific setup
-setup_architecture() {
-    log_step "Setting up Architecture $SWAP_ARCH"
+# Setup swap based on detected/configured options
+setup_swap_solution() {
+    log_step "Setting up swap solution"
+    log_info "RAM Solution: $SWAP_RAM_SOLUTION, Backing: $SWAP_BACKING_TYPE"
     
-    case $SWAP_ARCH in
-        1)
-            log_info "Architecture 1: ZRAM Only"
+    # Setup RAM-based swap if configured
+    case "$SWAP_RAM_SOLUTION" in
+        zram)
+            log_info "Setting up ZRAM"
             setup_zram
             ;;
-        2)
-            log_info "Architecture 2: ZRAM + Swap Files (Two-Tier)"
-            setup_zram
-            if [[ "$SWAP_BACKING_TYPE" == "partitions_swap" || "$SWAP_BACKING_TYPE" == "partitions_zvol" || "$SWAP_BACKING_TYPE" == "files_in_partitions" ]]; then
-                log_info "  Using partition-based swap"
-                setup_zram_with_partition
-            else
-                create_swap_files
-            fi
-            ;;
-        3)
-            log_info "Architecture 3: ZSWAP + Swap Files (Recommended)"
+        zswap)
+            log_info "Setting up ZSWAP"
             setup_zswap
-            if [[ "$SWAP_BACKING_TYPE" == "partitions_swap" || "$SWAP_BACKING_TYPE" == "partitions_zvol" || "$SWAP_BACKING_TYPE" == "files_in_partitions" ]]; then
-                log_info "  Using partition-based swap"
-                create_swap_partition
-            else
-                create_swap_files
-            fi
             ;;
-        4)
-            log_info "Architecture 4: Swap Files Only"
-            if [[ "$SWAP_BACKING_TYPE" == "partitions_swap" || "$SWAP_BACKING_TYPE" == "partitions_zvol" || "$SWAP_BACKING_TYPE" == "files_in_partitions" ]]; then
-                log_info "  Using partition-based swap"
-                create_swap_partition
-            else
-                create_swap_files
-            fi
-            ;;
-        5)
-            log_info "Architecture 5: ZFS Compressed Swap (zvol)"
-            setup_zfs_zvol
-            ;;
-        6)
-            log_info "Architecture 6: ZRAM + ZFS zvol"
-            setup_zram
-            setup_zfs_zvol
-            ;;
-        7)
-            log_info "Architecture 7: ZRAM + Uncompressed Swap Partition"
-            log_info "  ZRAM with zstd+zsmalloc (high priority)"
-            log_info "  Partition for overflow (low priority)"
-            setup_zram_with_partition
+        none)
+            log_info "No RAM-based swap configured"
             ;;
         *)
-            log_error "Invalid architecture: $SWAP_ARCH (must be 1-7)"
-            exit 1
+            log_error "Invalid SWAP_RAM_SOLUTION: $SWAP_RAM_SOLUTION"
+            return 1
+            ;;
+    esac
+    
+    # Setup disk-based swap if configured
+    case "$SWAP_BACKING_TYPE" in
+        files_in_root)
+            log_info "Setting up swap files in root filesystem"
+            create_swap_files
+            ;;
+        partitions_swap)
+            log_info "Setting up native swap partitions"
+            create_swap_partition
+            ;;
+        partitions_zvol)
+            log_info "Setting up ZFS zvol swap"
+            setup_zfs_zvol
+            ;;
+        files_in_partitions)
+            log_info "Setting up swap files on dedicated partition"
+            create_swap_files_on_partition
+            ;;
+        none)
+            log_info "No disk-based swap configured"
+            ;;
+        *)
+            log_error "Invalid SWAP_BACKING_TYPE: $SWAP_BACKING_TYPE"
+            return 1
             ;;
     esac
 }
@@ -1508,14 +1565,12 @@ main() {
     check_root
     
     log_info "Initial Configuration:"
-    log_info "  RAM Solution: $SWAP_RAM_SOLUTION"
+    log_info "  RAM Solution: ${SWAP_RAM_SOLUTION:-auto-detect}"
     log_info "  RAM Total: ${SWAP_RAM_TOTAL_GB}GB"
     log_info "  Disk Total: ${SWAP_DISK_TOTAL_GB}GB"
-    log_info "  Backing Type: $SWAP_BACKING_TYPE"
+    log_info "  Backing Type: ${SWAP_BACKING_TYPE:-auto-detect}"
     log_info "  Stripe Width: $SWAP_STRIPE_WIDTH"
-    if [ -n "$SWAP_ARCH" ]; then
-        log_info "  Using Preset: Architecture $SWAP_ARCH"
-    fi
+    log_info "  Extend Root: $EXTEND_ROOT"
     echo ""
     
     # Print current state
@@ -1524,8 +1579,8 @@ main() {
     # Detection and calculation
     detect_system
     
-    # Apply SWAP_ARCH preset if specified
-    apply_swap_arch_preset
+    # Auto-detect optimal configuration if not explicitly set
+    auto_detect_swap_configuration
     
     # Calculate sizes based on detected system
     calculate_swap_sizes
@@ -1542,8 +1597,8 @@ main() {
     # Disable existing swap
     disable_existing_swap
     
-    # Setup architecture
-    setup_architecture
+    # Setup swap solution
+    setup_swap_solution
     
     # Configure kernel
     configure_kernel_params

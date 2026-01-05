@@ -88,10 +88,11 @@ class SystemInfo:
         return info
     
     def get_disk_info(self):
-        """Get disk information"""
+        """Get disk information - reports full disk size, not just root partition"""
         info = {}
         
         try:
+            # Get root partition info
             result = subprocess.run(
                 ['df', '-k', '/'],
                 capture_output=True,
@@ -101,12 +102,57 @@ class SystemInfo:
             lines = result.stdout.strip().split('\n')
             if len(lines) > 1:
                 parts = lines[1].split()
-                info['total_kb'] = int(parts[1])
-                info['used_kb'] = int(parts[2])
-                info['available_kb'] = int(parts[3])
-                info['total_gb'] = round(info['total_kb'] / 1024 / 1024, 2)
-                info['available_gb'] = round(info['available_kb'] / 1024 / 1024, 2)
-                info['used_percent'] = int(parts[4].rstrip('%'))
+                root_device = parts[0]  # e.g., /dev/vda3
+                info['root_partition'] = root_device
+                info['root_total_kb'] = int(parts[1])
+                info['root_used_kb'] = int(parts[2])
+                info['root_available_kb'] = int(parts[3])
+                info['root_used_percent'] = int(parts[4].rstrip('%'))
+                
+                # Get the disk name from the partition (e.g., vda3 -> vda)
+                import re
+                disk_match = re.match(r'(/dev/)?([a-z]+)\d*', root_device)
+                if disk_match:
+                    disk_name = disk_match.group(2)
+                    
+                    # Try to get full disk size from lsblk
+                    try:
+                        lsblk_result = subprocess.run(
+                            ['lsblk', '-b', '-d', '-n', '-o', 'NAME,SIZE', f'/dev/{disk_name}'],
+                            capture_output=True,
+                            text=True,
+                            check=True
+                        )
+                        if lsblk_result.stdout.strip():
+                            lsblk_parts = lsblk_result.stdout.strip().split()
+                            if len(lsblk_parts) >= 2:
+                                disk_size_bytes = int(lsblk_parts[1])
+                                info['disk_total_kb'] = disk_size_bytes // 1024
+                                info['disk_total_gb'] = round(disk_size_bytes / (1024**3), 2)
+                                # Calculate used space on the entire disk
+                                info['disk_used_kb'] = info['root_used_kb']
+                                info['disk_available_kb'] = info['disk_total_kb'] - info['disk_used_kb']
+                                info['disk_available_gb'] = round(info['disk_available_kb'] / (1024**2), 2)
+                    except:
+                        # Fallback to root partition info if lsblk fails
+                        pass
+                
+                # If we couldn't get disk info, use root partition as fallback
+                if 'disk_total_gb' not in info:
+                    info['total_kb'] = info['root_total_kb']
+                    info['used_kb'] = info['root_used_kb']
+                    info['available_kb'] = info['root_available_kb']
+                    info['total_gb'] = round(info['total_kb'] / 1024 / 1024, 2)
+                    info['available_gb'] = round(info['available_kb'] / 1024 / 1024, 2)
+                    info['used_percent'] = info['root_used_percent']
+                else:
+                    # Use disk info for reporting
+                    info['total_kb'] = info['disk_total_kb']
+                    info['used_kb'] = info['disk_used_kb']
+                    info['available_kb'] = info['disk_available_kb']
+                    info['total_gb'] = info['disk_total_gb']
+                    info['available_gb'] = info['disk_available_gb']
+                    info['used_percent'] = int((info['used_kb'] / info['total_kb']) * 100) if info['total_kb'] > 0 else 0
         except:
             pass
         
