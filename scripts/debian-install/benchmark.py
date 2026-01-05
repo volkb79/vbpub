@@ -484,12 +484,13 @@ import sys
 
 # Allocate memory (90% of test size to trigger swapping)
 size = {size_mb * 1024 * 1024 * 9 // 10}
-print(f"Allocating {{size // 1024 // 1024}}MB of memory...", file=sys.stderr)
+size_mb_actual = size // 1024 // 1024
+print("Allocating " + str(size_mb_actual) + "MB of memory...", file=sys.stderr)
 
 try:
     data = bytearray(size)
 except MemoryError as e:
-    print(f"Failed to allocate memory: {{e}}", file=sys.stderr)
+    print("Failed to allocate memory: " + str(e), file=sys.stderr)
     sys.exit(1)
 
 # Fill with mixed patterns (more realistic than pure zeros)
