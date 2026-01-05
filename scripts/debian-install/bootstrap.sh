@@ -207,12 +207,13 @@ main() {
         BENCHMARK_OUTPUT="/tmp/benchmark-results-$(date +%Y%m%d-%H%M%S).json"
         
         # Run benchmark with telegram notification if configured
-        BENCHMARK_CMD="./benchmark.py --test-all --duration $BENCHMARK_DURATION --output $BENCHMARK_OUTPUT"
         if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-            BENCHMARK_CMD="$BENCHMARK_CMD --telegram"
+            BENCHMARK_ARGS="--test-all --duration $BENCHMARK_DURATION --output $BENCHMARK_OUTPUT --telegram"
+        else
+            BENCHMARK_ARGS="--test-all --duration $BENCHMARK_DURATION --output $BENCHMARK_OUTPUT"
         fi
         
-        if $BENCHMARK_CMD 2>&1 | tee -a "$LOG_FILE"; then
+        if ./benchmark.py $BENCHMARK_ARGS 2>&1 | tee -a "$LOG_FILE"; then
             log_info "✓ Benchmarks complete"
             # Benchmark results are automatically sent via Telegram if configured
         else

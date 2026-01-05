@@ -296,7 +296,6 @@ def main():
     parser = argparse.ArgumentParser(description='System Information Collector')
     parser.add_argument('--format', choices=['json', 'html', 'text'], default='json',
                        help='Output format (default: json)')
-    parser.add_argument('--html', action='store_true', help='Output as HTML (deprecated, use --format html)')
     parser.add_argument('--output', '-o', metavar='FILE', help='Save to file')
     
     args = parser.parse_args()
@@ -305,7 +304,7 @@ def main():
     info = collector.collect()
     
     # Determine output format
-    if args.html or args.format == 'html':
+    if args.format == 'html':
         output = collector.format_html()
     elif args.format == 'text':
         output = collector.format_text()

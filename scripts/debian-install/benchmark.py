@@ -794,6 +794,7 @@ Examples:
     if args.telegram:
         if not TELEGRAM_AVAILABLE:
             log_error("Cannot send to Telegram: telegram_client module not available")
+            log_error("Ensure telegram_client.py is in the same directory as benchmark.py")
         else:
             try:
                 telegram = TelegramClient()
