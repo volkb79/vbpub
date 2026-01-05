@@ -257,10 +257,11 @@ auto_detect_swap_configuration() {
     # Auto-detect SWAP_BACKING_TYPE if not set or set to "auto"
     if [ -z "$SWAP_BACKING_TYPE" ] || [ "$SWAP_BACKING_TYPE" = "auto" ]; then
         # Decision tree based on available disk space and storage type
-        if [ "$DISK_GB" -lt 20 ]; then
-            # Very low disk space: no disk swap
-            SWAP_BACKING_TYPE="none"
-            log_info "Auto-selected: No disk swap (low disk space <20GB)"
+        # NEVER select "none" - always have disk overflow protection
+        if [ "$DISK_GB" -lt 15 ]; then
+            # Very low disk space: use files in root (most flexible)
+            SWAP_BACKING_TYPE="files_in_root"
+            log_info "Auto-selected: Swap files in root (very low disk space <15GB, but overflow protection required)"
         elif [ "$ZFS_AVAILABLE" -eq 1 ]; then
             # ZFS available: use zvol for compressed swap
             SWAP_BACKING_TYPE="partitions_zvol"
@@ -276,7 +277,7 @@ auto_detect_swap_configuration() {
         else
             # Default fallback: files in root (safest, most flexible)
             SWAP_BACKING_TYPE="files_in_root"
-            log_info "Auto-selected: Swap files in root (default/fallback)"
+            log_info "Auto-selected: Swap files in root (default/fallback with overflow protection)"
         fi
     else
         log_info "SWAP_BACKING_TYPE explicitly set: $SWAP_BACKING_TYPE"
@@ -290,39 +291,69 @@ calculate_swap_sizes() {
     log_step "Calculating optimal swap sizes"
     
     # Calculate SWAP_DISK_TOTAL_GB if auto
+    # ALWAYS ensure disk-based swap for overflow protection
     if [ "$SWAP_DISK_TOTAL_GB" = "auto" ]; then
         if [ "$RAM_GB" -le 2 ]; then
+            # For very low RAM, use 2x RAM for disk swap
             SWAP_DISK_TOTAL_GB=$((RAM_GB * 2))
-            log_info "Low RAM system: Using 2x RAM = ${SWAP_DISK_TOTAL_GB}GB disk swap"
-        elif [ "$RAM_GB" -le 4 ]; then
-            SWAP_DISK_TOTAL_GB=$((RAM_GB * 3 / 2))
-            log_info "Using 1.5x RAM = ${SWAP_DISK_TOTAL_GB}GB disk swap"
-        elif [ "$RAM_GB" -le 8 ]; then
-            SWAP_DISK_TOTAL_GB=$RAM_GB
-            log_info "Using 1x RAM = ${SWAP_DISK_TOTAL_GB}GB disk swap"
-        elif [ "$RAM_GB" -le 16 ]; then
-            SWAP_DISK_TOTAL_GB=$((RAM_GB / 2))
-            log_info "Using 0.5x RAM = ${SWAP_DISK_TOTAL_GB}GB disk swap"
-        else
-            SWAP_DISK_TOTAL_GB=$((RAM_GB / 4))
             [ "$SWAP_DISK_TOTAL_GB" -lt 4 ] && SWAP_DISK_TOTAL_GB=4
-            [ "$SWAP_DISK_TOTAL_GB" -gt 16 ] && SWAP_DISK_TOTAL_GB=16
-            log_info "Using ${SWAP_DISK_TOTAL_GB}GB disk swap (capped)"
+            log_info "Low RAM system: Using ${SWAP_DISK_TOTAL_GB}GB disk swap (min 4GB)"
+        elif [ "$RAM_GB" -le 4 ]; then
+            # 4GB disk swap for 2-4GB RAM
+            SWAP_DISK_TOTAL_GB=4
+            log_info "Using ${SWAP_DISK_TOTAL_GB}GB disk swap"
+        elif [ "$RAM_GB" -le 8 ]; then
+            # 8GB disk swap for 4-8GB RAM
+            SWAP_DISK_TOTAL_GB=8
+            log_info "Using ${SWAP_DISK_TOTAL_GB}GB disk swap"
+        elif [ "$RAM_GB" -le 16 ]; then
+            # 16-32GB disk swap for 8-16GB RAM (scaling)
+            SWAP_DISK_TOTAL_GB=$((RAM_GB * 2))
+            [ "$SWAP_DISK_TOTAL_GB" -gt 32 ] && SWAP_DISK_TOTAL_GB=32
+            log_info "Using ${SWAP_DISK_TOTAL_GB}GB disk swap (scaling to 32GB max)"
+        else
+            # Cap at 32GB for high RAM systems
+            SWAP_DISK_TOTAL_GB=32
+            log_info "High RAM system: Using ${SWAP_DISK_TOTAL_GB}GB disk swap (capped)"
         fi
     fi
     
-    # If SWAP_BACKING_TYPE is none or SWAP_DISK_TOTAL_GB is 0, disable disk swap
+    # Override backing type to ensure disk swap unless explicitly set to none
+    # NEVER auto-select "none" - always have disk overflow
+    if [ "$SWAP_BACKING_TYPE" = "auto" ]; then
+        # Re-evaluate backing type but never choose "none"
+        if [ "$DISK_GB" -lt 20 ]; then
+            log_warn "Low disk space (<20GB) but disk swap is required for overflow protection"
+            log_warn "Using minimal disk swap configuration"
+            SWAP_BACKING_TYPE="files_in_root"
+            # Reduce disk swap size if space is very tight
+            if [ "$DISK_GB" -lt 15 ] && [ "$SWAP_DISK_TOTAL_GB" -gt 4 ]; then
+                SWAP_DISK_TOTAL_GB=4
+                log_warn "Reduced disk swap to ${SWAP_DISK_TOTAL_GB}GB due to space constraints"
+            fi
+        fi
+    fi
+    
+    # Only disable disk swap if EXPLICITLY set to none or 0
+    # This prevents accidental OOM situations
     if [ "$SWAP_BACKING_TYPE" = "none" ] || [ "$SWAP_DISK_TOTAL_GB" = "0" ]; then
+        if [ "$SWAP_BACKING_TYPE" != "none" ]; then
+            SWAP_BACKING_TYPE="none"
+        fi
         SWAP_DISK_TOTAL_GB=0
-        log_info "Disk-based swap disabled"
+        log_warn "⚠️  Disk-based swap DISABLED - system may run out of memory!"
+        log_warn "⚠️  This configuration is NOT recommended for production use"
+    else
+        log_info "✓ Disk-based swap enabled for overflow protection"
     fi
     
     # Check disk constraints
     if [ "$SWAP_DISK_TOTAL_GB" -gt 0 ] && [ "$DISK_GB" -lt 30 ]; then
-        log_warn "Low disk space (<30GB). Consider disabling disk swap or using SWAP_RAM_SOLUTION only"
-        if [ "$SWAP_DISK_TOTAL_GB" -gt 4 ]; then
-            SWAP_DISK_TOTAL_GB=4
-            log_warn "Reducing disk swap to ${SWAP_DISK_TOTAL_GB}GB due to disk constraints"
+        log_warn "Low disk space (<30GB). Disk swap may impact available storage"
+        if [ "$SWAP_DISK_TOTAL_GB" -gt "$((DISK_GB / 4))" ]; then
+            SWAP_DISK_TOTAL_GB=$((DISK_GB / 4))
+            [ "$SWAP_DISK_TOTAL_GB" -lt 2 ] && SWAP_DISK_TOTAL_GB=2
+            log_warn "Adjusted disk swap to ${SWAP_DISK_TOTAL_GB}GB (25% of disk space)"
         fi
     fi
     

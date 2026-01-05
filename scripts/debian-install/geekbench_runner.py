@@ -26,19 +26,51 @@ class GeekbenchRunner:
         self.results = {}
     
     def _get_download_url(self):
-        """Get Geekbench download URL based on system architecture"""
+        """Get Geekbench download URL based on system architecture
+        
+        Dynamically finds the latest minor version by trying common patterns.
+        Downloads from https://www.geekbench.com/download/ or https://cdn.geekbench.com/
+        """
         arch = platform.machine()
         system = platform.system()
         
-        if system == 'Linux':
-            if arch == 'x86_64':
-                return f"https://cdn.geekbench.com/Geekbench-{self.version}-Linux.tar.gz"
-            elif arch == 'aarch64' or arch == 'arm64':
-                return f"https://cdn.geekbench.com/Geekbench-{self.version}-LinuxARMPreview.tar.gz"
-            else:
-                raise ValueError(f"Unsupported architecture: {arch}")
-        else:
+        if system != 'Linux':
             raise ValueError(f"Unsupported system: {system}")
+        
+        if arch == 'x86_64':
+            base_filename = f"Geekbench-{self.version}"
+            suffix = "-Linux.tar.gz"
+        elif arch == 'aarch64' or arch == 'arm64':
+            base_filename = f"Geekbench-{self.version}"
+            suffix = "-LinuxARMPreview.tar.gz"
+        else:
+            raise ValueError(f"Unsupported architecture: {arch}")
+        
+        # Try to find the latest minor version by attempting common version patterns
+        # Try versions from .0 to .10 (should cover most cases)
+        for minor in range(10, -1, -1):
+            for patch in range(10, -1, -1):
+                version_str = f"{self.version}.{minor}.{patch}"
+                url = f"https://cdn.geekbench.com/{base_filename}.{minor}.{patch}{suffix}"
+                
+                # Check if URL is valid with a HEAD request
+                try:
+                    result = subprocess.run(
+                        ['curl', '-sI', '-o', '/dev/null', '-w', '%{http_code}', url],
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
+                    if result.returncode == 0 and result.stdout.strip() == '200':
+                        print(f"Found Geekbench version {version_str}")
+                        return url
+                except:
+                    continue
+        
+        # Fallback to base version without minor/patch
+        fallback_url = f"https://cdn.geekbench.com/{base_filename}{suffix}"
+        print(f"Using fallback URL: {fallback_url}")
+        return fallback_url
     
     def download_and_extract(self):
         """Download and extract Geekbench"""

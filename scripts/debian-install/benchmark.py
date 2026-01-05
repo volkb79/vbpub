@@ -240,15 +240,41 @@ def get_system_info():
     return info
 
 def ensure_zram_loaded():
-    """Ensure ZRAM kernel module is loaded"""
+    """Ensure ZRAM kernel module is loaded and device is clean"""
     try:
+        # Load zram module
         run_command('modprobe zram', check=False)
-        # Reset any existing zram devices
-        if os.path.exists('/dev/zram0'):
-            run_command('swapoff /dev/zram0', check=False)
-            run_command('echo 1 > /sys/block/zram0/reset', check=False)
+        
+        # Wait for device to appear
+        import time
+        for i in range(10):
+            if os.path.exists('/dev/zram0'):
+                break
+            time.sleep(0.1)
+        
+        if not os.path.exists('/dev/zram0'):
+            log_error("ZRAM device /dev/zram0 not found after loading module")
+            return False
+        
+        # Reset any existing zram device completely
+        if os.path.exists('/sys/block/zram0/disksize'):
+            # First, disable swap if active
+            run_command('swapoff /dev/zram0 2>/dev/null || true', check=False)
+            
+            # Try to read current disksize
+            try:
+                with open('/sys/block/zram0/disksize', 'r') as f:
+                    current_size = f.read().strip()
+                    if current_size != '0':
+                        # Device is configured, need to reset
+                        run_command('echo 1 > /sys/block/zram0/reset', check=False)
+                        time.sleep(0.5)
+            except:
+                pass
+        
         return True
-    except:
+    except Exception as e:
+        log_error(f"Failed to ensure ZRAM loaded: {e}")
         return False
 
 def benchmark_block_size_fio(size_kb, test_file='/tmp/fio_test', runtime_sec=5):
@@ -370,8 +396,10 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=100):
     }
     
     try:
-        # Ensure ZRAM is loaded
-        ensure_zram_loaded()
+        # Ensure ZRAM is loaded and clean
+        if not ensure_zram_loaded():
+            results['error'] = "Failed to load/reset ZRAM device"
+            return results
         
         # Check if we can set allocator (may not be available)
         if os.path.exists('/sys/block/zram0/mem_pool'):
@@ -382,11 +410,20 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=100):
         
         # Set compressor
         if os.path.exists('/sys/block/zram0/comp_algorithm'):
-            run_command(f'echo {compressor} > /sys/block/zram0/comp_algorithm', check=False)
+            try:
+                run_command(f'echo {compressor} > /sys/block/zram0/comp_algorithm', check=False)
+            except:
+                log_warn(f"Could not set compressor to {compressor}, using default")
         
-        # Set size
+        # Set size - use bash redirection instead of echo command to avoid shell issues
         size_bytes = size_mb * 1024 * 1024
-        run_command(f'echo {size_bytes} > /sys/block/zram0/disksize')
+        try:
+            with open('/sys/block/zram0/disksize', 'w') as f:
+                f.write(str(size_bytes))
+        except OSError as e:
+            log_error(f"Failed to set ZRAM disk size: {e}")
+            results['error'] = f"Failed to set disksize: {e}"
+            return results
         
         # Make swap
         run_command('mkswap /dev/zram0')

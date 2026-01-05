@@ -91,6 +91,19 @@ class SystemInfo:
         """Get disk information - reports full disk size, not just root partition"""
         info = {}
         
+        # Get lsblk output for comprehensive disk information
+        try:
+            lsblk_full = subprocess.run(
+                ['lsblk', '-o', 'NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE'],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            if lsblk_full.returncode == 0:
+                info['lsblk_output'] = lsblk_full.stdout.strip()
+        except:
+            pass
+        
         try:
             # Get root partition info
             result = subprocess.run(
@@ -233,12 +246,17 @@ class SystemInfo:
             html += f"  Total: {self.info['memory']['total_gb']} GB\n"
             html += f"  Available: {self.info['memory']['available_gb']} GB\n\n"
         
-        # Disk
+        # Disk (including lsblk output)
         if 'disk' in self.info and 'total_gb' in self.info['disk']:
             html += f"<b>💿 Disk</b>\n"
             html += f"  Total: {self.info['disk']['total_gb']} GB\n"
             html += f"  Available: {self.info['disk']['available_gb']} GB\n"
-            html += f"  Used: {self.info['disk'].get('used_percent', 0)}%\n\n"
+            html += f"  Used: {self.info['disk'].get('used_percent', 0)}%\n"
+            
+            # Add lsblk output if available
+            if 'lsblk_output' in self.info['disk']:
+                html += f"\n<pre>{self.info['disk']['lsblk_output']}</pre>\n"
+            html += "\n"
         
         # Swap
         if 'swap' in self.info and 'devices' in self.info['swap']:
