@@ -178,6 +178,11 @@ COMPRESSION_RATIO_MIN = 1.5  # Minimum expected compression ratio
 COMPRESSION_RATIO_MAX = 4.0  # Maximum typical compression ratio
 COMPRESSION_RATIO_SUSPICIOUS = 10.0  # Ratio above this is suspicious
 
+# Memory pressure test constants
+STRESS_NG_TIMEOUT_SEC = 15  # Timeout for stress-ng memory allocation
+STRESS_NG_WAIT_SEC = 20  # Maximum wait time for stress-ng process
+MEMORY_ACCESS_STEP_SIZE = 65536  # 64KB steps for memory access patterns
+
 # FIO test configuration constants
 FIO_TEST_FILE_SIZE = '1G'  # Test file size for fio benchmarks
 
@@ -530,8 +535,8 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
                 # stress-ng with vm-method all creates realistic memory pressure patterns
                 subprocess.run(
                     ['stress-ng', '--vm', '1', '--vm-bytes', f'{alloc_size_mb}M', 
-                     '--vm-method', 'all', '--timeout', '15s', '--metrics-brief'],
-                    timeout=20,
+                     '--vm-method', 'all', '--timeout', f'{STRESS_NG_TIMEOUT_SEC}s', '--metrics-brief'],
+                    timeout=STRESS_NG_WAIT_SEC,
                     check=False  # Don't fail on non-zero exit (stress-ng returns 1 on timeout)
                 )
             except subprocess.TimeoutExpired:
@@ -592,7 +597,7 @@ for i in range(0, len(data), 4096):
 print("Forcing memory to swap (multiple passes)...", file=sys.stderr)
 for pass_num in range({COMPRESSION_MEMORY_PASSES}):
     # Access memory in varied patterns to trigger swapping
-    for i in range(0, len(data), 65536):  # 64KB steps
+    for i in range(0, len(data), {MEMORY_ACCESS_STEP_SIZE}):  # 64KB steps
         data[i] = (data[i] + 1) % 256
     time.sleep(0.3)
 
@@ -1361,8 +1366,10 @@ Examples:
                 # Send charts as attachments
                 if chart_files:
                     log_info(f"Sending {len(chart_files)} performance charts to Telegram...")
+                    # Extract timestamp once to ensure consistency
+                    timestamp_str = datetime.now().strftime('%Y%m%d-%H%M%S')
                     for chart_file in chart_files:
-                        chart_name = os.path.basename(chart_file).replace('benchmark-', '').replace('.png', '').replace('-' + datetime.now().strftime('%Y%m%d-%H%M%S'), '')
+                        chart_name = os.path.basename(chart_file).replace('benchmark-', '').replace('.png', '').replace('-' + timestamp_str, '')
                         caption = f"📊 {chart_name.title()} Chart"
                         if telegram.send_document(chart_file, caption=caption):
                             log_info(f"✓ Sent {chart_name} chart")
