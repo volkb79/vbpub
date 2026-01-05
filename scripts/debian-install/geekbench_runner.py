@@ -19,6 +19,9 @@ from pathlib import Path
 class GeekbenchRunner:
     """Download, install and run Geekbench benchmarks"""
     
+    # Constants
+    URL_CHECK_TIMEOUT = 5  # Seconds to wait for URL validation
+    
     def __init__(self, version=6, work_dir=None):
         self.version = version
         self.work_dir = work_dir or tempfile.mkdtemp(prefix='geekbench_')
@@ -26,19 +29,58 @@ class GeekbenchRunner:
         self.results = {}
     
     def _get_download_url(self):
-        """Get Geekbench download URL based on system architecture"""
+        """Get Geekbench download URL based on system architecture
+        
+        Dynamically finds the latest minor version by trying common patterns.
+        Downloads from https://www.geekbench.com/download/ or https://cdn.geekbench.com/
+        """
         arch = platform.machine()
         system = platform.system()
         
-        if system == 'Linux':
-            if arch == 'x86_64':
-                return f"https://cdn.geekbench.com/Geekbench-{self.version}-Linux.tar.gz"
-            elif arch == 'aarch64' or arch == 'arm64':
-                return f"https://cdn.geekbench.com/Geekbench-{self.version}-LinuxARMPreview.tar.gz"
-            else:
-                raise ValueError(f"Unsupported architecture: {arch}")
-        else:
+        if system != 'Linux':
             raise ValueError(f"Unsupported system: {system}")
+        
+        if arch == 'x86_64':
+            base_filename = f"Geekbench-{self.version}"
+            suffix = "-Linux.tar.gz"
+        elif arch == 'aarch64' or arch == 'arm64':
+            base_filename = f"Geekbench-{self.version}"
+            suffix = "-LinuxARMPreview.tar.gz"
+        else:
+            raise ValueError(f"Unsupported architecture: {arch}")
+        
+        # Try to find the latest version by attempting common version patterns
+        # Check recent versions first (most likely to be current)
+        # Based on problem statement, current version is 6.4.0
+        version_candidates = [
+            (4, 0), (3, 0), (5, 0), (4, 1), (3, 1),  # Recent versions
+            (2, 0), (1, 0), (0, 0)  # Older fallbacks
+        ]
+        
+        for minor, patch in version_candidates:
+            version_str = f"{self.version}.{minor}.{patch}"
+            url = f"https://cdn.geekbench.com/{base_filename}.{minor}.{patch}{suffix}"
+            
+            # Quick check if URL is valid with HEAD request
+            try:
+                result = subprocess.run(
+                    ['curl', '-sI', '--max-time', str(self.URL_CHECK_TIMEOUT), '-o', '/dev/null', '-w', '%{http_code}', url],
+                    capture_output=True,
+                    text=True,
+                    timeout=self.URL_CHECK_TIMEOUT + 1  # Allow 1 extra second for subprocess overhead
+                )
+                if result.returncode == 0 and result.stdout.strip() == '200':
+                    print(f"Found Geekbench version {version_str}")
+                    return url
+            except subprocess.TimeoutExpired:
+                continue
+            except Exception:
+                continue
+        
+        # Fallback to base version without minor/patch (e.g., Geekbench-6-Linux.tar.gz)
+        fallback_url = f"https://cdn.geekbench.com/{base_filename}{suffix}"
+        print(f"Using fallback URL (will be validated during download): {fallback_url}")
+        return fallback_url
     
     def download_and_extract(self):
         """Download and extract Geekbench"""
