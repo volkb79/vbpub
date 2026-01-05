@@ -126,7 +126,9 @@ class GeekbenchRunner:
     def run_benchmark(self):
         """Run Geekbench benchmark"""
         if not self.geekbench_path:
-            print("✗ Geekbench not installed. Run download_and_extract() first.")
+            error_msg = "✗ Geekbench not installed. Run download_and_extract() first."
+            print(error_msg)
+            self.results['error'] = error_msg
             return False
         
         print(f"\nRunning Geekbench {self.version} benchmark...")
@@ -142,7 +144,22 @@ class GeekbenchRunner:
                 timeout=900  # 15 minutes max
             )
             
-            print(result.stdout)
+            # Print stdout for debugging
+            if result.stdout:
+                print(result.stdout)
+            
+            # Check for errors in stderr
+            if result.stderr:
+                print(f"Stderr output: {result.stderr}", file=sys.stderr)
+            
+            # Check return code
+            if result.returncode != 0:
+                error_msg = f"✗ Benchmark exited with code {result.returncode}"
+                print(error_msg)
+                self.results['error'] = error_msg
+                self.results['stderr'] = result.stderr
+                self.results['stdout'] = result.stdout
+                return False
             
             # Find JSON result file
             result_file = None
@@ -160,14 +177,34 @@ class GeekbenchRunner:
                 print(f"✓ Results saved to {result_file}")
                 return True
             else:
-                print("✗ Result file not found")
+                error_msg = "✗ Result file not found after benchmark completed"
+                print(error_msg)
+                # Search for any .gb files for debugging
+                all_gb_files = []
+                for root, dirs, files in os.walk(os.path.dirname(self.geekbench_path)):
+                    for file in files:
+                        if '.gb' in file:
+                            all_gb_files.append(os.path.join(root, file))
+                
+                if all_gb_files:
+                    print(f"Found these .gb files: {all_gb_files}")
+                    error_msg += f". Found: {all_gb_files}"
+                else:
+                    print("No .gb files found in working directory")
+                
+                self.results['error'] = error_msg
+                self.results['stdout'] = result.stdout
                 return False
                 
         except subprocess.TimeoutExpired:
-            print("✗ Benchmark timed out after 15 minutes")
+            error_msg = "✗ Benchmark timed out after 15 minutes"
+            print(error_msg)
+            self.results['error'] = error_msg
             return False
         except Exception as e:
-            print(f"✗ Benchmark failed: {e}")
+            error_msg = f"✗ Benchmark failed: {e}"
+            print(error_msg)
+            self.results['error'] = str(e)
             return False
     
     def upload_results(self):

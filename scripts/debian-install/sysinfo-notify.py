@@ -140,12 +140,36 @@ IMPORTANT: Send a message to your bot first before it can message you!
         try:
             # Download and extract
             if not runner.download_and_extract():
+                error_msg = "❌ <b>Geekbench Download Failed</b>\n\nFailed to download or extract Geekbench."
                 print("✗ Failed to download/extract Geekbench")
+                
+                # Send failure notification via Telegram
+                if args.notify and telegram:
+                    telegram.send_message(error_msg)
+                
                 return 1
             
             # Run benchmark
             if not runner.run_benchmark():
+                # Extract error details from runner.results
+                error_details = runner.results.get('error', 'Unknown error')
+                error_msg = f"❌ <b>Geekbench Benchmark Failed</b>\n\n<b>Error:</b> {error_details}"
+                
+                # Add stdout/stderr if available
+                if runner.results.get('stdout'):
+                    stdout_excerpt = runner.results['stdout'][:500]  # Limit to 500 chars
+                    error_msg += f"\n\n<b>Output excerpt:</b>\n<code>{stdout_excerpt}</code>"
+                
+                if runner.results.get('stderr'):
+                    stderr_excerpt = runner.results['stderr'][:500]
+                    error_msg += f"\n\n<b>Error output:</b>\n<code>{stderr_excerpt}</code>"
+                
                 print("✗ Benchmark failed")
+                
+                # Send failure notification via Telegram
+                if args.notify and telegram:
+                    telegram.send_message(error_msg)
+                
                 return 1
             
             # Get summary

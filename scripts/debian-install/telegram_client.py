@@ -7,6 +7,7 @@ Pure telegram messaging functionality with source attribution
 import os
 import socket
 import subprocess
+import time
 
 try:
     import requests
@@ -54,14 +55,16 @@ class TelegramClient:
         
         return f"{hostname} ({ip})"
     
-    def send_message(self, text, parse_mode='HTML', prefix_source=True):
+    def send_message(self, text, parse_mode='HTML', prefix_source=True, max_retries=3, retry_delay=2):
         """
-        Send text message with automatic source attribution
+        Send text message with automatic source attribution and retry logic
         
         Args:
             text: Message text
             parse_mode: Telegram parse mode (HTML, Markdown, or None)
             prefix_source: Automatically prefix with system ID (default: True)
+            max_retries: Maximum number of retry attempts (default: 3)
+            retry_delay: Initial delay between retries in seconds (default: 2)
         
         Returns:
             bool: True if successful, False otherwise
@@ -79,22 +82,45 @@ class TelegramClient:
             'parse_mode': parse_mode
         }
         
-        try:
-            response = requests.post(url, data=data, timeout=10)
-            response.raise_for_status()
-            return True
-        except requests.exceptions.RequestException as e:
-            print(f"Error sending message: {e}")
-            return False
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(url, data=data, timeout=10)
+                response.raise_for_status()
+                return True
+            except requests.exceptions.ConnectionError as e:
+                last_error = f"Connection error: {e}"
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                    print(f"Connection error, retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+            except requests.exceptions.Timeout as e:
+                last_error = f"Timeout error: {e}"
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    print(f"Timeout, retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+            except requests.exceptions.RequestException as e:
+                last_error = f"Request error: {e}"
+                # Don't retry for other errors (like 4xx client errors)
+                print(f"Error sending message: {e}")
+                return False
+        
+        print(f"Failed to send message after {max_retries} attempts: {last_error}")
+        return False
     
-    def send_document(self, file_path, caption=None, prefix_source=True):
+    def send_document(self, file_path, caption=None, prefix_source=True, max_retries=3, retry_delay=2):
         """
-        Send document file
+        Send document file with retry logic
         
         Args:
             file_path: Path to file to send
             caption: Optional caption
             prefix_source: Automatically prefix caption with system ID (default: True)
+            max_retries: Maximum number of retry attempts (default: 3)
+            retry_delay: Initial delay between retries in seconds (default: 2)
         
         Returns:
             bool: True if successful, False otherwise
@@ -108,20 +134,41 @@ class TelegramClient:
         
         url = f"{self.api_url}/sendDocument"
         
-        try:
-            with open(file_path, 'rb') as f:
-                files = {'document': f}
-                data = {'chat_id': self.chat_id}
-                if caption:
-                    data['caption'] = caption
-                    data['parse_mode'] = 'HTML'
-                
-                response = requests.post(url, data=data, files=files, timeout=30)
-                response.raise_for_status()
-                return True
-        except Exception as e:
-            print(f"Error sending document: {e}")
-            return False
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                with open(file_path, 'rb') as f:
+                    files = {'document': f}
+                    data = {'chat_id': self.chat_id}
+                    if caption:
+                        data['caption'] = caption
+                        data['parse_mode'] = 'HTML'
+                    
+                    response = requests.post(url, data=data, files=files, timeout=30)
+                    response.raise_for_status()
+                    return True
+            except requests.exceptions.ConnectionError as e:
+                last_error = f"Connection error: {e}"
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                    print(f"Connection error, retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+            except requests.exceptions.Timeout as e:
+                last_error = f"Timeout error: {e}"
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    print(f"Timeout, retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+            except Exception as e:
+                last_error = f"Error: {e}"
+                # Don't retry for other errors
+                print(f"Error sending document: {e}")
+                return False
+        
+        print(f"Failed to send document after {max_retries} attempts: {last_error}")
+        return False
     
     def test_connection(self):
         """Test bot connection"""

@@ -58,9 +58,66 @@ TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 # Colors
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
-log_info() { echo -e "${GREEN}[INFO]${NC} $*" | tee -a "$LOG_FILE"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $*" | tee -a "$LOG_FILE"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $*" | tee -a "$LOG_FILE" >&2; }
+log_info() { echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE" >&2; }
+log_debug() { 
+    if [ "$DEBUG_MODE" = "yes" ]; then
+        echo "[DEBUG] $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"
+    fi
+}
+
+# Helper function to run commands with comprehensive logging
+run_logged() {
+    local cmd="$1"
+    local description="${2:-Running command}"
+    
+    log_debug "==> $description"
+    log_debug "Command: $cmd"
+    
+    local output
+    local exit_code
+    
+    if output=$($cmd 2>&1); then
+        exit_code=$?
+    else
+        exit_code=$?
+    fi
+    
+    if [ "$DEBUG_MODE" = "yes" ]; then
+        echo "$output" | tee -a "$LOG_FILE"
+    else
+        echo "$output" >> "$LOG_FILE"
+    fi
+    
+    log_debug "Exit code: $exit_code"
+    
+    return $exit_code
+}
+
+# Test Telegram connectivity
+test_telegram() {
+    log_info "Testing Telegram connectivity..."
+    
+    if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+        log_warn "Telegram not configured (TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set)"
+        return 1
+    fi
+    
+    if [ ! -f "${SCRIPT_DIR}/telegram_client.py" ]; then
+        log_error "telegram_client.py not found at ${SCRIPT_DIR}/telegram_client.py"
+        return 1
+    fi
+    
+    log_info "Testing bot connection..."
+    if python3 "${SCRIPT_DIR}/telegram_client.py" --test 2>&1 | tee -a "$LOG_FILE"; then
+        log_info "✓ Telegram test successful!"
+        return 0
+    else
+        log_error "✗ Telegram test failed"
+        return 1
+    fi
+}
 
 # Helper function to send telegram messages using telegram_client.py
 tg_send() {
@@ -173,6 +230,11 @@ main() {
     # Make scripts executable
     chmod +x "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/*.py 2>/dev/null || true
     cd "$SCRIPT_DIR"
+    
+    # Test Telegram connectivity if configured
+    if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+        test_telegram || log_warn "Telegram test failed, but continuing with bootstrap"
+    fi
     
     # Configure APT repositories BEFORE installing packages
     if [ "$RUN_APT_CONFIG" = "yes" ]; then

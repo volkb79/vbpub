@@ -849,6 +849,16 @@ Examples:
     if args.compare_memory_only:
         results['memory_only_comparison'] = compare_memory_only()
     
+    # Always persist results locally for debugging
+    local_results_file = f"/var/log/debian-install/benchmark-results-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    try:
+        os.makedirs(os.path.dirname(local_results_file), exist_ok=True)
+        with open(local_results_file, 'w') as f:
+            json.dump(results, f, indent=2)
+        log_info(f"Results persisted to {local_results_file}")
+    except Exception as e:
+        log_warn(f"Failed to persist results locally: {e}")
+    
     # Output results
     if args.output:
         with open(args.output, 'w') as f:
@@ -876,6 +886,7 @@ Examples:
                     log_info("✓ Benchmark results sent to Telegram successfully!")
                 else:
                     log_error("✗ Failed to send benchmark results to Telegram")
+                    log_error(f"Results are available in {local_results_file}")
             except ValueError as e:
                 log_error(f"Telegram configuration error: {e}")
             except Exception as e:

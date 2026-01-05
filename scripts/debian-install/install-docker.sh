@@ -178,7 +178,45 @@ enable_docker_service() {
     log_step "Enabling and starting Docker service"
     
     systemctl enable docker
-    systemctl restart docker
+    
+    # Try to start Docker service and capture diagnostics on failure
+    if ! systemctl restart docker; then
+        log_error "Docker service failed to start"
+        
+        # Capture diagnostics
+        local diag_file="/tmp/docker-failure-diagnostics-$(date +%Y%m%d-%H%M%S).txt"
+        {
+            echo "=== Docker Installation Failure Diagnostics ==="
+            echo "Date: $(date)"
+            echo ""
+            echo "=== systemctl status docker ==="
+            systemctl status docker --no-pager || true
+            echo ""
+            echo "=== journalctl -u docker (last 50 lines) ==="
+            journalctl -u docker -n 50 --no-pager || true
+            echo ""
+            echo "=== Docker version ==="
+            docker --version 2>&1 || true
+            echo ""
+            echo "=== Docker info ==="
+            docker info 2>&1 || true
+        } > "$diag_file"
+        
+        log_error "Diagnostics saved to: $diag_file"
+        cat "$diag_file"
+        
+        # Send diagnostics via Telegram if configured
+        if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+            log_info "Sending diagnostics to Telegram..."
+            local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+            if [ -f "$script_dir/telegram_client.py" ]; then
+                python3 "$script_dir/telegram_client.py" --send "❌ Docker installation failed. See attached diagnostics." 2>/dev/null || true
+                python3 "$script_dir/telegram_client.py" --file "$diag_file" --caption "Docker Failure Diagnostics" 2>/dev/null || true
+            fi
+        fi
+        
+        return 1
+    fi
     
     log_success "Docker service enabled and started"
 }
@@ -257,7 +295,13 @@ main() {
     add_docker_repository
     install_docker
     configure_docker_daemon
-    enable_docker_service
+    
+    # Try to enable and start Docker service
+    if ! enable_docker_service; then
+        log_error "Docker service failed to start - see diagnostics above"
+        return 1
+    fi
+    
     verify_docker
     show_post_install
     
