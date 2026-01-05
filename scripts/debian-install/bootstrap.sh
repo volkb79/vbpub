@@ -12,6 +12,8 @@ DEBUG_MODE="${DEBUG_MODE:-no}"
 if [ "$DEBUG_MODE" = "yes" ]; then
     set -x
 fi
+# Force Python unbuffered output for benchmark
+export PYTHONUNBUFFERED=1
 
 # Configuration
 REPO_URL="${REPO_URL:-https://github.com/volkb79/vbpub.git}"
