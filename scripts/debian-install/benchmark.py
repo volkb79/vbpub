@@ -149,6 +149,16 @@ except ImportError:
     TELEGRAM_AVAILABLE = False
     TelegramClient = None
 
+# Optional matplotlib import (for chart generation)
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # Non-interactive backend
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    plt = None
+
 # Colors for output
 class Colors:
     GREEN = '\033[0;32m'
@@ -483,46 +493,115 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         run_command('mkswap /dev/zram0')
         run_command('swapon -p 100 /dev/zram0')
         
-        # Create memory pressure with mixed data patterns
+        # Create memory pressure to force actual swapping to ZRAM
+        # The key is to allocate MORE than available RAM to force the kernel to swap
         start = time.time()
         
-        # Test with different data patterns - use configured percentage to ensure memory swapping
-        test_script = f"""
+        # Get available memory
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                meminfo = f.read()
+            mem_available_kb = 0
+            for line in meminfo.split('\n'):
+                if line.startswith('MemAvailable:'):
+                    mem_available_kb = int(line.split()[1])
+                    break
+            
+            # Allocate significantly more than available memory to force swapping
+            # This ensures the kernel MUST use ZRAM swap
+            alloc_size_mb = max(size_mb, (mem_available_kb // 1024) + size_mb)
+            log_debug(f"Available memory: {mem_available_kb // 1024}MB, allocating: {alloc_size_mb}MB to force swapping")
+        except:
+            # Fallback to original approach if we can't read meminfo
+            alloc_size_mb = size_mb * COMPRESSION_MEMORY_PERCENT // 100
+        
+        # Test with different data patterns - use stress-ng if available, otherwise Python allocation
+        # stress-ng is more reliable at forcing kernel swapping
+        use_stress_ng = False
+        try:
+            result = subprocess.run(['which', 'stress-ng'], capture_output=True, timeout=2)
+            use_stress_ng = (result.returncode == 0)
+        except:
+            pass
+        
+        if use_stress_ng:
+            log_info(f"Using stress-ng to force {alloc_size_mb}MB memory allocation to ZRAM...")
+            try:
+                # stress-ng with vm-method all creates realistic memory pressure patterns
+                subprocess.run(
+                    ['stress-ng', '--vm', '1', '--vm-bytes', f'{alloc_size_mb}M', 
+                     '--vm-method', 'all', '--timeout', '15s', '--metrics-brief'],
+                    timeout=20,
+                    check=False  # Don't fail on non-zero exit (stress-ng returns 1 on timeout)
+                )
+            except subprocess.TimeoutExpired:
+                log_warn("stress-ng timed out (expected behavior)")
+            except Exception as e:
+                log_warn(f"stress-ng failed: {e}, falling back to Python allocation")
+                use_stress_ng = False
+        
+        if not use_stress_ng:
+            # Fallback: Python-based memory allocation with improved patterns
+            test_script = f"""
 python3 << 'PYEOF'
 import time
 import random
 import sys
+import os
 
-# Allocate memory (90% of test size to trigger swapping)
-size = {size_mb * 1024 * 1024 * COMPRESSION_MEMORY_PERCENT // 100}
+# Allocate MORE than available memory to force swapping
+size = {alloc_size_mb * 1024 * 1024}
 size_mb_actual = size // 1024 // 1024
-print("Allocating " + str(size_mb_actual) + "MB of memory...", file=sys.stderr)
+print("Allocating " + str(size_mb_actual) + "MB of memory to force swapping...", file=sys.stderr)
 
 try:
     data = bytearray(size)
 except MemoryError as e:
     print("Failed to allocate memory: " + str(e), file=sys.stderr)
-    sys.exit(1)
+    # Try with smaller allocation if initial fails
+    size = size // 2
+    size_mb_actual = size // 1024 // 1024
+    print("Retrying with " + str(size_mb_actual) + "MB...", file=sys.stderr)
+    try:
+        data = bytearray(size)
+    except MemoryError as e2:
+        print("Failed again: " + str(e2), file=sys.stderr)
+        sys.exit(1)
 
-# Fill with mixed patterns (more realistic than pure zeros)
-print("Filling memory with mixed patterns...", file=sys.stderr)
+# Fill with less compressible patterns (random data compresses poorly)
+print("Filling memory with varied patterns (less compressible)...", file=sys.stderr)
+random.seed(42)  # Reproducible but varied
 for i in range(0, len(data), 4096):
-    pattern = random.choice([0, 255, i % 256, random.randint(0, 255)])
-    data[i:min(i+4096, len(data))] = bytes([pattern] * min(4096, len(data)-i))
+    # Mix of patterns: some compressible, some not
+    pattern_type = i % 4
+    if pattern_type == 0:
+        # Random bytes (low compression)
+        chunk = bytes([random.randint(0, 255) for _ in range(min(4096, len(data)-i))])
+    elif pattern_type == 1:
+        # Repeated pattern (medium compression)
+        chunk = bytes([i % 256] * min(4096, len(data)-i))
+    elif pattern_type == 2:
+        # Zero bytes (high compression)
+        chunk = bytes(min(4096, len(data)-i))
+    else:
+        # Mixed (medium compression)
+        chunk = bytes([(i + j) % 256 for j in range(min(4096, len(data)-i))])
+    data[i:i+len(chunk)] = chunk
 
-# Touch all memory multiple times to ensure it's allocated and swapped
+# Touch all memory multiple times to ensure it's swapped
 print("Forcing memory to swap (multiple passes)...", file=sys.stderr)
 for pass_num in range({COMPRESSION_MEMORY_PASSES}):
-    for i in range(0, len(data), 4096):
+    # Access memory in varied patterns to trigger swapping
+    for i in range(0, len(data), 65536):  # 64KB steps
         data[i] = (data[i] + 1) % 256
-    time.sleep(0.5)
+    time.sleep(0.3)
 
 print("Memory pressure test complete", file=sys.stderr)
 time.sleep(2)
 PYEOF
 """
-        
-        run_command(test_script, check=False)
+            
+            run_command(test_script, check=False)
         
         duration = time.time() - start
         
@@ -572,12 +651,20 @@ PYEOF
                 results['compression_ratio'] = round(ratio, 2)
                 
                 # Efficiency: (orig - mem_used) / orig as percentage
-                # Negative values indicate allocator overhead
-                efficiency = ((orig_size - mem_used) / orig_size) * 100 if orig_size > 0 else 0
-                results['efficiency_pct'] = round(efficiency, 2)
-                
+                # Negative values indicate allocator overhead exceeds space savings
+                # This can happen with small data sizes or high-overhead allocators
+                if orig_size > 0:
+                    efficiency = ((orig_size - mem_used) / orig_size) * 100
+                    results['efficiency_pct'] = round(efficiency, 2)
+                    
+                    if efficiency < -50:
+                        log_warn(f"High allocator overhead: {abs(efficiency):.1f}% overhead (mem_used > orig_size)")
+                        log_warn("This can occur with small test sizes or inefficient allocators")
+                else:
+                    results['efficiency_pct'] = 0
+                    
                 log_info(f"  Compression ratio: {ratio:.2f}x")
-                log_info(f"  Space efficiency: {efficiency:.1f}%")
+                log_info(f"  Space efficiency: {results['efficiency_pct']:.1f}%")
                 log_info(f"  Memory saved: {results['orig_size_mb'] - results['mem_used_mb']:.2f} MB")
         
         results['duration_sec'] = round(duration, 2)
@@ -677,12 +764,25 @@ stonewall
         else:
             raise subprocess.CalledProcessError(result.returncode, 'fio', result.stderr)
     
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
         log_error(f"Concurrency test with {num_files} files timed out after 10 minutes")
-        results['error'] = 'Timeout'
+        log_error(f"Timeout details: cmd={e.cmd}, timeout={e.timeout}s")
+        log_warn("Consider increasing timeout or reducing file count for slower systems")
+        results['error'] = 'Timeout after 600s'
+        results['write_mb_per_sec'] = 0
+        results['read_mb_per_sec'] = 0
+    except subprocess.CalledProcessError as e:
+        log_error(f"Concurrency test failed with return code {e.returncode}")
+        log_debug(f"Command: {e.cmd}")
+        log_debug(f"Stderr: {e.stderr}")
+        results['error'] = f'Exit code {e.returncode}'
+        results['write_mb_per_sec'] = 0
+        results['read_mb_per_sec'] = 0
     except Exception as e:
         log_error(f"Concurrency test failed: {e}")
         results['error'] = str(e)
+        results['write_mb_per_sec'] = 0
+        results['read_mb_per_sec'] = 0
     finally:
         # Cleanup
         import shutil
@@ -772,6 +872,177 @@ def export_shell_config(results, output_file):
     
     log_info(f"Configuration saved to {output_file}")
 
+def generate_charts(results, output_dir='/var/log/debian-install'):
+    """
+    Generate matplotlib charts for benchmark results
+    
+    Creates PNG charts for:
+    1. Block size vs Throughput (read/write, sequential/random)
+    2. Block size vs Latency
+    3. Concurrency vs Throughput scaling
+    4. Compression ratio comparison
+    
+    Args:
+        results: Benchmark results dictionary
+        output_dir: Directory to save PNG files
+    
+    Returns:
+        List of generated chart file paths
+    """
+    if not MATPLOTLIB_AVAILABLE:
+        log_warn("matplotlib not available - skipping chart generation")
+        log_info("Install with: apt install python3-matplotlib")
+        return []
+    
+    os.makedirs(output_dir, exist_ok=True)
+    chart_files = []
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    
+    try:
+        # Chart 1: Block Size vs Throughput
+        if 'block_sizes' in results and results['block_sizes']:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            
+            block_sizes = [b['block_size_kb'] for b in results['block_sizes']]
+            seq_write = [b.get('write_mb_per_sec', 0) for b in results['block_sizes']]
+            seq_read = [b.get('read_mb_per_sec', 0) for b in results['block_sizes']]
+            
+            ax.plot(block_sizes, seq_write, 'o-', label='Sequential Write', linewidth=2, markersize=8)
+            ax.plot(block_sizes, seq_read, 's-', label='Sequential Read', linewidth=2, markersize=8)
+            
+            # Add random I/O if available
+            has_random = any(b.get('rand_write_mb_per_sec', 0) > 0 for b in results['block_sizes'])
+            if has_random:
+                rand_write = [b.get('rand_write_mb_per_sec', 0) for b in results['block_sizes']]
+                rand_read = [b.get('rand_read_mb_per_sec', 0) for b in results['block_sizes']]
+                ax.plot(block_sizes, rand_write, '^--', label='Random Write', linewidth=2, markersize=8, alpha=0.7)
+                ax.plot(block_sizes, rand_read, 'v--', label='Random Read', linewidth=2, markersize=8, alpha=0.7)
+            
+            ax.set_xlabel('Block Size (KB)', fontsize=12)
+            ax.set_ylabel('Throughput (MB/s)', fontsize=12)
+            ax.set_title('Block Size vs Throughput', fontsize=14, fontweight='bold')
+            ax.legend(fontsize=10)
+            ax.grid(True, alpha=0.3)
+            ax.set_xscale('log', base=2)
+            
+            chart_file = f"{output_dir}/benchmark-throughput-{timestamp}.png"
+            plt.tight_layout()
+            plt.savefig(chart_file, dpi=150)
+            plt.close()
+            chart_files.append(chart_file)
+            log_info(f"Generated throughput chart: {chart_file}")
+        
+        # Chart 2: Block Size vs Latency
+        if 'block_sizes' in results and results['block_sizes']:
+            has_latency = any(b.get('write_latency_ms', 0) > 0 or b.get('read_latency_ms', 0) > 0 for b in results['block_sizes'])
+            if has_latency:
+                fig, ax = plt.subplots(figsize=(10, 6))
+                
+                block_sizes = [b['block_size_kb'] for b in results['block_sizes']]
+                write_lat = [b.get('write_latency_ms', 0) for b in results['block_sizes']]
+                read_lat = [b.get('read_latency_ms', 0) for b in results['block_sizes']]
+                
+                ax.plot(block_sizes, write_lat, 'o-', label='Write Latency', linewidth=2, markersize=8)
+                ax.plot(block_sizes, read_lat, 's-', label='Read Latency', linewidth=2, markersize=8)
+                
+                ax.set_xlabel('Block Size (KB)', fontsize=12)
+                ax.set_ylabel('Latency (ms)', fontsize=12)
+                ax.set_title('Block Size vs Latency', fontsize=14, fontweight='bold')
+                ax.legend(fontsize=10)
+                ax.grid(True, alpha=0.3)
+                ax.set_xscale('log', base=2)
+                
+                chart_file = f"{output_dir}/benchmark-latency-{timestamp}.png"
+                plt.tight_layout()
+                plt.savefig(chart_file, dpi=150)
+                plt.close()
+                chart_files.append(chart_file)
+                log_info(f"Generated latency chart: {chart_file}")
+        
+        # Chart 3: Concurrency vs Throughput Scaling
+        if 'concurrency' in results and results['concurrency']:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            
+            # Filter out error results
+            valid_concur = [c for c in results['concurrency'] if 'error' not in c]
+            if valid_concur:
+                num_files = [c['num_files'] for c in valid_concur]
+                write_throughput = [c.get('write_mb_per_sec', 0) for c in valid_concur]
+                read_throughput = [c.get('read_mb_per_sec', 0) for c in valid_concur]
+                total_throughput = [w + r for w, r in zip(write_throughput, read_throughput)]
+                
+                ax.plot(num_files, write_throughput, 'o-', label='Write', linewidth=2, markersize=8)
+                ax.plot(num_files, read_throughput, 's-', label='Read', linewidth=2, markersize=8)
+                ax.plot(num_files, total_throughput, '^-', label='Total', linewidth=2, markersize=8)
+                
+                # Add ideal linear scaling reference
+                if num_files and total_throughput:
+                    ideal_scaling = [total_throughput[0] * (n / num_files[0]) for n in num_files]
+                    ax.plot(num_files, ideal_scaling, '--', color='gray', label='Ideal Linear', alpha=0.5)
+                
+                ax.set_xlabel('Number of Concurrent Files', fontsize=12)
+                ax.set_ylabel('Throughput (MB/s)', fontsize=12)
+                ax.set_title('Concurrency Scaling', fontsize=14, fontweight='bold')
+                ax.legend(fontsize=10)
+                ax.grid(True, alpha=0.3)
+                
+                chart_file = f"{output_dir}/benchmark-concurrency-{timestamp}.png"
+                plt.tight_layout()
+                plt.savefig(chart_file, dpi=150)
+                plt.close()
+                chart_files.append(chart_file)
+                log_info(f"Generated concurrency chart: {chart_file}")
+        
+        # Chart 4: Compression Ratio Comparison
+        if 'compressors' in results and results['compressors']:
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+            
+            # Filter out error results
+            valid_comp = [c for c in results['compressors'] if 'error' not in c and c.get('compression_ratio', 0) > 0]
+            if valid_comp:
+                compressors = [c['compressor'] for c in valid_comp]
+                ratios = [c.get('compression_ratio', 0) for c in valid_comp]
+                efficiency = [c.get('efficiency_pct', 0) for c in valid_comp]
+                
+                # Bar chart for compression ratios
+                bars = ax1.bar(compressors, ratios, color=['#3498db', '#e74c3c', '#2ecc71'][:len(compressors)])
+                ax1.set_ylabel('Compression Ratio (x)', fontsize=12)
+                ax1.set_title('Compression Ratio Comparison', fontsize=12, fontweight='bold')
+                ax1.grid(True, alpha=0.3, axis='y')
+                
+                # Add value labels on bars
+                for bar in bars:
+                    height = bar.get_height()
+                    ax1.text(bar.get_x() + bar.get_width()/2., height,
+                            f'{height:.1f}x', ha='center', va='bottom', fontsize=10)
+                
+                # Bar chart for efficiency
+                bars2 = ax2.bar(compressors, efficiency, color=['#3498db', '#e74c3c', '#2ecc71'][:len(compressors)])
+                ax2.set_ylabel('Space Efficiency (%)', fontsize=12)
+                ax2.set_title('Space Efficiency Comparison', fontsize=12, fontweight='bold')
+                ax2.grid(True, alpha=0.3, axis='y')
+                ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+                
+                # Add value labels on bars
+                for bar in bars2:
+                    height = bar.get_height()
+                    ax2.text(bar.get_x() + bar.get_width()/2., height,
+                            f'{height:.0f}%', ha='center', va='bottom' if height > 0 else 'top', fontsize=10)
+                
+                chart_file = f"{output_dir}/benchmark-compression-{timestamp}.png"
+                plt.tight_layout()
+                plt.savefig(chart_file, dpi=150)
+                plt.close()
+                chart_files.append(chart_file)
+                log_info(f"Generated compression chart: {chart_file}")
+        
+    except Exception as e:
+        log_error(f"Failed to generate charts: {e}")
+        import traceback
+        log_debug(traceback.format_exc())
+    
+    return chart_files
+
 def format_benchmark_html(results):
     """Format benchmark results as HTML for Telegram with visual indicators"""
     html = "<b>📊 Swap Benchmark Results</b>\n\n"
@@ -784,31 +1055,61 @@ def format_benchmark_html(results):
     # Block size tests with visual bar chart
     if 'block_sizes' in results and results['block_sizes']:
         html += "<b>📦 Block Size Performance:</b>\n"
-        html += "<i>(Sequential I/O, single-threaded)</i>\n"
         
         # DEBUG: Log what we're working with
         log_debug(f"Block sizes data: {results['block_sizes']}")
         
-        max_total = max((b.get('write_mb_per_sec', 0) + b.get('read_mb_per_sec', 0)) for b in results['block_sizes'])
+        # Check if we have random I/O data
+        has_random = any(b.get('rand_write_mb_per_sec', 0) > 0 or b.get('rand_read_mb_per_sec', 0) > 0 for b in results['block_sizes'])
         
-        # VALIDATION: Check if max_total is actually 0
-        if max_total == 0:
-            log_warn("All block size results show 0 MB/s - check data structure and test execution")
-            log_warn(f"Sample block data: {results['block_sizes'][0] if results['block_sizes'] else 'No data'}")
-        
-        for block in results['block_sizes']:
-            size_kb = block.get('block_size_kb', 'N/A')
-            write_mb = block.get('write_mb_per_sec', 0)
-            read_mb = block.get('read_mb_per_sec', 0)
+        if has_random:
+            # Show both sequential and random side-by-side
+            html += "<i>Sequential I/O:</i>\n"
+            max_total = max((b.get('write_mb_per_sec', 0) + b.get('read_mb_per_sec', 0)) for b in results['block_sizes'])
             
-            # DEBUG: Log individual block results
-            if write_mb == 0 and read_mb == 0:
-                log_debug(f"Block {size_kb}KB: No throughput data. Keys present: {list(block.keys())}")
+            for block in results['block_sizes']:
+                size_kb = block.get('block_size_kb', 'N/A')
+                write_mb = block.get('write_mb_per_sec', 0)
+                read_mb = block.get('read_mb_per_sec', 0)
+                total = write_mb + read_mb
+                bar_length = int((total / max_total) * 10) if max_total > 0 else 0
+                bar = '█' * bar_length + '░' * (10 - bar_length)
+                html += f"  {size_kb:3d}KB: {bar} ↑{write_mb:6.1f} ↓{read_mb:6.1f} MB/s\n"
             
-            total = write_mb + read_mb
-            bar_length = int((total / max_total) * 10) if max_total > 0 else 0
-            bar = '█' * bar_length + '░' * (10 - bar_length)
-            html += f"  {size_kb:3d}KB: {bar} ↑{write_mb:6.1f} ↓{read_mb:6.1f} MB/s\n"
+            html += "\n<i>Random I/O:</i>\n"
+            max_total_rand = max((b.get('rand_write_mb_per_sec', 0) + b.get('rand_read_mb_per_sec', 0)) for b in results['block_sizes'])
+            
+            for block in results['block_sizes']:
+                size_kb = block.get('block_size_kb', 'N/A')
+                rand_write_mb = block.get('rand_write_mb_per_sec', 0)
+                rand_read_mb = block.get('rand_read_mb_per_sec', 0)
+                total_rand = rand_write_mb + rand_read_mb
+                bar_length = int((total_rand / max_total_rand) * 10) if max_total_rand > 0 else 0
+                bar = '█' * bar_length + '░' * (10 - bar_length)
+                html += f"  {size_kb:3d}KB: {bar} ↑{rand_write_mb:6.1f} ↓{rand_read_mb:6.1f} MB/s\n"
+        else:
+            # Only sequential data available
+            html += "<i>(Sequential I/O, single-threaded)</i>\n"
+            max_total = max((b.get('write_mb_per_sec', 0) + b.get('read_mb_per_sec', 0)) for b in results['block_sizes'])
+            
+            # VALIDATION: Check if max_total is actually 0
+            if max_total == 0:
+                log_warn("All block size results show 0 MB/s - check data structure and test execution")
+                log_warn(f"Sample block data: {results['block_sizes'][0] if results['block_sizes'] else 'No data'}")
+            
+            for block in results['block_sizes']:
+                size_kb = block.get('block_size_kb', 'N/A')
+                write_mb = block.get('write_mb_per_sec', 0)
+                read_mb = block.get('read_mb_per_sec', 0)
+                
+                # DEBUG: Log individual block results
+                if write_mb == 0 and read_mb == 0:
+                    log_debug(f"Block {size_kb}KB: No throughput data. Keys present: {list(block.keys())}")
+                
+                total = write_mb + read_mb
+                bar_length = int((total / max_total) * 10) if max_total > 0 else 0
+                bar = '█' * bar_length + '░' * (10 - bar_length)
+                html += f"  {size_kb:3d}KB: {bar} ↑{write_mb:6.1f} ↓{read_mb:6.1f} MB/s\n"
         html += "\n"
     
     # Compressor comparison with visual indicators
@@ -989,7 +1290,14 @@ Examples:
                 result = test_concurrency(count)
                 results['concurrency'].append(result)
             except Exception as e:
-                log_error(f"Concurrency test with {count} files failed: {e}")
+                log_error(f"Concurrency test with {count} files failed unexpectedly: {e}")
+                # Append error result so it shows in output
+                results['concurrency'].append({
+                    'num_files': count,
+                    'error': str(e),
+                    'write_mb_per_sec': 0,
+                    'read_mb_per_sec': 0
+                })
     
     if args.compare_memory_only:
         results['memory_only_comparison'] = compare_memory_only()
@@ -1001,6 +1309,18 @@ Examples:
         with open(local_results_file, 'w') as f:
             json.dump(results, f, indent=2)
         log_info(f"Results persisted to {local_results_file}")
+        
+        # Send results JSON as telegram attachment for debugging
+        if args.telegram and TELEGRAM_AVAILABLE:
+            try:
+                telegram = TelegramClient()
+                log_info("Sending benchmark JSON to Telegram...")
+                if telegram.send_document(local_results_file, caption="📊 Benchmark Results (JSON)"):
+                    log_info("✓ Benchmark JSON sent to Telegram")
+                else:
+                    log_warn("Failed to send benchmark JSON to Telegram")
+            except Exception as e:
+                log_warn(f"Failed to send benchmark JSON to Telegram: {e}")
     except Exception as e:
         log_warn(f"Failed to persist results locally: {e}")
     
@@ -1024,14 +1344,30 @@ Examples:
         else:
             try:
                 telegram = TelegramClient()
-                html_message = format_benchmark_html(results)
                 
+                # Generate charts
+                log_info("Generating performance charts...")
+                chart_files = generate_charts(results)
+                
+                # Send HTML summary
+                html_message = format_benchmark_html(results)
                 log_info("Sending benchmark results to Telegram...")
                 if telegram.send_message(html_message):
                     log_info("✓ Benchmark results sent to Telegram successfully!")
                 else:
                     log_error("✗ Failed to send benchmark results to Telegram")
                     log_error(f"Results are available in {local_results_file}")
+                
+                # Send charts as attachments
+                if chart_files:
+                    log_info(f"Sending {len(chart_files)} performance charts to Telegram...")
+                    for chart_file in chart_files:
+                        chart_name = os.path.basename(chart_file).replace('benchmark-', '').replace('.png', '').replace('-' + datetime.now().strftime('%Y%m%d-%H%M%S'), '')
+                        caption = f"📊 {chart_name.title()} Chart"
+                        if telegram.send_document(chart_file, caption=caption):
+                            log_info(f"✓ Sent {chart_name} chart")
+                        else:
+                            log_warn(f"Failed to send {chart_name} chart")
             except ValueError as e:
                 log_error(f"Telegram configuration error: {e}")
             except Exception as e:
