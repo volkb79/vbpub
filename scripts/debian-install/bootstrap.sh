@@ -38,7 +38,7 @@ SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE:-auto}"  # files_in_root, partitions_swap
 SWAP_DISK_TOTAL_GB="${SWAP_DISK_TOTAL_GB:-auto}"  # Total disk-based swap (auto = calculated)
 SWAP_STRIPE_WIDTH="${SWAP_STRIPE_WIDTH:-8}"  # Number of parallel swap devices (for I/O striping)
 SWAP_PRIORITY="${SWAP_PRIORITY:-10}"  # Priority for disk swap (lower than RAM)
-EXTEND_ROOT="${EXTEND_ROOT:-no}"
+EXTEND_ROOT="${EXTEND_ROOT:-yes}"  # Default to yes - expand root partition when using partition-based swap
 
 # ZFS-specific
 ZFS_POOL="${ZFS_POOL:-tank}"
@@ -95,6 +95,155 @@ run_logged() {
     log_debug "Exit code: $exit_code"
     
     return $exit_code
+}
+
+# Check if root partition needs expansion before main operations
+check_and_expand_root_early() {
+    log_info "==> Checking if root partition expansion is needed"
+    
+    # Get available space
+    local avail_kb=$(df -k / | tail -1 | awk '{print $4}')
+    local avail_gb=$((avail_kb / 1024 / 1024))
+    
+    log_info "Available disk space: ${avail_gb}GB"
+    
+    # If we have less than 10GB available, check if we can expand
+    if [ "$avail_gb" -lt 10 ]; then
+        log_warn "Low available space (${avail_gb}GB) - checking for expansion opportunity"
+        
+        # Find root partition and disk
+        local root_partition=$(findmnt -n -o SOURCE / 2>/dev/null || echo "")
+        if [ -z "$root_partition" ]; then
+            log_warn "Could not determine root partition - skipping early expansion"
+            return 0
+        fi
+        
+        local root_disk=$(lsblk -no PKNAME "$root_partition" 2>/dev/null | head -1)
+        if [ -z "$root_disk" ]; then
+            log_warn "Could not determine root disk - skipping early expansion"
+            return 0
+        fi
+        
+        # Get disk and partition sizes
+        local disk_size_sectors=$(blockdev --getsz "/dev/$root_disk" 2>/dev/null || echo "0")
+        local disk_total_gb=$((disk_size_sectors / 2048 / 1024))
+        
+        log_info "Total disk capacity: ${disk_total_gb}GB"
+        
+        # Check if disk is much larger than available space (indicating unexpanded root)
+        if [ "$disk_total_gb" -gt $((avail_gb * 3)) ]; then
+            log_warn "⚠️  Root partition appears to be unexpanded (${avail_gb}GB used of ${disk_total_gb}GB disk)"
+            log_warn "⚠️  Expanding root partition NOW to prevent 'No space left on device' errors"
+            
+            tg_send "⚠️ <b>Early Root Expansion Required</b>
+
+Root partition is using only ${avail_gb}GB of ${disk_total_gb}GB disk.
+Expanding root partition before continuing to prevent space issues..."
+            
+            # Expand root partition using online filesystem resize
+            local fs_type=$(findmnt -n -o FSTYPE /)
+            log_info "Root filesystem: $fs_type"
+            
+            # Get partition number and info
+            local root_part_num=$(echo "$root_partition" | grep -oE '[0-9]+$')
+            
+            # Get current partition layout
+            local root_start=$(sfdisk -d "/dev/$root_disk" 2>/dev/null | grep "^$root_partition" | sed -E 's/.*start= *([0-9]+).*/\1/')
+            local root_size=$(sfdisk -d "/dev/$root_disk" 2>/dev/null | grep "^$root_partition" | sed -E 's/.*size= *([0-9]+).*/\1/')
+            
+            # Calculate free space
+            local free_sectors=$((disk_size_sectors - root_start - root_size))
+            local free_gb=$((free_sectors / 2048 / 1024))
+            
+            log_info "Unallocated space after root: ${free_gb}GB"
+            
+            if [ "$free_gb" -ge 5 ]; then
+                log_info "Expanding root partition to use most of disk (leaving some space for swap)"
+                
+                # Calculate new root size - use 90% of remaining disk, leave 10% for swap
+                local new_root_size_sectors=$((disk_size_sectors - root_start - (disk_size_sectors / 10)))
+                
+                # Backup partition table
+                local backup_file="/tmp/ptable-early-backup-$(date +%s).dump"
+                sfdisk --dump "/dev/$root_disk" > "$backup_file"
+                log_info "Partition table backed up to: $backup_file"
+                
+                # Create modified partition table
+                local ptable_new="/tmp/ptable-early-expand-$(date +%s).dump"
+                {
+                    # Copy header
+                    grep -E "^(label|label-id|device|unit|first-lba|last-lba|sector-size):" "$backup_file"
+                    echo ""
+                    
+                    # Process partitions
+                    while IFS= read -r line; do
+                        if [[ "$line" =~ ^/dev/ ]]; then
+                            local part_num=$(echo "$line" | grep -oE '[0-9]+' | head -1)
+                            if [ "$part_num" = "$root_part_num" ]; then
+                                # Extend root partition
+                                echo "$line" | sed -E "s/size= *[0-9]+/size=${new_root_size_sectors}/"
+                            else
+                                # Keep other partitions
+                                echo "$line"
+                            fi
+                        fi
+                    done < "$backup_file"
+                } > "$ptable_new"
+                
+                # Write partition table
+                log_info "Writing expanded partition table..."
+                if sfdisk --force "/dev/$root_disk" < "$ptable_new" 2>&1 | tee -a "$LOG_FILE"; then
+                    log_info "Partition table updated"
+                else
+                    log_error "Failed to update partition table"
+                    return 1
+                fi
+                
+                # Update kernel partition table
+                sync
+                sleep 2
+                partx -u "/dev/$root_disk" 2>&1 | tee -a "$LOG_FILE" || true
+                sync
+                sleep 2
+                
+                # Resize filesystem
+                log_info "Resizing ${fs_type} filesystem..."
+                case "$fs_type" in
+                    ext4|ext3|ext2)
+                        resize2fs "$root_partition" 2>&1 | tee -a "$LOG_FILE"
+                        ;;
+                    xfs)
+                        xfs_growfs / 2>&1 | tee -a "$LOG_FILE"
+                        ;;
+                    btrfs)
+                        btrfs filesystem resize max / 2>&1 | tee -a "$LOG_FILE"
+                        ;;
+                    *)
+                        log_error "Unsupported filesystem: $fs_type"
+                        return 1
+                        ;;
+                esac
+                
+                # Check new available space
+                avail_kb=$(df -k / | tail -1 | awk '{print $4}')
+                avail_gb=$((avail_kb / 1024 / 1024))
+                
+                log_info "✓ Root partition expanded - now ${avail_gb}GB available"
+                tg_send "✅ <b>Root Expansion Complete</b>
+
+Root partition expanded successfully.
+Available space: ${avail_gb}GB (was ${avail_gb}GB before expansion)"
+            else
+                log_warn "Not enough unallocated space (${free_gb}GB) to expand - will proceed carefully"
+            fi
+        else
+            log_info "Root partition size appears adequate relative to disk capacity"
+        fi
+    else
+        log_info "Available space (${avail_gb}GB) is adequate - no early expansion needed"
+    fi
+    
+    return 0
 }
 
 # Test Telegram connectivity
@@ -262,6 +411,10 @@ main() {
     tg_send "$SYSTEM_SUMMARY"
     
     if [ "$EUID" -ne 0 ]; then log_error "Must run as root"; exit 1; fi
+    
+    # Check and expand root partition if needed BEFORE any apt operations
+    # This prevents "No space left on device" errors during bootstrap
+    check_and_expand_root_early
     
     # Install git first
     if ! command -v git >/dev/null 2>&1; then
