@@ -145,12 +145,23 @@ Expanding root partition before continuing to prevent space issues..."
             local fs_type=$(findmnt -n -o FSTYPE /)
             log_info "Root filesystem: $fs_type"
             
-            # Get partition number and info
+            # Get partition number and info with error checking
             local root_part_num=$(echo "$root_partition" | grep -oE '[0-9]+$')
+            if [ -z "$root_part_num" ]; then
+                log_warn "Could not extract partition number from $root_partition - skipping early expansion"
+                return 0
+            fi
             
-            # Get current partition layout
+            # Get current partition layout with validation
             local root_start=$(sfdisk -d "/dev/$root_disk" 2>/dev/null | grep "^$root_partition" | sed -E 's/.*start= *([0-9]+).*/\1/')
             local root_size=$(sfdisk -d "/dev/$root_disk" 2>/dev/null | grep "^$root_partition" | sed -E 's/.*size= *([0-9]+).*/\1/')
+            
+            # Validate that we got values
+            if [ -z "$root_start" ] || [ -z "$root_size" ]; then
+                log_warn "Could not extract partition info from sfdisk - skipping early expansion"
+                log_debug "root_start=$root_start, root_size=$root_size"
+                return 0
+            fi
             
             # Calculate free space
             local free_sectors=$((disk_size_sectors - root_start - root_size))
@@ -162,6 +173,8 @@ Expanding root partition before continuing to prevent space issues..."
                 log_info "Expanding root partition to use most of disk (leaving some space for swap)"
                 
                 # Calculate new root size - use 90% of remaining disk, leave 10% for swap
+                # Using integer division: (disk_size - start - disk_size/10)
+                # This reserves approximately 10% of total disk at the end
                 local new_root_size_sectors=$((disk_size_sectors - root_start - (disk_size_sectors / 10)))
                 
                 # Backup partition table

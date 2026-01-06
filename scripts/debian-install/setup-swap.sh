@@ -196,12 +196,12 @@ detect_system() {
     log_info "Available disk space: ${DISK_AVAIL_GB}GB"
     
     # Get total disk capacity (not just available space)
-    # Find root partition and disk
-    ROOT_PARTITION=$(findmnt -n -o SOURCE / 2>/dev/null || echo "")
-    if [ -n "$ROOT_PARTITION" ]; then
-        ROOT_DISK=$(lsblk -no PKNAME "$ROOT_PARTITION" 2>/dev/null | head -1)
-        if [ -n "$ROOT_DISK" ]; then
-            DISK_SIZE_SECTORS=$(blockdev --getsz "/dev/$ROOT_DISK" 2>/dev/null || echo "0")
+    # Find root partition and disk (using temporary variables to avoid conflicts with later usage)
+    local detect_root_partition=$(findmnt -n -o SOURCE / 2>/dev/null || echo "")
+    if [ -n "$detect_root_partition" ]; then
+        local detect_root_disk=$(lsblk -no PKNAME "$detect_root_partition" 2>/dev/null | head -1)
+        if [ -n "$detect_root_disk" ]; then
+            DISK_SIZE_SECTORS=$(blockdev --getsz "/dev/$detect_root_disk" 2>/dev/null || echo "0")
             DISK_TOTAL_GB=$((DISK_SIZE_SECTORS / 2048 / 1024))
             log_info "Total disk capacity: ${DISK_TOTAL_GB}GB"
         else
@@ -633,7 +633,7 @@ print_system_analysis_and_plan() {
     
     if [ "$show_warnings" -eq 1 ]; then
         echo ""
-        echo -e "$warning_msgs"
+        printf '%b\n' "$warning_msgs"
     fi
     
     # Send configuration plan to Telegram
