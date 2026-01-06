@@ -172,7 +172,7 @@ class Colors:
     NC = '\033[0m'
 
 # Benchmark configuration constants
-COMPRESSION_TEST_SIZE_MB = 256  # Default compression test size
+COMPRESSION_TEST_SIZE_MB = 64  # Default compression test size (reduced for faster benchmarks)
 COMPRESSION_MEMORY_PERCENT = 90  # Percentage of test size to allocate (90%)
 COMPRESSION_MEMORY_PASSES = 3  # Number of passes over memory to ensure swapping
 COMPRESSION_MIN_SWAP_PERCENT = 50  # Minimum expected swap activity (50% of test size)
@@ -1131,8 +1131,8 @@ def test_blocksize_concurrency_matrix(block_sizes=None, concurrency_levels=None,
     which configuration provides the best throughput for the specific hardware.
     
     Args:
-        block_sizes: List of block sizes in KB (default: [4, 8, 16, 32, 64, 128])
-        concurrency_levels: List of concurrency levels (default: [1, 2, 4, 8])
+        block_sizes: List of block sizes in KB (default: [4, 8, 16, 32, 64])
+        concurrency_levels: List of concurrency levels (default: [1, 2, 4])
         file_size_mb: Size of each file in MB
         test_dir: Directory for test files
         runtime_sec: Test runtime in seconds
@@ -1143,9 +1143,9 @@ def test_blocksize_concurrency_matrix(block_sizes=None, concurrency_levels=None,
     start_time = time.time()
     
     if block_sizes is None:
-        block_sizes = [4, 8, 16, 32, 64, 128]
+        block_sizes = [4, 8, 16, 32, 64]  # Remove 128KB - diminishing returns
     if concurrency_levels is None:
-        concurrency_levels = [1, 2, 4, 8]
+        concurrency_levels = [1, 2, 4]  # Remove 8 jobs - diminishing returns
     
     total_combinations = len(block_sizes) * len(concurrency_levels)
     log_step_ts(f"Block Size × Concurrency Matrix Test ({total_combinations} combinations)")
@@ -1296,7 +1296,9 @@ stonewall
         results['optimal']['recommended_page_cluster'] = recommended_cluster
         
         # Use max successfully tested concurrency (not 16 if it failed)
-        max_successful = max([r['concurrency'] for r in valid_results])
+        # Filter out results with errors
+        valid_results = [r for r in results['matrix'] if 'error' not in r]
+        max_successful = max([r['concurrency'] for r in valid_results]) if valid_results else 1
         results['optimal']['recommended_swap_stripe_width'] = max_successful
         
         log_info(f"Recommended settings:")
@@ -3612,6 +3614,11 @@ Examples:
         results['allocators'] = []
         for alloc in allocators:
             try:
+                # Force memory refresh before each test to get accurate compression ratios
+                log_debug(f"Cleaning up ZRAM before testing allocator: {alloc}")
+                cleanup_zram_aggressive()
+                time.sleep(2)  # Let system stabilize
+                
                 current_test += 1
                 result = benchmark_compression(
                     'lz4', 
