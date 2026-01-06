@@ -207,7 +207,7 @@ class SystemInfo:
         return info
     
     def get_network_info(self):
-        """Get network information"""
+        """Get network information including interface and DNS"""
         info = {}
         
         # Try to get public IP
@@ -219,6 +219,61 @@ class SystemInfo:
             )
             if result.returncode == 0:
                 info['public_ip'] = result.stdout.strip()
+        except:
+            pass
+        
+        # Get primary network interface
+        try:
+            # Get default route interface
+            result = subprocess.run(
+                ['ip', 'route', 'show', 'default'],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            # Parse: default via 192.168.1.1 dev eth0 ...
+            if result.stdout:
+                parts = result.stdout.strip().split()
+                if 'dev' in parts:
+                    dev_idx = parts.index('dev')
+                    if dev_idx + 1 < len(parts):
+                        info['interface'] = parts[dev_idx + 1]
+        except:
+            pass
+        
+        # Get DNS servers
+        try:
+            dns_servers = []
+            # Try systemd-resolved first
+            try:
+                result = subprocess.run(
+                    ['resolvectl', 'status'],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                for line in result.stdout.split('\n'):
+                    if 'DNS Servers:' in line or 'Current DNS Server:' in line:
+                        # Extract IP addresses
+                        import re
+                        ips = re.findall(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b', line)
+                        dns_servers.extend(ips)
+            except:
+                # Fallback to /etc/resolv.conf
+                try:
+                    with open('/etc/resolv.conf') as f:
+                        for line in f:
+                            if line.strip().startswith('nameserver'):
+                                parts = line.strip().split()
+                                if len(parts) >= 2:
+                                    dns_servers.append(parts[1])
+                except:
+                    pass
+            
+            if dns_servers:
+                # Remove duplicates while preserving order
+                seen = set()
+                info['dns_servers'] = [x for x in dns_servers if not (x in seen or seen.add(x))]
         except:
             pass
         
@@ -248,12 +303,24 @@ class SystemInfo:
             html += f"  Total: {self.info['memory']['total_gb']} GB\n"
             html += f"  Available: {self.info['memory']['available_gb']} GB\n\n"
         
-        # Disk (including lsblk output)
-        if 'disk' in self.info and 'total_gb' in self.info['disk']:
+        # Disk (including root partition details)
+        if 'disk' in self.info:
             html += f"<b>💿 Disk</b>\n"
-            html += f"  Total: {self.info['disk']['total_gb']} GB\n"
-            html += f"  Available: {self.info['disk']['available_gb']} GB\n"
-            html += f"  Used: {self.info['disk'].get('used_percent', 0)}%\n"
+            
+            # Show disk total if available
+            if 'total_gb' in self.info['disk']:
+                html += f"  Total: {self.info['disk']['total_gb']} GB\n"
+                html += f"  Available: {self.info['disk']['available_gb']} GB\n"
+                html += f"  Used: {self.info['disk'].get('used_percent', 0)}%\n"
+            
+            # Show root partition details if different from disk
+            if 'root_partition' in self.info['disk'] and 'root_total_kb' in self.info['disk']:
+                root_total_gb = round(self.info['disk']['root_total_kb'] / 1024 / 1024, 2)
+                root_avail_gb = round(self.info['disk']['root_available_kb'] / 1024 / 1024, 2)
+                html += f"\n  <b>Root Partition</b> ({self.info['disk']['root_partition']})\n"
+                html += f"    Total: {root_total_gb} GB\n"
+                html += f"    Available: {root_avail_gb} GB\n"
+                html += f"    Used: {self.info['disk']['root_used_percent']}%\n"
             
             # Add lsblk output if available
             if 'lsblk_output' in self.info['disk']:
@@ -270,9 +337,14 @@ class SystemInfo:
             html += f"<b>💱 Swap</b>\n  Not configured\n"
         
         # Network
-        if 'network' in self.info and 'public_ip' in self.info['network']:
+        if 'network' in self.info:
             html += f"\n<b>🌐 Network</b>\n"
-            html += f"  Public IP: {self.info['network']['public_ip']}\n"
+            if 'interface' in self.info['network']:
+                html += f"  Interface: {self.info['network']['interface']}\n"
+            if 'public_ip' in self.info['network']:
+                html += f"  Public IP: {self.info['network']['public_ip']}\n"
+            if 'dns_servers' in self.info['network']:
+                html += f"  DNS: {', '.join(self.info['network']['dns_servers'])}\n"
         
         return html
     

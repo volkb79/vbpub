@@ -3469,7 +3469,11 @@ Examples:
             for f in glob.glob(pattern):
                 if os.path.isfile(f):
                     os.remove(f)
-                    log_debug(f"Removed {f}")
+                    log_debug(f"Removed file: {f}")
+                elif os.path.isdir(f):
+                    import shutil
+                    shutil.rmtree(f)
+                    log_debug(f"Removed directory: {f}")
         except Exception as e:
             log_debug(f"Cleanup warning for {pattern}: {e}")
     
