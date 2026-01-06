@@ -3260,7 +3260,7 @@ def format_benchmark_html(results):
             
             # Check for suspicious low ratios (likely failed tests)
             if zram_ratio < MIN_VALID_COMPRESSION_RATIO or zswap_ratio < MIN_VALID_COMPRESSION_RATIO:
-                html += f"  ⚠️ <i>Test results appear invalid (compression ratio &lt; {MIN_VALID_COMPRESSION_RATIO}x)</i>\n"
+                html += f"  ⚠️ <i>Test results appear invalid (compression ratio &lt; {MIN_VALID_COMPRESSION_RATIO:.1f}x)</i>\n"
                 html += "  <i>This may indicate test failure or insufficient memory pressure</i>\n"
             else:
                 html += f"  ZRAM:  {zram_ratio:.1f}x ratio, {zram_lat:.1f}µs latency\n"
@@ -3838,10 +3838,16 @@ Examples:
                 
                 # Generate charts (with WebP conversion if requested)
                 log_info("Generating performance charts...")
-                chart_files = generate_charts(results, webp=args.webp)
+                chart_files_generated = generate_charts(results, webp=args.webp)
                 
-                # Filter out non-existent charts
-                chart_files = [f for f in chart_files if os.path.exists(f)]
+                # Filter out non-existent charts and log which ones are missing
+                chart_files = []
+                for chart_file in chart_files_generated:
+                    if os.path.exists(chart_file):
+                        chart_files.append(chart_file)
+                    else:
+                        log_debug(f"Chart file not found: {chart_file}")
+                
                 if not chart_files:
                     log_warn("No charts were generated")
                 
@@ -3852,6 +3858,8 @@ Examples:
                         matrix_chart = generate_matrix_heatmaps(results['matrix'], output_prefix)
                         if matrix_chart and os.path.exists(matrix_chart):
                             chart_files.append(matrix_chart)
+                        elif matrix_chart:
+                            log_debug(f"Matrix chart file not found: {matrix_chart}")
                     except Exception as e:
                         log_warn(f"Failed to generate matrix heatmaps: {e}")
                 
