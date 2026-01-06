@@ -348,11 +348,36 @@ main() {
     # Geekbench
     if [ "$RUN_GEEKBENCH" = "yes" ]; then
         log_info "==> Running Geekbench (5-10 min)"
+        GEEKBENCH_START=$(date +%s)
         if ./sysinfo-notify.py --geekbench-only 2>&1 | tee -a "$LOG_FILE"; then
-            log_info "✓ Geekbench complete"
+            GEEKBENCH_END=$(date +%s)
+            GEEKBENCH_DURATION=$((GEEKBENCH_END - GEEKBENCH_START))
+            log_info "✓ Geekbench complete (took ${GEEKBENCH_DURATION}s)"
             # Geekbench results are automatically sent via telegram by sysinfo-notify.py
         else
-            log_warn "Geekbench failed"
+            GEEKBENCH_EXIT_CODE=$?
+            GEEKBENCH_END=$(date +%s)
+            GEEKBENCH_DURATION=$((GEEKBENCH_END - GEEKBENCH_START))
+            log_error "✗ Geekbench failed (exit code: $GEEKBENCH_EXIT_CODE, took ${GEEKBENCH_DURATION}s)"
+            log_error "Check logs for details: $LOG_FILE"
+            
+            # Send failure notification via Telegram
+            if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+                GEEKBENCH_ERROR_MSG="❌ <b>Geekbench Failed</b>
+
+Exit code: ${GEEKBENCH_EXIT_CODE}
+Duration: ${GEEKBENCH_DURATION}s
+Log: ${LOG_FILE}
+
+Possible causes:
+• Download failure (network/URL issue)
+• Extraction failure (corrupt archive)
+• Runtime failure (insufficient resources)
+• Timeout (benchmark took >15 min)
+
+Check the log file for detailed error messages."
+                tg_send "$GEEKBENCH_ERROR_MSG"
+            fi
         fi
     else
         log_info "==> Geekbench skipped (RUN_GEEKBENCH=$RUN_GEEKBENCH)"

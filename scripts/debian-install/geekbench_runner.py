@@ -86,20 +86,79 @@ class GeekbenchRunner:
         """Download and extract Geekbench"""
         print(f"Downloading Geekbench {self.version}...")
         
-        url = self._get_download_url()
+        try:
+            url = self._get_download_url()
+        except Exception as e:
+            error_msg = f"✗ Failed to determine download URL: {e}"
+            print(error_msg)
+            self.results['error'] = error_msg
+            return False
+        
         tarball = os.path.join(self.work_dir, f"geekbench{self.version}.tar.gz")
         
         # Download
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ['curl', '-fsSL', '-o', tarball, url],
+                capture_output=True,
                 check=True,
                 timeout=300
             )
             print(f"✓ Downloaded to {tarball}")
-        except subprocess.CalledProcessError as e:
-            print(f"✗ Download failed: {e}")
+        except subprocess.TimeoutExpired:
+            error_msg = f"✗ Download timed out after 300 seconds"
+            print(error_msg)
+            self.results['error'] = error_msg
             return False
+        except subprocess.CalledProcessError as e:
+            error_msg = f"✗ Download failed: curl exit code {e.returncode}"
+            if e.stderr:
+                error_msg += f"\nError output: {e.stderr}"
+            print(error_msg)
+            self.results['error'] = error_msg
+            # Try to provide helpful hints
+            if '404' in str(e.stderr) or 'not found' in str(e.stderr).lower():
+                print("Hint: The Geekbench version may not be available. Try a different version.")
+            print(f"Attempted URL: {url}")
+            return False
+        except FileNotFoundError:
+            error_msg = "✗ curl not found. Install with: apt install curl"
+            print(error_msg)
+            self.results['error'] = error_msg
+            return False
+        except Exception as e:
+            error_msg = f"✗ Download failed with unexpected error: {e}"
+            print(error_msg)
+            self.results['error'] = error_msg
+            return False
+        
+        # Verify downloaded file
+        if not os.path.exists(tarball):
+            error_msg = f"✗ Downloaded file not found: {tarball}"
+            print(error_msg)
+            self.results['error'] = error_msg
+            return False
+        
+        file_size = os.path.getsize(tarball)
+        if file_size < 1024:  # Less than 1KB is suspicious
+            error_msg = f"✗ Downloaded file too small ({file_size} bytes) - likely an error page"
+            print(error_msg)
+            self.results['error'] = error_msg
+            # Try to read and show content if it's text (use binary mode to avoid decode errors)
+            try:
+                with open(tarball, 'rb') as f:
+                    content = f.read(500)
+                    # Try to decode as UTF-8, but don't fail if it's binary
+                    try:
+                        content_str = content.decode('utf-8', errors='replace')
+                        print(f"File content preview: {content_str}")
+                    except:
+                        print(f"File appears to be binary or corrupt (first bytes): {content[:50]}")
+            except:
+                pass
+            return False
+        
+        print(f"Downloaded file size: {file_size / 1024 / 1024:.1f} MB")
         
         # Extract
         try:
@@ -116,11 +175,25 @@ class GeekbenchRunner:
                         print(f"✓ Extracted to {self.geekbench_path}")
                         return True
             
-            print("✗ Geekbench executable not found after extraction")
+            error_msg = "✗ Geekbench executable not found after extraction"
+            print(error_msg)
+            # List what was extracted for debugging
+            print("Extracted files:")
+            for root, dirs, files in os.walk(self.work_dir):
+                for file in files:
+                    print(f"  {os.path.join(root, file)}")
+            self.results['error'] = error_msg
             return False
             
+        except tarfile.ReadError as e:
+            error_msg = f"✗ Extraction failed: Invalid tar.gz file - {e}"
+            print(error_msg)
+            self.results['error'] = error_msg
+            return False
         except Exception as e:
-            print(f"✗ Extraction failed: {e}")
+            error_msg = f"✗ Extraction failed: {e}"
+            print(error_msg)
+            self.results['error'] = error_msg
             return False
     
     def run_benchmark(self):
@@ -262,6 +335,8 @@ class GeekbenchRunner:
         except subprocess.TimeoutExpired:
             error_msg = "✗ Benchmark timed out after 15 minutes"
             print(error_msg)
+            print("This may indicate a system performance issue or Geekbench hang.")
+            print("Consider checking system logs and available resources.")
             self.results['error'] = error_msg
             return False
         except Exception as e:

@@ -441,7 +441,9 @@ print_system_analysis_and_plan() {
             echo "  Allocator:     ${ZRAM_ALLOCATOR}"
             echo "  Priority:      ${ZRAM_PRIORITY}"
         elif [ "$SWAP_RAM_SOLUTION" = "zswap" ]; then
-            echo "  Pool Size:     20% of RAM (fixed)"
+            # Calculate actual pool size in GB
+            POOL_SIZE_GB=$(awk "BEGIN {printf \"%.1f\", ${RAM_GB} * 0.20}")
+            echo "  Pool Size:     20% of RAM (~${POOL_SIZE_GB}GB)"
             echo "  Compressor:    ${ZSWAP_COMPRESSOR}"
             echo "  Zpool:         ${ZSWAP_ZPOOL}"
         fi
@@ -580,9 +582,11 @@ print_system_analysis_and_plan() {
   - Allocator: ${ZRAM_ALLOCATOR}
   - Priority: ${ZRAM_PRIORITY}"
             elif [ "$SWAP_RAM_SOLUTION" = "zswap" ]; then
+                # Calculate actual pool size in GB
+                POOL_SIZE_GB=$(awk "BEGIN {printf \"%.1f\", ${RAM_GB} * 0.20}")
                 telegram_msg="${telegram_msg}
   - Compressor: ${ZSWAP_COMPRESSOR}
-  - Pool: 20% of RAM
+  - Pool: 20% of RAM (~${POOL_SIZE_GB}GB)
   - Zpool: ${ZSWAP_ZPOOL}"
             fi
         fi
@@ -961,6 +965,62 @@ detect_disk_layout() {
     return 0
 }
 
+# Helper function to update kernel partition table with multiple methods
+update_kernel_partition_table() {
+    local disk="$1"
+    local log_file="${2:-/dev/null}"
+    
+    log_info "Updating kernel partition table for /dev/$disk..."
+    
+    # Sync first
+    sync
+    sleep 2
+    
+    # Method 1: blockdev --rereadpt (force kernel to re-read partition table)
+    if command -v blockdev >/dev/null 2>&1; then
+        log_info "Using blockdev --rereadpt..."
+        if blockdev --rereadpt "/dev/$disk" 2>&1 | tee -a "$log_file"; then
+            log_info "✓ blockdev completed successfully"
+        else
+            log_warn "blockdev reported errors (expected for in-use disk)"
+        fi
+    fi
+    
+    # Method 2: partprobe (most comprehensive)
+    if command -v partprobe >/dev/null 2>&1; then
+        log_info "Using partprobe..."
+        if partprobe "/dev/$disk" 2>&1 | tee -a "$log_file"; then
+            log_info "✓ partprobe completed successfully"
+        else
+            log_warn "partprobe reported errors (expected for in-use disk)"
+        fi
+    fi
+    
+    # Method 3: partx (alternative method)
+    if command -v partx >/dev/null 2>&1; then
+        log_info "Using partx..."
+        if partx -u "/dev/$disk" 2>&1 | tee -a "$log_file"; then
+            log_info "✓ partx completed successfully"
+        else
+            log_warn "partx reported errors (expected for in-use disk)"
+        fi
+    fi
+    
+    # Settle udev events
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm settle 2>&1 | tee -a "$log_file" || true
+        log_info "Settled udev events"
+    fi
+    
+    # Final sync and wait
+    sync
+    sleep 3
+    
+    log_info "✓ Kernel partition table update completed"
+}
+
+# Detect disk layout and determine strategy (keeping original function name for compatibility)
+
 # Create swap partition at end of disk using sfdisk
 create_swap_partition() {
     log_step "Creating swap partition at end of disk"
@@ -1154,26 +1214,8 @@ create_swap_partition() {
     sync
     sleep 2
     
-    # Inform kernel of partition table changes with multiple methods
-    log_info "Informing kernel of partition table changes..."
-    
-    # Try partprobe first (most comprehensive)
-    if command -v partprobe >/dev/null 2>&1; then
-        partprobe "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
-        log_info "Used partprobe to update kernel partition table"
-    fi
-    
-    # Try partx as well (alternative method)
-    if command -v partx >/dev/null 2>&1; then
-        # Use -u (update) instead of -a (add) to handle existing partitions gracefully
-        partx -u "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
-        log_info "Used partx to update kernel partition table"
-    fi
-    
-    # Settle udev events
-    if command -v udevadm >/dev/null 2>&1; then
-        udevadm settle 2>&1 | tee -a "$LOG_FILE" || true
-        log_info "Settled udev events"
+    # Inform kernel of partition table changes
+    update_kernel_partition_table "$ROOT_DISK" "$LOG_FILE"
     fi
     
     # Additional wait for device node creation
@@ -1187,8 +1229,8 @@ create_swap_partition() {
             ext4|ext3|ext2)
                 # For ext filesystems, need to check first, then resize
                 log_info "Checking ext filesystem integrity..."
-                # Online check (read-only)
-                e2fsck -n -f "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE" || true
+                # Online check (read-only, -n flag prevents modifications, -v for verbose)
+                e2fsck -n -v "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE" || true
                 
                 log_info "Resizing ext filesystem to match partition..."
                 if resize2fs "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
@@ -1423,12 +1465,19 @@ extend_root_partition() {
         return 1
     fi
     
+    # Sync
+    sync
+    sleep 2
+    
     # Inform kernel of partition table changes
-    log_info "Informing kernel of partition table changes..."
-    if command -v partprobe >/dev/null 2>&1; then
-        partprobe "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
+    update_kernel_partition_table "$ROOT_DISK" "$LOG_FILE"
+    
+    # Verify the partition is visible to the kernel
+    log_info "Verifying partition table update..."
+    if lsblk "/dev/$ROOT_DISK" | grep -q "$ROOT_PARTITION"; then
+        log_info "✓ Root partition visible in kernel"
     else
-        partx --update "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
+        log_warn "⚠ Root partition not immediately visible - may require reboot"
     fi
     
     # Resize filesystem
@@ -1436,9 +1485,9 @@ extend_root_partition() {
     
     case "$FS_TYPE" in
         ext4|ext3|ext2)
-            # Check filesystem first
+            # Check filesystem first (read-only check for mounted partition)
             log_info "Checking filesystem integrity..."
-            e2fsck -f -y "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE" || true
+            e2fsck -n -v "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE" || true
             
             # Resize filesystem
             if resize2fs "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
@@ -1504,7 +1553,7 @@ extend_root_partition() {
     if command -v partprobe >/dev/null 2>&1; then
         partprobe "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
     else
-        partx --update "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
+        partx -u "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
     fi
     
     # Wait for device to appear

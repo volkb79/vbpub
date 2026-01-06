@@ -8,6 +8,7 @@ import os
 import socket
 import subprocess
 import time
+import json
 
 try:
     import requests
@@ -168,6 +169,98 @@ class TelegramClient:
                 return False
         
         print(f"Failed to send document after {max_retries} attempts: {last_error}")
+        return False
+    
+    def send_media_group(self, file_paths, caption=None, prefix_source=True, max_retries=3, retry_delay=2):
+        """
+        Send multiple images as a media group (album) in a single message
+        
+        Args:
+            file_paths: List of file paths to send (supports PNG, JPEG, WebP)
+            caption: Optional caption for first image
+            prefix_source: Automatically prefix caption with system ID (default: True)
+            max_retries: Maximum number of retry attempts (default: 3)
+            retry_delay: Initial delay between retries in seconds (default: 2)
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if not file_paths:
+            print("Error: No files provided")
+            return False
+        
+        # Filter out non-existent files
+        valid_files = [f for f in file_paths if os.path.exists(f)]
+        if not valid_files:
+            print(f"Error: None of the provided files exist")
+            return False
+        
+        if len(valid_files) < len(file_paths):
+            missing = set(file_paths) - set(valid_files)
+            print(f"Warning: Skipping missing files: {missing}")
+        
+        if caption and prefix_source:
+            caption = f"{self.system_id}\n{caption}"
+        
+        url = f"{self.api_url}/sendMediaGroup"
+        
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                # Build media array
+                media = []
+                files = {}
+                
+                for idx, file_path in enumerate(valid_files):
+                    attach_name = f"file{idx}"
+                    media_item = {
+                        'type': 'photo',  # Telegram treats images as photos in media groups
+                        'media': f'attach://{attach_name}'
+                    }
+                    
+                    # Add caption to first image only
+                    if idx == 0 and caption:
+                        media_item['caption'] = caption
+                        media_item['parse_mode'] = 'HTML'
+                    
+                    media.append(media_item)
+                    files[attach_name] = open(file_path, 'rb')
+                
+                try:
+                    data = {
+                        'chat_id': self.chat_id,
+                        'media': json.dumps(media)
+                    }
+                    
+                    response = requests.post(url, data=data, files=files, timeout=60)
+                    response.raise_for_status()
+                    return True
+                    
+                finally:
+                    # Close all file handles
+                    for f in files.values():
+                        f.close()
+                        
+            except requests.exceptions.ConnectionError as e:
+                last_error = f"Connection error: {e}"
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    print(f"Connection error, retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+            except requests.exceptions.Timeout as e:
+                last_error = f"Timeout error: {e}"
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    print(f"Timeout, retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+            except Exception as e:
+                last_error = f"Error: {e}"
+                print(f"Error sending media group: {e}")
+                return False
+        
+        print(f"Failed to send media group after {max_retries} attempts: {last_error}")
         return False
     
     def test_connection(self):
