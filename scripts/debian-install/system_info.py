@@ -91,20 +91,30 @@ class SystemInfo:
         """Get disk information - reports full disk size, not just root partition"""
         info = {}
         
-        # Get lsblk output for comprehensive disk information
+        # Get lsblk JSON output for comprehensive disk information
         try:
-            lsblk_full = subprocess.run(
-                ['lsblk', '-o', 'NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE'],
+            lsblk_result = subprocess.run(
+                ['lsblk', '--json', '-o', 'NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE'],
                 capture_output=True,
                 text=True,
                 check=True
             )
-            info['lsblk_output'] = lsblk_full.stdout.strip()
-        except subprocess.CalledProcessError:
-            # lsblk failed, continue without this info
-            pass
-        except Exception:
-            pass
+            info['lsblk'] = json.loads(lsblk_result.stdout)
+        except:
+            # Fallback to text output if JSON not available
+            try:
+                lsblk_full = subprocess.run(
+                    ['lsblk', '-o', 'NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE'],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                info['lsblk_output'] = lsblk_full.stdout.strip()
+            except subprocess.CalledProcessError:
+                # lsblk failed, continue without this info
+                pass
+            except Exception:
+                pass
         
         try:
             # Get root partition info
@@ -193,8 +203,10 @@ class SystemInfo:
                     if len(parts) >= 3:
                         device_info = {
                             'device': parts[0],
-                            'size': parts[2],
-                            'priority': parts[3] if len(parts) > 3 else 'unknown'
+                            'type': parts[1] if len(parts) > 1 else 'unknown',
+                            'size': parts[2] if len(parts) > 2 else 'unknown',
+                            'used': parts[3] if len(parts) > 3 else 'unknown',
+                            'priority': parts[4] if len(parts) > 4 else 'unknown'
                         }
                         info['devices'].append(device_info)
                 
@@ -219,65 +231,69 @@ class SystemInfo:
             )
             if result.returncode == 0:
                 info['public_ip'] = result.stdout.strip()
+                
+                # Get reverse DNS for public IP
+                rdns = self._get_reverse_dns(info['public_ip'])
+                if rdns:
+                    info['reverse_dns'] = rdns
         except:
             pass
         
-        # Get primary network interface
+        # Get hostname
         try:
-            # Get default route interface
-            result = subprocess.run(
-                ['ip', 'route', 'show', 'default'],
+            info['hostname'] = subprocess.run(
+                ['hostname', '-f'],
                 capture_output=True,
-                text=True,
-                check=True
-            )
-            # Parse: default via 192.168.1.1 dev eth0 ...
-            if result.stdout:
-                parts = result.stdout.strip().split()
-                if 'dev' in parts:
-                    dev_idx = parts.index('dev')
-                    if dev_idx + 1 < len(parts):
-                        info['interface'] = parts[dev_idx + 1]
-        except:
-            pass
-        
-        # Get DNS servers
-        try:
-            dns_servers = []
-            # Try systemd-resolved first
-            try:
-                result = subprocess.run(
-                    ['resolvectl', 'status'],
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
-                for line in result.stdout.split('\n'):
-                    if 'DNS Servers:' in line or 'Current DNS Server:' in line:
-                        # Extract IP addresses
-                        import re
-                        ips = re.findall(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b', line)
-                        dns_servers.extend(ips)
-            except:
-                # Fallback to /etc/resolv.conf
-                try:
-                    with open('/etc/resolv.conf') as f:
-                        for line in f:
-                            if line.strip().startswith('nameserver'):
-                                parts = line.strip().split()
-                                if len(parts) >= 2:
-                                    dns_servers.append(parts[1])
-                except:
-                    pass
-            
-            if dns_servers:
-                # Remove duplicates while preserving order
-                seen = set()
-                info['dns_servers'] = [x for x in dns_servers if not (x in seen or seen.add(x))]
+                text=True
+            ).stdout.strip()
         except:
             pass
         
         return info
+    
+    def _get_reverse_dns(self, ip):
+        """Get reverse DNS for an IP address"""
+        if not ip:
+            return None
+        
+        # Try dig first
+        try:
+            result = subprocess.run(
+                ['dig', '+short', '-x', ip],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                rdns = result.stdout.strip().rstrip('.')
+                if rdns:
+                    return rdns
+        except:
+            pass
+        
+        # Fallback to host command
+        try:
+            result = subprocess.run(
+                ['host', ip],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                # Parse "X.X.X.X domain name pointer hostname.example.com."
+                for line in result.stdout.split('\n'):
+                    if 'domain name pointer' in line:
+                        rdns = line.split('domain name pointer')[1].strip().rstrip('.')
+                        if rdns:
+                            return rdns
+        except:
+            pass
+        
+        return None
+    
+    def to_dict(self):
+        """Return system info as dictionary"""
+        return self.info
     
     def format_html(self):
         """Format system info as HTML for Telegram"""

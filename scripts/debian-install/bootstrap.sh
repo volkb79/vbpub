@@ -355,9 +355,8 @@ main() {
         exit 1
     fi
     
-    # Sync and send log file
+    # Sync log file (removed telegram_send for swap configuration)
     sync
-    tg_send_file "$LOG_FILE" "Swap Configuration Log attached"
     
     # User configuration
     if [ "$RUN_USER_CONFIG" = "yes" ]; then
