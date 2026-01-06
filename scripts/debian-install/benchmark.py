@@ -2232,15 +2232,13 @@ def benchmark_latency_comparison(test_size_mb=100):
     log_info("\n=== Phase 1: Native RAM Baseline ===")
     results['baseline'] = benchmark_native_ram_baseline(test_size_mb)
     
-    # 2. Write latency tests
-    log_info("\n=== Phase 2: Write Latency Tests ===")
+    # 2. Write latency tests - reduced to top performers only
+    # Test best speed (lz4) and best compression (zstd) with most common allocators
+    log_info("\n=== Phase 2: Write Latency Tests (Top Performers) ===")
     write_configs = [
-        ('lz4', 'zsmalloc'),
-        ('lz4', 'z3fold'),
-        ('lz4', 'zbud'),
-        ('zstd', 'zsmalloc'),
-        ('zstd', 'z3fold'),
-        ('zstd', 'zbud')
+        ('lz4', 'zsmalloc'),   # Fast compressor, best allocator
+        ('zstd', 'zsmalloc'),  # Best compression, best allocator
+        ('lz4', 'z3fold'),     # Fast compressor, alternative allocator
     ]
     
     for i, (comp, alloc) in enumerate(write_configs, 1):
@@ -2248,17 +2246,12 @@ def benchmark_latency_comparison(test_size_mb=100):
                                         test_num=i, total_tests=len(write_configs))
         results['write_latency'].append(result)
     
-    # 3. Read latency tests (sequential and random)
-    log_info("\n=== Phase 3: Read Latency Tests ===")
+    # 3. Read latency tests - reduced to top performers only
+    log_info("\n=== Phase 3: Read Latency Tests (Top Performers) ===")
     read_configs = [
-        ('lz4', 'zsmalloc', 0),   # sequential
-        ('lz4', 'z3fold', 0),     # sequential
-        ('lz4', 'zbud', 0),       # sequential
-        ('lz4', 'zsmalloc', 1),   # random
-        ('zstd', 'zsmalloc', 0),  # sequential
-        ('zstd', 'z3fold', 0),    # sequential
-        ('zstd', 'zbud', 0),      # sequential
-        ('zstd', 'zsmalloc', 1),  # random
+        ('lz4', 'zsmalloc', 0),   # Fast, sequential
+        ('zstd', 'zsmalloc', 0),  # Best compression, sequential
+        ('lz4', 'zsmalloc', 1),   # Fast, random
     ]
     
     for i, (comp, alloc, pattern) in enumerate(read_configs, 1):
