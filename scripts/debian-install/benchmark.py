@@ -132,8 +132,10 @@ sudo ./benchmark.py --test-all --output results.json --shell-config optimal.conf
 """
 
 import argparse
+import glob
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -477,17 +479,19 @@ def ensure_zram_loaded():
             # First, disable swap if active
             run_command('swapoff /dev/zram0 2>/dev/null || true', check=False)
             
-            # Try to read current disksize
+            # Always reset the device to ensure clean state
+            # This is critical - without reset, disksize writes fail with "Device or resource busy"
             try:
-                with open('/sys/block/zram0/disksize', 'r') as f:
-                    current_size = f.read().strip()
-                    if current_size != '0':
-                        # Device is configured, need to reset using direct file I/O
-                        with open('/sys/block/zram0/reset', 'w') as reset_f:
-                            reset_f.write('1\n')
-                        time.sleep(0.5)
-            except:
-                pass
+                if os.path.exists('/sys/block/zram0/reset'):
+                    log_debug("Resetting ZRAM device...")
+                    with open('/sys/block/zram0/reset', 'w') as reset_f:
+                        reset_f.write('1\n')
+                    # Give kernel time to complete reset
+                    time.sleep(0.5)
+                    log_debug("ZRAM device reset complete")
+            except Exception as e:
+                log_error(f"Failed to reset ZRAM device: {e}")
+                # Don't return False here, try to continue
         
         return True
     except Exception as e:
@@ -1025,7 +1029,6 @@ stonewall
         results['read_mb_per_sec'] = 0
     finally:
         # Cleanup
-        import shutil
         if os.path.exists(test_dir):
             shutil.rmtree(test_dir, ignore_errors=True)
         if os.path.exists('/tmp/fio_concurrent.job'):
@@ -1035,6 +1038,196 @@ stonewall
     elapsed = time.time() - start_time
     results['elapsed_sec'] = round(elapsed, 1)
     log_info(f"✓ Test completed in {elapsed:.1f}s")
+    
+    return results
+
+def test_blocksize_concurrency_matrix(block_sizes=None, concurrency_levels=None, file_size_mb=128, test_dir='/tmp/swap_test', runtime_sec=5):
+    """
+    Test block size × concurrency matrix to find optimal configuration
+    
+    This tests all combinations of block sizes and concurrency levels to discover
+    which configuration provides the best throughput for the specific hardware.
+    
+    Args:
+        block_sizes: List of block sizes in KB (default: [4, 8, 16, 32, 64, 128])
+        concurrency_levels: List of concurrency levels (default: [1, 2, 4, 8, 16])
+        file_size_mb: Size of each file in MB
+        test_dir: Directory for test files
+        runtime_sec: Test runtime in seconds
+    
+    Returns:
+        Dictionary with matrix results and optimal configuration
+    """
+    start_time = time.time()
+    
+    if block_sizes is None:
+        block_sizes = [4, 8, 16, 32, 64, 128]
+    if concurrency_levels is None:
+        concurrency_levels = [1, 2, 4, 8, 16]
+    
+    total_combinations = len(block_sizes) * len(concurrency_levels)
+    log_step_ts(f"Block Size × Concurrency Matrix Test ({total_combinations} combinations)")
+    log_info(f"Block sizes: {block_sizes} KB")
+    log_info(f"Concurrency levels: {concurrency_levels}")
+    log_info(f"Runtime per test: {runtime_sec}s")
+    
+    results = {
+        'block_sizes': block_sizes,
+        'concurrency_levels': concurrency_levels,
+        'matrix': [],
+        'timestamp': datetime.now().isoformat()
+    }
+    
+    # Create test directory
+    os.makedirs(test_dir, exist_ok=True)
+    
+    # Test each combination
+    test_num = 0
+    for block_size in block_sizes:
+        for concurrency in concurrency_levels:
+            test_num += 1
+            progress_str = f"[{test_num}/{total_combinations}]"
+            log_info_ts(f"{progress_str} Testing {block_size}KB × {concurrency} jobs...")
+            
+            # Create fio job for this combination
+            fio_job = f"""
+[global]
+ioengine=libaio
+direct=1
+size={file_size_mb}m
+directory={test_dir}
+numjobs={concurrency}
+group_reporting
+runtime={runtime_sec}
+time_based
+
+[matrix_write]
+rw=write
+bs={block_size}k
+
+[matrix_read]
+rw=read
+bs={block_size}k
+stonewall
+"""
+            
+            try:
+                with open('/tmp/fio_matrix.job', 'w') as f:
+                    f.write(fio_job)
+                
+                log_debug_ts(f"fio command: fio --output-format=json /tmp/fio_matrix.job")
+                
+                result = subprocess.run(
+                    ['fio', '--output-format=json', '/tmp/fio_matrix.job'],
+                    capture_output=True,
+                    text=True,
+                    timeout=300
+                )
+                
+                if result.returncode == 0:
+                    data = json.loads(result.stdout)
+                    
+                    # Validate data structure
+                    if 'jobs' not in data or len(data['jobs']) < 2:
+                        raise ValueError("Incomplete fio results")
+                    
+                    # Extract performance metrics
+                    write_bw = data['jobs'][0]['write']['bw'] / 1024  # MB/s
+                    read_bw = data['jobs'][1]['read']['bw'] / 1024  # MB/s
+                    write_iops = int(round(data['jobs'][0]['write']['iops'], 0))
+                    read_iops = int(round(data['jobs'][1]['read']['iops'], 0))
+                    
+                    matrix_result = {
+                        'block_size_kb': block_size,
+                        'concurrency': concurrency,
+                        'write_mb_per_sec': round(write_bw, 2),
+                        'read_mb_per_sec': round(read_bw, 2),
+                        'write_iops': write_iops,
+                        'read_iops': read_iops
+                    }
+                    
+                    results['matrix'].append(matrix_result)
+                    
+                    log_info(f"  Write: {write_bw:.2f} MB/s ({write_iops} IOPS)")
+                    log_info(f"  Read: {read_bw:.2f} MB/s ({read_iops} IOPS)")
+                else:
+                    raise subprocess.CalledProcessError(result.returncode, 'fio', result.stderr)
+            
+            except subprocess.TimeoutExpired as e:
+                log_error(f"Matrix test {block_size}KB × {concurrency} timed out")
+                results['matrix'].append({
+                    'block_size_kb': block_size,
+                    'concurrency': concurrency,
+                    'error': 'Timeout',
+                    'write_mb_per_sec': 0,
+                    'read_mb_per_sec': 0
+                })
+            except Exception as e:
+                log_error(f"Matrix test {block_size}KB × {concurrency} failed: {e}")
+                results['matrix'].append({
+                    'block_size_kb': block_size,
+                    'concurrency': concurrency,
+                    'error': str(e),
+                    'write_mb_per_sec': 0,
+                    'read_mb_per_sec': 0
+                })
+    
+    # Find optimal configuration
+    if results['matrix']:
+        # Find best write throughput
+        best_write = max(results['matrix'], key=lambda x: x.get('write_mb_per_sec', 0))
+        best_read = max(results['matrix'], key=lambda x: x.get('read_mb_per_sec', 0))
+        
+        # Calculate combined score (write + read)
+        for r in results['matrix']:
+            r['combined_mb_per_sec'] = r.get('write_mb_per_sec', 0) + r.get('read_mb_per_sec', 0)
+        
+        best_combined = max(results['matrix'], key=lambda x: x.get('combined_mb_per_sec', 0))
+        
+        results['optimal'] = {
+            'best_write': {
+                'block_size_kb': best_write['block_size_kb'],
+                'concurrency': best_write['concurrency'],
+                'throughput_mb_per_sec': best_write['write_mb_per_sec']
+            },
+            'best_read': {
+                'block_size_kb': best_read['block_size_kb'],
+                'concurrency': best_read['concurrency'],
+                'throughput_mb_per_sec': best_read['read_mb_per_sec']
+            },
+            'best_combined': {
+                'block_size_kb': best_combined['block_size_kb'],
+                'concurrency': best_combined['concurrency'],
+                'throughput_mb_per_sec': best_combined['combined_mb_per_sec']
+            }
+        }
+        
+        log_success_ts("Matrix testing complete!")
+        log_info(f"Optimal configuration:")
+        log_info(f"  Best write: {best_write['block_size_kb']}KB × {best_write['concurrency']} jobs = {best_write['write_mb_per_sec']} MB/s")
+        log_info(f"  Best read: {best_read['block_size_kb']}KB × {best_read['concurrency']} jobs = {best_read['read_mb_per_sec']} MB/s")
+        log_info(f"  Best combined: {best_combined['block_size_kb']}KB × {best_combined['concurrency']} jobs = {best_combined['combined_mb_per_sec']} MB/s")
+        
+        # Generate recommendations for vm.page-cluster
+        block_to_cluster = {4: 0, 8: 1, 16: 2, 32: 3, 64: 4, 128: 5}
+        recommended_cluster = block_to_cluster.get(best_combined['block_size_kb'], 3)
+        results['optimal']['recommended_page_cluster'] = recommended_cluster
+        results['optimal']['recommended_swap_stripe_width'] = best_combined['concurrency']
+        
+        log_info(f"Recommended settings:")
+        log_info(f"  SWAP_PAGE_CLUSTER={recommended_cluster} (for {best_combined['block_size_kb']}KB blocks)")
+        log_info(f"  SWAP_STRIPE_WIDTH={best_combined['concurrency']}")
+    
+    # Cleanup
+    if os.path.exists(test_dir):
+        shutil.rmtree(test_dir, ignore_errors=True)
+    if os.path.exists('/tmp/fio_matrix.job'):
+        os.remove('/tmp/fio_matrix.job')
+    
+    # Log completion time
+    elapsed = time.time() - start_time
+    results['elapsed_sec'] = round(elapsed, 1)
+    log_info(f"✓ Matrix test completed in {elapsed:.1f}s")
     
     return results
 
@@ -1065,6 +1258,485 @@ def compare_memory_only():
         log_info(f"  lz4:  {results['zram_lz4']['compression_ratio']}x compression")
         log_info(f"  zstd: {results['zram_zstd']['compression_ratio']}x compression")
         log_info(f"  zstd advantage: {results['zram_zstd']['compression_ratio'] / results['zram_lz4']['compression_ratio']:.2f}x")
+    
+    return results
+
+def get_device_io_stats(device_path):
+    """
+    Get I/O statistics for a block device from /sys/block or /proc/diskstats
+    
+    Returns dict with sectors_read, sectors_written, sector_size, etc.
+    """
+    stats = {
+        'sectors_read': 0,
+        'sectors_written': 0,
+        'read_ios': 0,
+        'write_ios': 0,
+        'sector_size': 512  # Default, will try to read actual value
+    }
+    
+    try:
+        # Extract device name from path (e.g., /dev/vda3 -> vda)
+        import re
+        device_match = re.search(r'/dev/([a-z]+)\d*', device_path)
+        if not device_match:
+            return stats
+        
+        base_device = device_match.group(1)
+        
+        # Get actual sector size from sysfs (usually 512, but can be 4096 for advanced format drives)
+        sector_size_path = f'/sys/block/{base_device}/queue/hw_sector_size'
+        try:
+            if os.path.exists(sector_size_path):
+                with open(sector_size_path, 'r') as f:
+                    stats['sector_size'] = int(f.read().strip())
+                    log_debug(f"Device {base_device} sector size: {stats['sector_size']} bytes")
+        except Exception as e:
+            log_debug(f"Could not read sector size, using default 512: {e}")
+        
+        # Try reading from /sys/block first
+        stat_path = f'/sys/block/{base_device}/stat'
+        if os.path.exists(stat_path):
+            with open(stat_path, 'r') as f:
+                parts = f.read().split()
+                if len(parts) >= 10:
+                    stats['read_ios'] = int(parts[0])
+                    stats['sectors_read'] = int(parts[2])
+                    stats['write_ios'] = int(parts[4])
+                    stats['sectors_written'] = int(parts[6])
+                    return stats
+        
+        # Fallback to /proc/diskstats
+        with open('/proc/diskstats', 'r') as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 14 and parts[2] == base_device:
+                    stats['read_ios'] = int(parts[3])
+                    stats['sectors_read'] = int(parts[5])
+                    stats['write_ios'] = int(parts[7])
+                    stats['sectors_written'] = int(parts[9])
+                    break
+    except Exception as e:
+        log_debug(f"Could not read device stats: {e}")
+    
+    return stats
+
+def benchmark_zswap_comprehensive(swap_device='/dev/vda4', test_size_mb=256, compressor='lz4', zpool='z3fold', max_pool_percent=20):
+    """
+    Comprehensive ZSWAP benchmarking using same methodology as ZRAM tests:
+    - RAM compression performance (using mem_pressure like ZRAM tests)
+    - Compression ratio measurement
+    - Disk overflow detection via device I/O counters
+    - Writeback statistics from ZSWAP debugfs
+    
+    This ensures fair comparison between ZSWAP and ZRAM.
+    
+    Args:
+        swap_device: Swap partition device (e.g., /dev/vda4)
+        test_size_mb: Size of memory to test in MB
+        compressor: Compression algorithm (lz4, zstd, lzo-rle)
+        zpool: Memory pool (z3fold, zbud, zsmalloc)
+        max_pool_percent: Max % of RAM for ZSWAP pool (default 20%)
+    
+    Returns:
+        Dictionary with comprehensive ZSWAP metrics
+    """
+    start_time = time.time()
+    log_step_ts(f"Comprehensive ZSWAP Benchmark: {compressor} + {zpool}")
+    log_info(f"Using swap device: {swap_device}")
+    log_info(f"Max pool percent: {max_pool_percent}%")
+    
+    results = {
+        'compressor': compressor,
+        'zpool': zpool,
+        'swap_device': swap_device,
+        'test_size_mb': test_size_mb,
+        'max_pool_percent': max_pool_percent,
+        'timestamp': datetime.now().isoformat()
+    }
+    
+    mem_locker_proc = None
+    
+    try:
+        # Step 1: Check if swap device exists and is a block device
+        if not os.path.exists(swap_device):
+            log_error(f"Swap device {swap_device} does not exist")
+            results['error'] = f'Swap device not found: {swap_device}'
+            return results
+        
+        if not os.path.isfile(swap_device) and not os.path.exists(swap_device):
+            log_error(f"{swap_device} is not a valid block device")
+            results['error'] = f'Invalid device: {swap_device}'
+            return results
+        
+        # Step 2: Format and enable swap device
+        log_info(f"Formatting {swap_device} as swap...")
+        try:
+            subprocess.run(['mkswap', swap_device], capture_output=True, check=True)
+            subprocess.run(['swapon', swap_device], capture_output=True, check=True)
+            log_success(f"Swap device {swap_device} enabled")
+        except subprocess.CalledProcessError as e:
+            log_error(f"Failed to setup swap device: {e}")
+            results['error'] = f'Failed to setup swap: {e}'
+            return results
+        
+        # Step 3: Check if ZSWAP is available
+        if not os.path.exists('/sys/module/zswap'):
+            log_error("ZSWAP not available (module not loaded)")
+            results['error'] = 'ZSWAP module not available'
+            return results
+        
+        # Step 4: Configure ZSWAP
+        log_info("Configuring ZSWAP...")
+        
+        # Enable ZSWAP
+        with open('/sys/module/zswap/parameters/enabled', 'w') as f:
+            f.write('Y')
+        
+        # Set compressor
+        try:
+            with open('/sys/module/zswap/parameters/compressor', 'w') as f:
+                f.write(compressor)
+            log_info(f"Set compressor to {compressor}")
+        except Exception as e:
+            log_warn(f"Could not set compressor to {compressor}: {e}")
+        
+        # Set zpool
+        try:
+            with open('/sys/module/zswap/parameters/zpool', 'w') as f:
+                f.write(zpool)
+            log_info(f"Set zpool to {zpool}")
+        except Exception as e:
+            log_warn(f"Could not set zpool to {zpool}: {e}")
+        
+        # Set max pool percent
+        try:
+            with open('/sys/module/zswap/parameters/max_pool_percent', 'w') as f:
+                f.write(str(max_pool_percent))
+            log_info(f"Set max_pool_percent to {max_pool_percent}%")
+        except Exception as e:
+            log_warn(f"Could not set max_pool_percent: {e}")
+        
+        log_success(f"ZSWAP enabled: {compressor} + {zpool}")
+        
+        # Step 5: Get initial device I/O stats
+        initial_device_stats = get_device_io_stats(swap_device)
+        log_debug(f"Initial device stats: {initial_device_stats}")
+        
+        # Step 6: Get initial ZSWAP stats
+        def get_zswap_stats():
+            stats = {}
+            debugfs_path = '/sys/kernel/debug/zswap'
+            
+            if os.path.exists(debugfs_path):
+                try:
+                    for stat_file in ['pool_total_size', 'stored_pages', 'pool_limit_hit', 'written_back_pages', 'reject_compress_poor', 'reject_alloc_fail']:
+                        stat_path = os.path.join(debugfs_path, stat_file)
+                        if os.path.exists(stat_path):
+                            with open(stat_path, 'r') as f:
+                                stats[stat_file] = int(f.read().strip())
+                except Exception as e:
+                    log_debug(f"Could not read debugfs stats: {e}")
+            
+            return stats
+        
+        initial_zswap_stats = get_zswap_stats()
+        log_debug(f"Initial ZSWAP stats: {initial_zswap_stats}")
+        
+        # Step 7: Run memory pressure test (SAME as ZRAM test)
+        log_info("Running memory pressure test (same methodology as ZRAM)...")
+        
+        # Use mem_locker if available
+        script_dir = Path(__file__).parent
+        mem_locker_path = script_dir / 'mem_locker'
+        
+        # Calculate memory distribution
+        test_alloc_mb, lock_mb, available_mb = calculate_memory_distribution(test_size_mb)
+        
+        if lock_mb > 100 and mem_locker_path.exists():
+            try:
+                log_info_ts(f"Starting mem_locker to reserve {lock_mb}MB of free RAM...")
+                mem_locker_proc = subprocess.Popen(
+                    [str(mem_locker_path), str(lock_mb)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                time.sleep(2)
+                
+                if mem_locker_proc.poll() is not None:
+                    log_warn("mem_locker exited prematurely, continuing without it")
+                    mem_locker_proc = None
+                else:
+                    log_info(f"✓ mem_locker running (PID: {mem_locker_proc.pid})")
+            except Exception as e:
+                log_warn(f"Failed to start mem_locker: {e}")
+                mem_locker_proc = None
+        
+        # Get available memory and calculate allocation size
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                meminfo = f.read()
+            mem_available_kb = 0
+            for line in meminfo.split('\n'):
+                if line.startswith('MemAvailable:'):
+                    mem_available_kb = int(line.split()[1])
+                    break
+            
+            # Allocate more than available to force swapping
+            alloc_size_mb = max(test_size_mb, (mem_available_kb // 1024) + test_size_mb)
+            log_info(f"Allocating {alloc_size_mb}MB to force swapping...")
+        except:
+            alloc_size_mb = test_size_mb
+        
+        # Use mem_pressure (same as ZRAM tests)
+        mem_pressure_path = script_dir / 'mem_pressure'
+        
+        if not mem_pressure_path.exists():
+            log_error(f"mem_pressure program not found at {mem_pressure_path}")
+            results['error'] = "mem_pressure program not found"
+            return results
+        
+        log_info_ts(f"Running mem_pressure ({alloc_size_mb}MB)...")
+        
+        try:
+            result = subprocess.run(
+                [str(mem_pressure_path), str(alloc_size_mb), '0', '15'],
+                capture_output=True,
+                text=True,
+                timeout=COMPRESSION_TEST_TIMEOUT_SEC
+            )
+            
+            if result.returncode != 0:
+                log_error(f"mem_pressure failed: {result.stderr}")
+                results['error'] = f"mem_pressure failed: {result.stderr}"
+                return results
+            
+            log_info("Memory pressure test completed")
+        except subprocess.TimeoutExpired:
+            log_error(f"Memory pressure test timed out after {COMPRESSION_TEST_TIMEOUT_SEC}s")
+            results['error'] = 'Timeout'
+            return results
+        
+        # Step 8: Get final stats
+        final_device_stats = get_device_io_stats(swap_device)
+        final_zswap_stats = get_zswap_stats()
+        
+        log_debug(f"Final device stats: {final_device_stats}")
+        log_debug(f"Final ZSWAP stats: {final_zswap_stats}")
+        
+        # Step 9: Calculate compression metrics (from ZSWAP pool)
+        if 'pool_total_size' in final_zswap_stats and 'stored_pages' in final_zswap_stats:
+            pool_size_bytes = final_zswap_stats['pool_total_size']
+            stored_pages = final_zswap_stats['stored_pages']
+            uncompressed_bytes = stored_pages * 4096  # 4KB pages
+            
+            results['pool_size_mb'] = round(pool_size_bytes / (1024 * 1024), 2)
+            results['stored_pages'] = stored_pages
+            results['uncompressed_mb'] = round(uncompressed_bytes / (1024 * 1024), 2)
+            
+            if pool_size_bytes > 0:
+                compression_ratio = uncompressed_bytes / pool_size_bytes
+                results['compression_ratio'] = round(compression_ratio, 2)
+                log_info(f"  Compression ratio: {compression_ratio:.2f}x")
+                log_info(f"  Pool size: {results['pool_size_mb']:.2f}MB (compressed)")
+                log_info(f"  Original size: {results['uncompressed_mb']:.2f}MB (uncompressed)")
+            else:
+                log_warn("No data in ZSWAP pool")
+        
+        # Step 10: Calculate disk overflow metrics
+        sectors_written_delta = final_device_stats['sectors_written'] - initial_device_stats['sectors_written']
+        sectors_read_delta = final_device_stats['sectors_read'] - initial_device_stats['sectors_read']
+        write_ios_delta = final_device_stats['write_ios'] - initial_device_stats['write_ios']
+        read_ios_delta = final_device_stats['read_ios'] - initial_device_stats['read_ios']
+        
+        # Get sector size (typically 512, but can be 4096 for advanced format drives)
+        sector_size = final_device_stats.get('sector_size', 512)
+        
+        # Convert sectors to MB using actual sector size
+        mb_written = (sectors_written_delta * sector_size) / (1024 * 1024)
+        mb_read = (sectors_read_delta * sector_size) / (1024 * 1024)
+        
+        results['disk_mb_written'] = round(mb_written, 2)
+        results['disk_mb_read'] = round(mb_read, 2)
+        results['disk_write_ios'] = write_ios_delta
+        results['disk_read_ios'] = read_ios_delta
+        
+        log_info(f"  Disk overflow: {mb_written:.2f}MB written, {mb_read:.2f}MB read")
+        log_info(f"  Disk I/Os: {write_ios_delta} writes, {read_ios_delta} reads")
+        
+        # Step 11: ZSWAP writeback stats
+        if 'written_back_pages' in final_zswap_stats and 'written_back_pages' in initial_zswap_stats:
+            pages_written_back = final_zswap_stats['written_back_pages'] - initial_zswap_stats.get('written_back_pages', 0)
+            mb_written_back = (pages_written_back * 4096) / (1024 * 1024)
+            results['zswap_writeback_pages'] = pages_written_back
+            results['zswap_writeback_mb'] = round(mb_written_back, 2)
+            log_info(f"  ZSWAP writeback: {pages_written_back} pages ({mb_written_back:.2f}MB)")
+        
+        if 'pool_limit_hit' in final_zswap_stats:
+            pool_limit_hits = final_zswap_stats['pool_limit_hit'] - initial_zswap_stats.get('pool_limit_hit', 0)
+            results['pool_limit_hits'] = pool_limit_hits
+            if pool_limit_hits > 0:
+                log_info(f"  Pool limit hit {pool_limit_hits} times (triggered writeback)")
+        
+        if 'reject_compress_poor' in final_zswap_stats:
+            rejects = final_zswap_stats['reject_compress_poor'] - initial_zswap_stats.get('reject_compress_poor', 0)
+            if rejects > 0:
+                results['reject_compress_poor'] = rejects
+                log_info(f"  Rejected {rejects} pages (poor compression)")
+        
+        log_success("ZSWAP benchmark complete")
+        
+    except Exception as e:
+        log_error(f"ZSWAP benchmark failed: {e}")
+        import traceback
+        log_debug(f"Traceback: {traceback.format_exc()}")
+        results['error'] = str(e)
+    
+    finally:
+        # Cleanup mem_locker if it was started
+        if mem_locker_proc is not None:
+            try:
+                log_info("Stopping mem_locker...")
+                mem_locker_proc.terminate()
+                mem_locker_proc.wait(timeout=5)
+                log_info("✓ mem_locker stopped")
+            except subprocess.TimeoutExpired:
+                log_warn("mem_locker didn't stop gracefully, killing it")
+                mem_locker_proc.kill()
+                mem_locker_proc.wait()
+            except Exception as e:
+                log_warn(f"Error stopping mem_locker: {e}")
+        
+        # Cleanup swap
+        try:
+            subprocess.run(['swapoff', swap_device], capture_output=True)
+        except Exception as e:
+            log_debug(f"Swapoff warning: {e}")
+        
+        # Disable ZSWAP
+        try:
+            if os.path.exists('/sys/module/zswap/parameters/enabled'):
+                with open('/sys/module/zswap/parameters/enabled', 'w') as f:
+                    f.write('N')
+        except Exception as e:
+            log_debug(f"ZSWAP disable warning: {e}")
+    
+    # Log completion time
+    elapsed = time.time() - start_time
+    results['elapsed_sec'] = round(elapsed, 1)
+    log_info(f"✓ ZSWAP benchmark completed in {elapsed:.1f}s")
+    
+    return results
+
+def compare_zswap_vs_zram(swap_device='/dev/vda4', test_size_mb=256):
+    """
+    Compare ZSWAP vs ZRAM performance using identical testing methodology
+    
+    Tests both systems with lz4 and zstd compressors using the same
+    mem_pressure tool for fair comparison. Provides comprehensive metrics:
+    - Compression ratio (RAM efficiency)
+    - Memory pressure handling
+    - For ZSWAP: disk overflow behavior via device counters
+    
+    Args:
+        swap_device: Swap partition for ZSWAP backing (e.g., /dev/vda4)
+        test_size_mb: Size of memory to test in MB
+    
+    Returns:
+        Dictionary with comparison results
+    """
+    log_step_ts("Comparing ZSWAP vs ZRAM (identical methodology)")
+    
+    results = {
+        'test_size_mb': test_size_mb,
+        'swap_device': swap_device,
+        'timestamp': datetime.now().isoformat(),
+        'zram': {},
+        'zswap': {}
+    }
+    
+    # Test ZRAM with lz4
+    log_info("\n=== Testing ZRAM with lz4 ===")
+    try:
+        results['zram']['lz4'] = benchmark_compression('lz4', 'zsmalloc', test_size_mb)
+    except Exception as e:
+        log_error(f"ZRAM lz4 test failed: {e}")
+        results['zram']['lz4'] = {'error': str(e)}
+    
+    # Test ZRAM with zstd
+    log_info("\n=== Testing ZRAM with zstd ===")
+    try:
+        results['zram']['zstd'] = benchmark_compression('zstd', 'zsmalloc', test_size_mb)
+    except Exception as e:
+        log_error(f"ZRAM zstd test failed: {e}")
+        results['zram']['zstd'] = {'error': str(e)}
+    
+    # Test ZSWAP with lz4
+    log_info("\n=== Testing ZSWAP with lz4 ===")
+    try:
+        results['zswap']['lz4'] = benchmark_zswap_comprehensive(
+            swap_device=swap_device,
+            test_size_mb=test_size_mb,
+            compressor='lz4',
+            zpool='z3fold',
+            max_pool_percent=20
+        )
+    except Exception as e:
+        log_error(f"ZSWAP lz4 test failed: {e}")
+        results['zswap']['lz4'] = {'error': str(e)}
+    
+    # Test ZSWAP with zstd
+    log_info("\n=== Testing ZSWAP with zstd ===")
+    try:
+        results['zswap']['zstd'] = benchmark_zswap_comprehensive(
+            swap_device=swap_device,
+            test_size_mb=test_size_mb,
+            compressor='zstd',
+            zpool='z3fold',
+            max_pool_percent=20
+        )
+    except Exception as e:
+        log_error(f"ZSWAP zstd test failed: {e}")
+        results['zswap']['zstd'] = {'error': str(e)}
+    
+    # Generate comparison summary
+    log_info("\n=== Comparison Summary ===")
+    
+    for comp in ['lz4', 'zstd']:
+        log_info(f"\n{comp.upper()} Compressor:")
+        
+        # ZRAM metrics
+        if 'compression_ratio' in results['zram'].get(comp, {}):
+            zram_ratio = results['zram'][comp]['compression_ratio']
+            log_info(f"  ZRAM compression: {zram_ratio:.2f}x")
+            
+            if 'orig_size_mb' in results['zram'][comp]:
+                log_info(f"    Original: {results['zram'][comp]['orig_size_mb']:.2f}MB")
+                log_info(f"    Compressed: {results['zram'][comp]['compr_size_mb']:.2f}MB")
+        
+        # ZSWAP metrics
+        if 'compression_ratio' in results['zswap'].get(comp, {}):
+            zswap_ratio = results['zswap'][comp]['compression_ratio']
+            log_info(f"  ZSWAP compression: {zswap_ratio:.2f}x")
+            
+            if 'uncompressed_mb' in results['zswap'][comp]:
+                log_info(f"    Original: {results['zswap'][comp]['uncompressed_mb']:.2f}MB")
+                log_info(f"    Compressed: {results['zswap'][comp]['pool_size_mb']:.2f}MB")
+        
+        # ZSWAP disk overflow
+        if 'disk_mb_written' in results['zswap'].get(comp, {}):
+            disk_written = results['zswap'][comp]['disk_mb_written']
+            if disk_written > 0:
+                log_info(f"  ZSWAP disk overflow: {disk_written:.2f}MB written to disk")
+                
+                if 'zswap_writeback_mb' in results['zswap'][comp]:
+                    log_info(f"    Via ZSWAP writeback: {results['zswap'][comp]['zswap_writeback_mb']:.2f}MB")
+                
+                if 'pool_limit_hits' in results['zswap'][comp]:
+                    log_info(f"    Pool limit hits: {results['zswap'][comp]['pool_limit_hits']}")
+            else:
+                log_info(f"  ZSWAP: All data stayed in RAM (no disk overflow)")
     
     return results
 
@@ -2207,6 +2879,14 @@ Examples:
                        help='Compare ZRAM configurations')
     parser.add_argument('--test-concurrency', type=int, metavar='N',
                        help='Test concurrency with N swap files')
+    parser.add_argument('--test-matrix', action='store_true',
+                       help='Test block size × concurrency matrix to find optimal configuration')
+    parser.add_argument('--test-zswap', action='store_true',
+                       help='Run comprehensive ZSWAP benchmarks (requires swap backing device)')
+    parser.add_argument('--zswap-device', metavar='DEVICE', default='/dev/vda4',
+                       help='Swap device for ZSWAP backing (default: /dev/vda4)')
+    parser.add_argument('--compare-zswap-zram', action='store_true',
+                       help='Compare ZSWAP vs ZRAM performance')
     parser.add_argument('--test-latency', action='store_true',
                        help='Run comprehensive latency comparison tests')
     parser.add_argument('--latency-size', type=int, metavar='MB', default=100,
@@ -2305,6 +2985,16 @@ Examples:
     if args.test_all or args.test_concurrency:
         file_counts = [1, 2, 4, 8, 16] if args.test_all else [args.test_concurrency]
         total_tests += len(file_counts)
+    
+    if args.test_matrix or args.test_all:
+        # Matrix test counts as one comprehensive test
+        total_tests += 1
+    
+    if args.test_zswap:
+        total_tests += 2  # lz4 and zstd
+    
+    if args.compare_zswap_zram:
+        total_tests += 4  # ZRAM lz4, ZRAM zstd, ZSWAP lz4, ZSWAP zstd
     
     if args.compare_memory_only:
         total_tests += 2  # lz4 and zstd
@@ -2410,6 +3100,56 @@ Examples:
                     'read_mb_per_sec': 0
                 })
     
+    # Matrix testing (block size × concurrency)
+    if args.test_matrix or args.test_all:
+        try:
+            log_info_ts("\n=== Running Block Size × Concurrency Matrix Test ===")
+            results['matrix'] = test_blocksize_concurrency_matrix(
+                runtime_sec=args.duration
+            )
+        except Exception as e:
+            log_error(f"Matrix test failed: {e}")
+            results['matrix'] = {'error': str(e)}
+    
+    # ZSWAP benchmarks
+    if args.test_zswap:
+        try:
+            log_info_ts("\n=== Running ZSWAP Benchmarks ===")
+            results['zswap'] = {}
+            
+            # Test with lz4
+            log_info("Testing ZSWAP with lz4...")
+            results['zswap']['lz4'] = benchmark_zswap_comprehensive(
+                swap_device=args.zswap_device,
+                compressor='lz4',
+                zpool='z3fold',
+                test_size_mb=compression_test_size
+            )
+            
+            # Test with zstd
+            log_info("Testing ZSWAP with zstd...")
+            results['zswap']['zstd'] = benchmark_zswap_comprehensive(
+                swap_device=args.zswap_device,
+                compressor='zstd',
+                zpool='z3fold',
+                test_size_mb=compression_test_size
+            )
+        except Exception as e:
+            log_error(f"ZSWAP benchmark failed: {e}")
+            results['zswap'] = {'error': str(e)}
+    
+    # ZSWAP vs ZRAM comparison
+    if args.compare_zswap_zram:
+        try:
+            log_info_ts("\n=== Comparing ZSWAP vs ZRAM ===")
+            results['zswap_vs_zram'] = compare_zswap_vs_zram(
+                swap_device=args.zswap_device,
+                test_size_mb=compression_test_size
+            )
+        except Exception as e:
+            log_error(f"ZSWAP vs ZRAM comparison failed: {e}")
+            results['zswap_vs_zram'] = {'error': str(e)}
+    
     if args.compare_memory_only:
         results['memory_only_comparison'] = compare_memory_only()
     
@@ -2427,7 +3167,6 @@ Examples:
         '/tmp/swap_test*',
         '/tmp/ptable-*',
     ]
-    import glob
     for pattern in cleanup_patterns:
         try:
             for f in glob.glob(pattern):
