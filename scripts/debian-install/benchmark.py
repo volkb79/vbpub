@@ -1919,10 +1919,15 @@ def generate_charts(results, output_dir='/var/log/debian-install', webp=False):
                     try:
                         img = Image.open(png_file)
                         img.save(webp_file, 'WEBP', quality=85, method=6)
-                        webp_files.append(webp_file)
-                        # Remove original PNG to save space
-                        os.remove(png_file)
-                        log_info(f"Converted {os.path.basename(png_file)} to WebP")
+                        # Verify the WebP file was created successfully
+                        if os.path.exists(webp_file) and os.path.getsize(webp_file) > 0:
+                            webp_files.append(webp_file)
+                            # Remove original PNG only after successful conversion
+                            os.remove(png_file)
+                            log_info(f"Converted {os.path.basename(png_file)} to WebP")
+                        else:
+                            log_warn(f"WebP conversion produced invalid file for {png_file}, keeping PNG")
+                            webp_files.append(png_file)
                     except Exception as e:
                         log_warn(f"Failed to convert {png_file} to WebP: {e}")
                         # Keep original PNG if conversion fails
@@ -2419,7 +2424,6 @@ Examples:
         '/tmp/fio_test*',
         '/tmp/swap_test*',
         '/tmp/ptable-*',
-        '/var/log/debian-install/benchmark-*.png',  # Keep only final charts
     ]
     import glob
     for pattern in cleanup_patterns:

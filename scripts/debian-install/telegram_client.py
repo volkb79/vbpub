@@ -8,18 +8,12 @@ import os
 import socket
 import subprocess
 import time
+import json
 
 try:
     import requests
 except ImportError:
     print("Error: requests module not found. Install with: pip3 install requests")
-    import sys
-    sys.exit(1)
-
-try:
-    import json
-except ImportError:
-    print("Error: json module not found (should be in standard library)")
     import sys
     sys.exit(1)
 

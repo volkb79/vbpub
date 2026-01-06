@@ -101,7 +101,6 @@ class GeekbenchRunner:
             result = subprocess.run(
                 ['curl', '-fsSL', '-o', tarball, url],
                 capture_output=True,
-                text=True,
                 check=True,
                 timeout=300
             )
