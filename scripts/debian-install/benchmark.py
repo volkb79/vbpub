@@ -179,6 +179,8 @@ COMPRESSION_MIN_SWAP_PERCENT = 50  # Minimum expected swap activity (50% of test
 COMPRESSION_RATIO_MIN = 1.5  # Minimum expected compression ratio
 COMPRESSION_RATIO_MAX = 4.0  # Maximum typical compression ratio
 COMPRESSION_RATIO_SUSPICIOUS = 10.0  # Ratio above this is suspicious
+MIN_VALID_COMPRESSION_RATIO = 1.1  # Minimum ratio to consider valid (below this indicates test failure)
+ZRAM_STABILIZATION_DELAY_SEC = 2  # Time to wait after ZRAM cleanup for system stabilization
 
 # Memory pressure test constants
 STRESS_NG_TIMEOUT_SEC = 15  # Timeout for stress-ng memory allocation
@@ -3257,8 +3259,8 @@ def format_benchmark_html(results):
             zswap_lat = comp['zswap'].get('avg_latency_us', 0)
             
             # Check for suspicious low ratios (likely failed tests)
-            if zram_ratio < 1.1 or zswap_ratio < 1.1:
-                html += "  ⚠️ <i>Test results appear invalid (compression ratio &lt; 1.1x)</i>\n"
+            if zram_ratio < MIN_VALID_COMPRESSION_RATIO or zswap_ratio < MIN_VALID_COMPRESSION_RATIO:
+                html += f"  ⚠️ <i>Test results appear invalid (compression ratio &lt; {MIN_VALID_COMPRESSION_RATIO}x)</i>\n"
                 html += "  <i>This may indicate test failure or insufficient memory pressure</i>\n"
             else:
                 html += f"  ZRAM:  {zram_ratio:.1f}x ratio, {zram_lat:.1f}µs latency\n"
@@ -3640,7 +3642,7 @@ Examples:
                 # Force memory refresh before each test to get accurate compression ratios
                 log_debug(f"Cleaning up ZRAM before testing allocator: {alloc}")
                 cleanup_zram_aggressive()
-                time.sleep(2)  # Let system stabilize
+                time.sleep(ZRAM_STABILIZATION_DELAY_SEC)  # Let system stabilize
                 
                 current_test += 1
                 result = benchmark_compression(
