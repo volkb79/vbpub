@@ -189,6 +189,10 @@ COMPRESSION_TEST_TIMEOUT_SEC = 300  # Maximum time per compression test (5 minut
 # FIO test configuration constants
 FIO_TEST_FILE_SIZE = '1G'  # Test file size for fio benchmarks
 
+# System RAM tier thresholds for auto-detection
+RAM_TIER_LOW_GB = 4    # Systems below this use ZRAM
+RAM_TIER_HIGH_GB = 16  # Systems above this use ZSWAP (but so do medium tier)
+
 def format_timestamp():
     """Return formatted timestamp for logging"""
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -2413,15 +2417,15 @@ def generate_swap_config_report(results, output_file):
         f.write("-" * 68 + "\n")
         
         # Determine RAM solution based on system RAM
-        if ram_gb < 4:
+        if ram_gb < RAM_TIER_LOW_GB:
             ram_solution = "zram"
-            reason = "low RAM system (<4GB)"
-        elif ram_gb < 16:
+            reason = f"low RAM system (<{RAM_TIER_LOW_GB}GB)"
+        elif ram_gb < RAM_TIER_HIGH_GB:
             ram_solution = "zswap"
-            reason = "medium RAM system (4-16GB)"
+            reason = f"medium RAM system ({RAM_TIER_LOW_GB}-{RAM_TIER_HIGH_GB}GB)"
         else:
             ram_solution = "zswap"
-            reason = "high RAM system (>16GB)"
+            reason = f"high RAM system (>{RAM_TIER_HIGH_GB}GB)"
         
         f.write(f"RAM Solution:    {ram_solution} ({reason})\n")
         f.write(f"Backing Type:    files_in_root (SSD with adequate space)\n")
@@ -3453,11 +3457,12 @@ Examples:
     log_info("Cleaning up temporary test files...")
     cleanup_test_files()
     
-    # Additional cleanup patterns specific to main test run
+    # Additional cleanup patterns for test run directories not covered by cleanup_test_files
+    # These are broader patterns that may catch test-specific subdirectories
     additional_patterns = [
-        '/tmp/fio_test*',
-        '/tmp/swap_test*',
-        '/tmp/ptable-*',
+        '/tmp/fio_test*',      # FIO test directories (not just .job files)
+        '/tmp/swap_test*',     # Swap test directories
+        '/tmp/ptable-*',       # Partition table dumps
     ]
     for pattern in additional_patterns:
         try:
@@ -3565,7 +3570,7 @@ Examples:
                     else:
                         log_warn("Failed to send charts as media group, falling back to individual messages")
                         # Fallback: send charts one by one
-                        # Use the same timestamp_str for consistency
+                        # Use the timestamp_str variable defined at line 3520 for consistency
                         for chart_file in chart_files:
                             # Handle both .png and .webp extensions
                             chart_name = os.path.basename(chart_file)
