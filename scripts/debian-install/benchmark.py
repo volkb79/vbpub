@@ -2595,6 +2595,72 @@ def generate_swap_config_report(results, output_file):
     
     log_info(f"✓ Swap configuration report saved to {output_file}")
 
+def generate_matrix_heatmaps(matrix_results, output_prefix):
+    """Generate heatmaps for matrix test results"""
+    if not MATPLOTLIB_AVAILABLE:
+        log_warn("matplotlib not available - skipping matrix heatmap generation")
+        return None
+    
+    import numpy as np
+    
+    block_sizes = matrix_results['block_sizes']
+    concurrency_levels = matrix_results['concurrency_levels'] 
+    
+    # Extract throughput data into 2D array
+    write_data = np.zeros((len(concurrency_levels), len(block_sizes)))
+    read_data = np.zeros((len(concurrency_levels), len(block_sizes)))
+    
+    for result in matrix_results['matrix']:
+        if 'error' in result:
+            continue
+        bi = block_sizes.index(result['block_size_kb'])
+        ci = concurrency_levels.index(result['concurrency'])
+        write_data[ci, bi] = result['write_mb_per_sec']
+        read_data[ci, bi] = result['read_mb_per_sec']
+    
+    # Create throughput heatmap
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    
+    im1 = ax1.imshow(write_data, cmap='YlOrRd', aspect='auto')
+    ax1.set_title('Write Throughput (MB/s)', fontsize=14, fontweight='bold')
+    ax1.set_xlabel('Block Size (KB)')
+    ax1.set_ylabel('Concurrency Level')
+    ax1.set_xticks(range(len(block_sizes)))
+    ax1.set_xticklabels(block_sizes)
+    ax1.set_yticks(range(len(concurrency_levels)))
+    ax1.set_yticklabels(concurrency_levels)
+    plt.colorbar(im1, ax=ax1)
+    
+    # Annotate cells with values
+    for i in range(len(concurrency_levels)):
+        for j in range(len(block_sizes)):
+            if write_data[i, j] > 0:
+                text = ax1.text(j, i, f'{write_data[i, j]:.0f}',
+                              ha="center", va="center", color="black", fontsize=8)
+    
+    im2 = ax2.imshow(read_data, cmap='YlGnBu', aspect='auto')
+    ax2.set_title('Read Throughput (MB/s)', fontsize=14, fontweight='bold')
+    ax2.set_xlabel('Block Size (KB)')
+    ax2.set_ylabel('Concurrency Level')
+    ax2.set_xticks(range(len(block_sizes)))
+    ax2.set_xticklabels(block_sizes)
+    ax2.set_yticks(range(len(concurrency_levels)))
+    ax2.set_yticklabels(concurrency_levels)
+    plt.colorbar(im2, ax=ax2)
+    
+    for i in range(len(concurrency_levels)):
+        for j in range(len(block_sizes)):
+            if read_data[i, j] > 0:
+                text = ax2.text(j, i, f'{read_data[i, j]:.0f}',
+                              ha="center", va="center", color="black", fontsize=8)
+    
+    plt.tight_layout()
+    output_file = f'{output_prefix}-matrix-throughput.png'
+    plt.savefig(output_file, dpi=150, bbox_inches='tight')
+    plt.close()
+    log_info(f"Generated matrix throughput heatmap: {output_file}")
+    return output_file
+
 def generate_charts(results, output_dir='/var/log/debian-install', webp=False):
     """
     Generate matplotlib charts for benchmark results
@@ -3283,6 +3349,35 @@ def format_benchmark_html(results):
                     
                     html += f"  {r['compressor']:6s}+{r['allocator']:8s}({pattern}): {bar} {avg_us:6.1f}µs{comparison}{marker}\n"
             html += "\n"
+        
+        # Add RAM vs ZRAM vs Disk latency comparison
+        if 'baseline' in lat_comp and 'write_latency' in lat_comp and 'read_latency' in lat_comp:
+            baseline = lat_comp['baseline']
+            ram_read = baseline.get('read_ns', 0)
+            ram_write = baseline.get('write_ns', 0)
+            
+            # Best ZRAM latencies
+            valid_read_tests = [t for t in lat_comp['read_latency'] if 'error' not in t and 'avg_read_us' in t]
+            valid_write_tests = [t for t in lat_comp['write_latency'] if 'error' not in t and 'avg_write_us' in t]
+            
+            if valid_read_tests and valid_write_tests and ram_read > 0 and ram_write > 0:
+                best_zram_read = min([t['avg_read_us'] for t in valid_read_tests]) * 1000  # to ns
+                best_zram_write = min([t['avg_write_us'] for t in valid_write_tests]) * 1000
+                
+                # Disk latency estimates (typical values)
+                disk_read_ns = 5000000  # ~5ms typical for HDD
+                disk_write_ns = 10000000  # ~10ms typical for HDD
+                
+                html += "<b>⚡ Latency Comparison:</b>\n"
+                html += f"  <i>Read:</i>\n"
+                html += f"  RAM:   {ram_read:8.0f} ns (baseline)\n"
+                html += f"  ZRAM:  {best_zram_read:8.0f} ns ({best_zram_read/ram_read:4.0f}× slower)\n"
+                html += f"  Disk:  {disk_read_ns/1000:8.0f} µs ({disk_read_ns/ram_read:4.0f}× slower)\n\n"
+                html += f"  <i>Write:</i>\n"
+                html += f"  RAM:   {ram_write:8.0f} ns (baseline)\n"
+                html += f"  ZRAM:  {best_zram_write:8.0f} ns ({best_zram_write/ram_write:4.0f}× slower)\n"
+                html += f"  Disk:  {disk_write_ns/1000:8.0f} µs ({disk_write_ns/ram_write:4.0f}× slower)\n"
+                html += "\n"
     
     # Memory-only comparison
     if 'memory_only_comparison' in results:
@@ -3707,6 +3802,16 @@ Examples:
                 # Generate charts (with WebP conversion if requested)
                 log_info("Generating performance charts...")
                 chart_files = generate_charts(results, webp=args.webp)
+                
+                # Generate matrix heatmaps if matrix tests were run
+                if 'matrix' in results and isinstance(results['matrix'], dict) and 'matrix' in results['matrix']:
+                    try:
+                        output_prefix = f"/var/log/debian-install/benchmark-{timestamp_str}"
+                        matrix_chart = generate_matrix_heatmaps(results['matrix'], output_prefix)
+                        if matrix_chart:
+                            chart_files.append(matrix_chart)
+                    except Exception as e:
+                        log_warn(f"Failed to generate matrix heatmaps: {e}")
                 
                 # Send HTML summary
                 html_message = format_benchmark_html(results)

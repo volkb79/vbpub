@@ -91,20 +91,30 @@ class SystemInfo:
         """Get disk information - reports full disk size, not just root partition"""
         info = {}
         
-        # Get lsblk output for comprehensive disk information
+        # Get lsblk JSON output for comprehensive disk information
         try:
-            lsblk_full = subprocess.run(
-                ['lsblk', '-o', 'NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE'],
+            lsblk_result = subprocess.run(
+                ['lsblk', '--json', '-o', 'NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE'],
                 capture_output=True,
                 text=True,
                 check=True
             )
-            info['lsblk_output'] = lsblk_full.stdout.strip()
-        except subprocess.CalledProcessError:
-            # lsblk failed, continue without this info
-            pass
-        except Exception:
-            pass
+            info['lsblk'] = json.loads(lsblk_result.stdout)
+        except:
+            # Fallback to text output if JSON not available
+            try:
+                lsblk_full = subprocess.run(
+                    ['lsblk', '-o', 'NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE'],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                info['lsblk_output'] = lsblk_full.stdout.strip()
+            except subprocess.CalledProcessError:
+                # lsblk failed, continue without this info
+                pass
+            except Exception:
+                pass
         
         try:
             # Get root partition info
@@ -220,6 +230,66 @@ class SystemInfo:
                 text=True
             )
             if result.returncode == 0:
+                info['public_ip'] = result.stdout.strip()
+                
+                # Get reverse DNS for public IP
+                rdns = self._get_reverse_dns(info['public_ip'])
+                if rdns:
+                    info['reverse_dns'] = rdns
+        except:
+            pass
+        
+        # Get hostname
+        try:
+            info['hostname'] = subprocess.run(
+                ['hostname', '-f'],
+                capture_output=True,
+                text=True
+            ).stdout.strip()
+        except:
+            pass
+        
+        return info
+    
+    def _get_reverse_dns(self, ip):
+        """Get reverse DNS for an IP address"""
+        if not ip:
+            return None
+        
+        # Try dig first
+        try:
+            result = subprocess.run(
+                ['dig', '+short', '-x', ip],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                rdns = result.stdout.strip().rstrip('.')
+                if rdns:
+                    return rdns
+        except:
+            pass
+        
+        # Fallback to host command
+        try:
+            result = subprocess.run(
+                ['host', ip],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                # Parse "X.X.X.X domain name pointer hostname.example.com."
+                for line in result.stdout.split('\n'):
+                    if 'domain name pointer' in line:
+                        rdns = line.split('domain name pointer')[1].strip().rstrip('.')
+                        if rdns:
+                            return rdns
+        except:
+            pass
+        
+        return None
                 info['public_ip'] = result.stdout.strip()
         except:
             pass
