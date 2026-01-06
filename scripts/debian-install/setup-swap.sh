@@ -1409,9 +1409,9 @@ create_swap_partition() {
     return 0
 }
 
-# Extend root partition
+# Extend root partition using dump-modify-write method
 extend_root_partition() {
-    log_step "Extending root partition"
+    log_step "Extending root partition using dump-modify-write method"
     
     # Detect layout first
     if ! detect_disk_layout; then
@@ -1424,36 +1424,115 @@ extend_root_partition() {
     
     log_info "Root filesystem: $FS_TYPE"
     log_info "Root partition: $ROOT_PARTITION"
+    log_info "Current root size: $((ROOT_SIZE / 2048))MiB"
+    log_info "Unallocated space: $((FREE_SECTORS / 2048))MiB"
     
-    # Calculate new size for root partition
-    # Formula: Total sectors - start of root - space for swap - 1 (for rounding)
+    # Calculate swap space requirements
+    # Total swap space divided by number of devices
+    SWAP_DEVICE_SIZE_GB=$((SWAP_DISK_TOTAL_GB / SWAP_STRIPE_WIDTH))
+    if [ "$SWAP_DEVICE_SIZE_GB" -lt 1 ]; then
+        SWAP_DEVICE_SIZE_GB=1
+    fi
     SWAP_SIZE_MIB=$((SWAP_DEVICE_SIZE_GB * 1024))
     SWAP_SIZE_SECTORS=$((SWAP_SIZE_MIB * 2048))
     
-    # Calculate remaining space for root in MiB
-    REMAINING_SECTORS=$((DISK_SIZE_SECTORS - ROOT_START - SWAP_SIZE_SECTORS - 1))
-    REMAINING_MIB=$((REMAINING_SECTORS / 2048))
+    # Calculate total space needed for all swap partitions
+    TOTAL_SWAP_SECTORS=$((SWAP_SIZE_SECTORS * SWAP_STRIPE_WIDTH))
+    TOTAL_SWAP_MIB=$((SWAP_SIZE_MIB * SWAP_STRIPE_WIDTH))
     
-    log_info "New root partition size: ${REMAINING_MIB}MiB"
+    log_info "Creating ${SWAP_STRIPE_WIDTH} swap partitions of ${SWAP_DEVICE_SIZE_GB}GB each"
+    log_info "Total swap space: ${TOTAL_SWAP_MIB}MiB (${SWAP_DISK_TOTAL_GB}GB)"
     
-    if [ "$REMAINING_MIB" -le 0 ]; then
-        log_error "No space available for root partition extension"
+    # Calculate new root size (use most of disk, leaving space for swap at end)
+    # Add 2048 sectors buffer for alignment
+    NEW_ROOT_SIZE_SECTORS=$((DISK_SIZE_SECTORS - ROOT_START - TOTAL_SWAP_SECTORS - 2048))
+    NEW_ROOT_SIZE_MIB=$((NEW_ROOT_SIZE_SECTORS / 2048))
+    
+    log_info "New root partition size: ${NEW_ROOT_SIZE_MIB}MiB"
+    
+    if [ "$NEW_ROOT_SIZE_SECTORS" -le "$ROOT_SIZE" ]; then
+        log_error "Not enough space to create swap partitions"
+        log_error "Current root: $((ROOT_SIZE / 2048))MiB, would be: ${NEW_ROOT_SIZE_MIB}MiB"
         return 1
     fi
     
-    # Backup current partition table
-    BACKUP_FILE="/tmp/ptable-backup-$(date +%s).dump"
-    sfdisk --dump "/dev/$ROOT_DISK" > "$BACKUP_FILE"
-    log_info "Partition table backed up to: $BACKUP_FILE"
+    # Step 1: Dump current partition table
+    log_info "Step 1: Dumping current partition table..."
+    PTABLE_DUMP="/tmp/ptable-current-$(date +%s).dump"
+    if ! sfdisk --dump "/dev/$ROOT_DISK" > "$PTABLE_DUMP" 2>&1; then
+        log_error "Failed to dump partition table"
+        return 1
+    fi
+    log_info "Partition table dumped to: $PTABLE_DUMP"
     
-    # Resize partition using sfdisk
-    # Best practice: Omit start to leave it untouched, just set new size
-    # Use --force with --no-reread for in-use disk
-    log_info "Resizing root partition ${ROOT_PART_NUM}..."
-    if echo ",${REMAINING_MIB}M" | sfdisk --force --no-reread "/dev/$ROOT_DISK" -N"${ROOT_PART_NUM}" 2>&1 | tee -a "$LOG_FILE"; then
-        log_info "Root partition resized in partition table (ioctl error is expected)"
+    # Step 2: Create modified partition table
+    log_info "Step 2: Creating modified partition table..."
+    PTABLE_NEW="/tmp/ptable-new-$(date +%s).dump"
+    
+    # Linux swap GUID type for GPT
+    SWAP_TYPE_GUID="0657FD6D-A4AB-43C4-84E5-0933C84B4F4F"
+    
+    # Parse and modify the partition table
+    {
+        # Copy header lines (label, device, unit, etc.)
+        grep -E "^(label|label-id|device|unit|first-lba|last-lba|sector-size):" "$PTABLE_DUMP"
+        echo ""
+        
+        # Process existing partition entries
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^/dev/ ]]; then
+                # Extract partition number from line
+                PART_NUM=$(echo "$line" | grep -oE '[0-9]+' | head -1)
+                
+                if [ "$PART_NUM" = "$ROOT_PART_NUM" ]; then
+                    # Modify root partition - extend its size
+                    echo "$line" | sed -E "s/size= *[0-9]+/size=${NEW_ROOT_SIZE_SECTORS}/"
+                else
+                    # Keep other partitions as-is
+                    echo "$line"
+                fi
+            fi
+        done < "$PTABLE_DUMP"
+        
+        # Add new swap partitions at the end
+        SWAP_START=$((ROOT_START + NEW_ROOT_SIZE_SECTORS))
+        
+        for i in $(seq 1 "$SWAP_STRIPE_WIDTH"); do
+            SWAP_PART_NUM=$((ROOT_PART_NUM + i))
+            
+            # Handle device naming (nvme uses p prefix, others don't)
+            if [[ "$ROOT_DISK" =~ nvme ]]; then
+                PART_NAME="/dev/${ROOT_DISK}p${SWAP_PART_NUM}"
+            else
+                PART_NAME="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
+            fi
+            
+            # Add swap partition with proper type GUID
+            # Format: /dev/vdaN : start=X, size=Y, type=GUID
+            echo "${PART_NAME} : start=${SWAP_START}, size=${SWAP_SIZE_SECTORS}, type=${SWAP_TYPE_GUID}"
+            
+            # Update start for next partition (maintain 2048-sector alignment)
+            SWAP_START=$((SWAP_START + SWAP_SIZE_SECTORS))
+            # Align to 2048 sectors
+            SWAP_START=$(( (SWAP_START + 2047) / 2048 * 2048 ))
+        done
+        
+    } > "$PTABLE_NEW"
+    
+    log_info "Modified partition table created at: $PTABLE_NEW"
+    log_info "Changes:"
+    log_info "  - Root partition (${ROOT_PART_NUM}): extended to ${NEW_ROOT_SIZE_SECTORS} sectors"
+    log_info "  - Added ${SWAP_STRIPE_WIDTH} swap partitions of ${SWAP_SIZE_SECTORS} sectors each"
+    
+    # Step 3: Write modified partition table
+    log_info "Step 3: Writing modified partition table..."
+    if sfdisk --force "/dev/$ROOT_DISK" < "$PTABLE_NEW" 2>&1 | tee -a "$LOG_FILE"; then
+        log_info "Modified partition table written (Device or resource busy is NORMAL)"
     else
-        log_warn "sfdisk reported errors - checking partition table"
+        log_error "Failed to write modified partition table"
+        log_error "Backup available at: $PTABLE_DUMP"
+        log_info "To restore: sfdisk --force /dev/$ROOT_DISK < $PTABLE_DUMP"
+        return 1
     fi
     
     # Verify partition table
@@ -1464,12 +1543,20 @@ extend_root_partition() {
         return 1
     fi
     
-    # Sync
+    # Sync and wait
     sync
     sleep 2
     
-    # Inform kernel of partition table changes
-    update_kernel_partition_table "$ROOT_DISK" "$LOG_FILE"
+    # Step 4: Update kernel partition table using partx
+    log_info "Step 4: Updating kernel partition table with partx -u..."
+    if partx -u "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
+        log_success "Kernel partition table updated"
+    else
+        log_warn "partx reported errors (may be normal for in-use disk)"
+    fi
+    
+    # Additional wait for device nodes
+    sleep 2
     
     # Verify the partition is visible to the kernel
     log_info "Verifying partition table update..."
@@ -1479,16 +1566,17 @@ extend_root_partition() {
         log_warn "⚠ Root partition not immediately visible - may require reboot"
     fi
     
-    # Resize filesystem
-    log_info "Resizing ${FS_TYPE} filesystem..."
+    # Step 5: Resize filesystem online
+    log_info "Step 5: Resizing ${FS_TYPE} filesystem online..."
     
     case "$FS_TYPE" in
         ext4|ext3|ext2)
-            # Check filesystem first (read-only check for mounted partition)
-            log_info "Checking filesystem integrity..."
+            # Check filesystem first (read-only check on mounted partition)
+            log_info "Checking filesystem integrity (read-only)..."
             e2fsck -n -v "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE" || true
             
-            # Resize filesystem
+            # Resize filesystem without size argument = expand to fill partition
+            log_info "Expanding filesystem to fill partition..."
             if resize2fs "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
                 log_success "ext4 filesystem resized successfully"
             else
@@ -1521,69 +1609,72 @@ extend_root_partition() {
     
     log_success "Root partition extended successfully"
     
-    # Now create swap partition at the end of the disk
-    log_info "Creating swap partition at end of disk..."
+    # Step 6: Format and enable swap partitions
+    log_info "Step 6: Formatting and enabling ${SWAP_STRIPE_WIDTH} swap partitions..."
     
-    # Find next partition number after root
-    LAST_PART_NUM=$(sfdisk -l "/dev/$ROOT_DISK" 2>/dev/null | grep "^/dev/" | grep -oE '[0-9]+' | tail -1)
-    if [ -z "$LAST_PART_NUM" ]; then
-        LAST_PART_NUM=$ROOT_PART_NUM
-    fi
-    SWAP_PART_NUM=$((LAST_PART_NUM + 1))
+    for i in $(seq 1 "$SWAP_STRIPE_WIDTH"); do
+        SWAP_PART_NUM=$((ROOT_PART_NUM + i))
+        
+        # Handle device naming (nvme uses p prefix, others don't)
+        if [[ "$ROOT_DISK" =~ nvme ]]; then
+            SWAP_PARTITION="/dev/${ROOT_DISK}p${SWAP_PART_NUM}"
+        else
+            SWAP_PARTITION="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
+        fi
+        
+        log_info "Processing swap partition ${i}/${SWAP_STRIPE_WIDTH}: ${SWAP_PARTITION}"
+        
+        # Wait for device node to appear
+        for retry in {1..5}; do
+            if [ -b "$SWAP_PARTITION" ]; then
+                break
+            fi
+            log_debug "Waiting for ${SWAP_PARTITION} to appear (attempt ${retry}/5)..."
+            sleep 1
+        done
+        
+        if [ ! -b "$SWAP_PARTITION" ]; then
+            log_error "Swap partition ${SWAP_PARTITION} not found"
+            continue
+        fi
+        
+        # Format as swap
+        log_info "Formatting ${SWAP_PARTITION} as swap..."
+        if mkswap "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
+            log_success "Swap partition ${i} formatted"
+        else
+            log_error "Failed to format swap partition ${i}"
+            continue
+        fi
+        
+        # Enable swap
+        log_info "Enabling swap partition ${i}..."
+        if swapon -p "$SWAP_PRIORITY" "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
+            log_success "Swap partition ${i} enabled"
+        else
+            log_error "Failed to enable swap partition ${i}"
+            continue
+        fi
+        
+        # Add to fstab with PARTUUID for stability
+        PARTUUID=$(blkid -s PARTUUID -o value "$SWAP_PARTITION" 2>/dev/null)
+        if [ -n "$PARTUUID" ]; then
+            if ! grep -q "$PARTUUID" /etc/fstab 2>/dev/null; then
+                echo "PARTUUID=${PARTUUID} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+                log_info "Added swap ${i} to /etc/fstab using PARTUUID"
+            fi
+        else
+            if ! grep -q "$SWAP_PARTITION" /etc/fstab 2>/dev/null; then
+                echo "${SWAP_PARTITION} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+                log_info "Added swap ${i} to /etc/fstab using device path"
+            fi
+        fi
+        
+        log_success "Swap partition ${i}/${SWAP_STRIPE_WIDTH} complete: ${SWAP_PARTITION}"
+    done
     
-    # Handle device naming (nvme uses p prefix, others don't)
-    if [[ "$ROOT_DISK" =~ nvme ]]; then
-        SWAP_PARTITION="/dev/${ROOT_DISK}p${SWAP_PART_NUM}"
-    else
-        SWAP_PARTITION="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
-    fi
-    
-    log_info "Creating swap partition ${SWAP_PART_NUM} as ${SWAP_PARTITION}"
-    
-    # Append swap partition (all remaining space)
-    # Format: ",S" means use remaining space with type=swap
-    if echo ",S" | sfdisk --force --no-reread --append "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
-        log_info "Swap partition created successfully"
-    else
-        log_warn "sfdisk reported errors for swap partition"
-    fi
-    
-    # Inform kernel again
-    if command -v partprobe >/dev/null 2>&1; then
-        partprobe "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
-    else
-        partx -u "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
-    fi
-    
-    # Wait for device to appear
-    sleep 2
-    
-    # Format and enable swap partition
-    log_info "Formatting swap partition..."
-    if mkswap "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
-        log_success "Swap partition formatted"
-    else
-        log_error "Failed to format swap partition"
-        return 1
-    fi
-    
-    log_info "Enabling swap partition..."
-    if swapon -p "$SWAP_PRIORITY" "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
-        log_success "Swap partition enabled"
-    else
-        log_error "Failed to enable swap partition"
-        return 1
-    fi
-    
-    # Add to fstab with PARTUUID for stability
-    PARTUUID=$(blkid -s PARTUUID -o value "$SWAP_PARTITION" 2>/dev/null)
-    if [ -n "$PARTUUID" ]; then
-        echo "PARTUUID=${PARTUUID} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
-        log_info "Added swap to /etc/fstab using PARTUUID"
-    else
-        echo "${SWAP_PARTITION} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
-        log_info "Added swap to /etc/fstab using device path"
-    fi
+    log_success "Root partition extended and ${SWAP_STRIPE_WIDTH} swap partitions created successfully"
+    log_info "All swap partitions have equal priority (${SWAP_PRIORITY}) for I/O striping"
     
     return 0
 }
