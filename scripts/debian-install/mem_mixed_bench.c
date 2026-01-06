@@ -43,6 +43,7 @@ typedef struct {
 } latency_stats_t;
 
 void signal_handler(int signo) {
+    (void)signo;  // Suppress unused parameter warning
     interrupted = 1;
 }
 
