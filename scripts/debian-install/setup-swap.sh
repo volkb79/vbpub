@@ -1184,6 +1184,7 @@ create_swap_partition() {
         
         # Find next partition number (handles nvme, sd, vd, etc.)
         # Count existing partitions to determine the next partition number
+        # Example: 3 existing partitions -> LAST_PART_NUM=3 -> SWAP_PART_NUM=4
         LAST_PART_NUM=$(sfdisk -l "/dev/$ROOT_DISK" 2>/dev/null | grep "^/dev/" | wc -l)
         if [ -z "$LAST_PART_NUM" ] || [ "$LAST_PART_NUM" -eq 0 ]; then
             # Fallback: if no partitions found, start at 1

@@ -3014,16 +3014,20 @@ def format_benchmark_html(results):
         html += "<b>💾 Allocator Performance:</b>\n"
         # Use efficiency percentage for bar chart (shows allocator overhead)
         # Higher efficiency = better (less overhead)
-        max_eff = max(abs(a.get('efficiency_pct', 0)) for a in results['allocators'])
+        # Note: Negative efficiency indicates overhead (uses more memory than original)
+        max_eff = max(a.get('efficiency_pct', 0) for a in results['allocators'])
         for alloc in results['allocators']:
             name = alloc.get('allocator', 'N/A')
             ratio = alloc.get('compression_ratio', 0)
             eff = alloc.get('efficiency_pct', 0)
             # Bar shows efficiency: higher is better
-            # Use absolute value in case efficiency is negative (overhead)
-            bar_length = int((abs(eff) / max_eff) * 10) if max_eff > 0 else 0
+            # For negative efficiency (overhead), show minimal bar
+            if eff >= 0 and max_eff > 0:
+                bar_length = int((eff / max_eff) * 10)
+            else:
+                bar_length = 0  # No bar for negative efficiency
             bar = '▓' * bar_length + '░' * (10 - bar_length)
-            is_best = abs(eff) == max_eff
+            is_best = eff == max_eff and eff > 0
             marker = " ⭐" if is_best else ""
             html += f"  {name:8s}: {bar} {ratio:.1f}x ratio, {eff:+.0f}% eff{marker}\n"
         html += "\n"
