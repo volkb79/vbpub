@@ -3021,11 +3021,12 @@ def format_benchmark_html(results):
             ratio = alloc.get('compression_ratio', 0)
             eff = alloc.get('efficiency_pct', 0)
             # Bar shows efficiency: higher is better
-            # For negative efficiency (overhead), show minimal bar
-            if eff >= 0 and max_eff > 0:
+            # For negative efficiency (overhead), show no bar
+            # For zero max_eff, show no bar (avoid division by zero)
+            if max_eff > 0 and eff >= 0:
                 bar_length = int((eff / max_eff) * 10)
             else:
-                bar_length = 0  # No bar for negative efficiency
+                bar_length = 0  # No bar for negative efficiency or zero max_eff
             bar = '▓' * bar_length + '░' * (10 - bar_length)
             is_best = eff == max_eff and eff > 0
             marker = " ⭐" if is_best else ""
@@ -3103,7 +3104,7 @@ def format_benchmark_html(results):
             html += f"  ZRAM:  {zram_ratio:.1f}x ratio, {zram_lat:.1f}µs latency\n"
             html += f"  ZSWAP: {zswap_ratio:.1f}x ratio, {zswap_lat:.1f}µs latency\n"
             
-            # Determine winner
+            # Determine winner (avoid division by zero)
             if zram_lat > 0 and zswap_lat > 0:
                 if zram_lat < zswap_lat:
                     winner = "ZRAM"
@@ -3113,7 +3114,7 @@ def format_benchmark_html(results):
                     winner = "ZSWAP"
                     diff_pct = ((zram_lat - zswap_lat) / zswap_lat) * 100
                     html += f"  ⭐ {winner} is {diff_pct:.0f}% faster\n"
-                # If equal, don't show a winner
+                # If equal latency, don't show a winner
         html += "\n"
     
     # Latency comparison results
