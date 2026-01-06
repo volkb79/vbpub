@@ -132,8 +132,10 @@ sudo ./benchmark.py --test-all --output results.json --shell-config optimal.conf
 """
 
 import argparse
+import glob
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -1025,7 +1027,6 @@ stonewall
         results['read_mb_per_sec'] = 0
     finally:
         # Cleanup
-        import shutil
         if os.path.exists(test_dir):
             shutil.rmtree(test_dir, ignore_errors=True)
         if os.path.exists('/tmp/fio_concurrent.job'):
@@ -1216,7 +1217,6 @@ stonewall
         log_info(f"  SWAP_STRIPE_WIDTH={best_combined['concurrency']}")
     
     # Cleanup
-    import shutil
     if os.path.exists(test_dir):
         shutil.rmtree(test_dir, ignore_errors=True)
     if os.path.exists('/tmp/fio_matrix.job'):
@@ -3024,7 +3024,6 @@ Examples:
         '/tmp/swap_test*',
         '/tmp/ptable-*',
     ]
-    import glob
     for pattern in cleanup_patterns:
         try:
             for f in glob.glob(pattern):
