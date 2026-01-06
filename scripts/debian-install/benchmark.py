@@ -1589,7 +1589,26 @@ def generate_charts(results, output_dir='/var/log/debian-install', webp=False):
             
             ax.set_xlabel('Block Size (KB)', fontsize=12)
             ax.set_ylabel('Throughput (MB/s)', fontsize=12)
-            ax.set_title('Block Size vs Throughput', fontsize=14, fontweight='bold')
+            
+            # Add subtitle with test parameters
+            title = 'Block Size vs Throughput'
+            if results['block_sizes']:
+                first_test = results['block_sizes'][0]
+                test_params = []
+                if 'concurrency' in first_test:
+                    test_params.append(f"Concurrency: {first_test['concurrency']}")
+                if 'runtime_sec' in first_test:
+                    test_params.append(f"Duration: {first_test['runtime_sec']}s")
+                if 'io_pattern' in first_test:
+                    test_params.append(f"Pattern: {first_test['io_pattern']}")
+                if test_params:
+                    subtitle = ' | '.join(test_params)
+                    ax.set_title(f'{title}\n{subtitle}', fontsize=14, fontweight='bold')
+                else:
+                    ax.set_title(title, fontsize=14, fontweight='bold')
+            else:
+                ax.set_title(title, fontsize=14, fontweight='bold')
+            
             ax.legend(fontsize=10)
             ax.grid(True, alpha=0.3)
             ax.set_xscale('log', base=2)
@@ -1863,9 +1882,22 @@ def generate_charts(results, output_dir='/var/log/debian-install', webp=False):
                     axes[1].tick_params(axis='x', rotation=45)
                     axes[1].grid(True, alpha=0.3, axis='y')
                 
+                # Add explanatory legend for box plot components
+                # Create a text box with explanation
+                legend_text = 'Box Plot Legend:\n' \
+                             '• Box: Q1-Q3 (25th-75th percentile)\n' \
+                             '• Line in box: Median (50th percentile)\n' \
+                             '• Whiskers: 1.5×IQR (Interquartile Range)\n' \
+                             '• Circles: Outliers beyond whiskers'
+                
+                # Place legend below the subplots
+                fig.text(0.5, -0.05, legend_text, ha='center', va='top', 
+                        fontsize=9, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+                
                 chart_file = f"{output_dir}/benchmark-latency-distribution-{timestamp}.png"
                 plt.tight_layout()
-                plt.savefig(chart_file, dpi=150)
+                plt.subplots_adjust(bottom=0.15)  # Make room for legend
+                plt.savefig(chart_file, dpi=150, bbox_inches='tight')
                 plt.close()
                 chart_files.append(chart_file)
                 log_info(f"Generated latency distribution chart: {chart_file}")
@@ -2068,6 +2100,10 @@ def format_benchmark_html(results):
         if 'write_latency' in lat_comp and lat_comp['write_latency']:
             html += "  <i>Write Latency (swap-out):</i>\n"
             valid_writes = [w for w in lat_comp['write_latency'] if 'error' not in w and 'avg_write_us' in w]
+            
+            # Get baseline for comparison
+            baseline_write_ns = baseline.get('write_ns', 0) if 'baseline' in lat_comp else 0
+            
             if valid_writes:
                 min_latency = min(w['avg_write_us'] for w in valid_writes)
                 max_latency = max(w['avg_write_us'] for w in valid_writes)
@@ -2078,13 +2114,24 @@ def format_benchmark_html(results):
                     bar = '█' * bar_len + '░' * (10 - bar_len)
                     is_best = (avg_us == min_latency)
                     marker = " ⭐" if is_best else ""
-                    html += f"  {w['compressor']:6s}+{w['allocator']:8s}: {bar} {avg_us:6.1f}µs{marker}\n"
+                    
+                    # Add comparison with baseline if available
+                    comparison = ""
+                    if baseline_write_ns > 0:
+                        slowdown = (avg_us * 1000) / baseline_write_ns  # Convert us to ns for comparison
+                        comparison = f" ({slowdown:.0f}×)"
+                    
+                    html += f"  {w['compressor']:6s}+{w['allocator']:8s}: {bar} {avg_us:6.1f}µs{comparison}{marker}\n"
             html += "\n"
         
         # Read latency
         if 'read_latency' in lat_comp and lat_comp['read_latency']:
             html += "  <i>Read Latency (page fault):</i>\n"
             valid_reads = [r for r in lat_comp['read_latency'] if 'error' not in r and 'avg_read_us' in r]
+            
+            # Get baseline for comparison
+            baseline_read_ns = baseline.get('read_ns', 0) if 'baseline' in lat_comp else 0
+            
             if valid_reads:
                 # Group by compressor+allocator
                 unique_configs = {}
@@ -2104,7 +2151,14 @@ def format_benchmark_html(results):
                     bar = '█' * bar_len + '░' * (10 - bar_len)
                     is_best = (avg_us == min_latency)
                     marker = " ⭐" if is_best else ""
-                    html += f"  {r['compressor']:6s}+{r['allocator']:8s}({pattern}): {bar} {avg_us:6.1f}µs{marker}\n"
+                    
+                    # Add comparison with baseline if available
+                    comparison = ""
+                    if baseline_read_ns > 0:
+                        slowdown = (avg_us * 1000) / baseline_read_ns  # Convert us to ns for comparison
+                        comparison = f" ({slowdown:.0f}×)"
+                    
+                    html += f"  {r['compressor']:6s}+{r['allocator']:8s}({pattern}): {bar} {avg_us:6.1f}µs{comparison}{marker}\n"
             html += "\n"
     
     # Memory-only comparison

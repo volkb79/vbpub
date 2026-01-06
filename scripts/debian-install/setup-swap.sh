@@ -441,7 +441,9 @@ print_system_analysis_and_plan() {
             echo "  Allocator:     ${ZRAM_ALLOCATOR}"
             echo "  Priority:      ${ZRAM_PRIORITY}"
         elif [ "$SWAP_RAM_SOLUTION" = "zswap" ]; then
-            echo "  Pool Size:     20% of RAM (fixed)"
+            # Calculate actual pool size in GB
+            POOL_SIZE_GB=$(awk "BEGIN {printf \"%.1f\", ${RAM_GB} * 0.20}")
+            echo "  Pool Size:     20% of RAM (~${POOL_SIZE_GB}GB)"
             echo "  Compressor:    ${ZSWAP_COMPRESSOR}"
             echo "  Zpool:         ${ZSWAP_ZPOOL}"
         fi
@@ -580,9 +582,11 @@ print_system_analysis_and_plan() {
   - Allocator: ${ZRAM_ALLOCATOR}
   - Priority: ${ZRAM_PRIORITY}"
             elif [ "$SWAP_RAM_SOLUTION" = "zswap" ]; then
+                # Calculate actual pool size in GB
+                POOL_SIZE_GB=$(awk "BEGIN {printf \"%.1f\", ${RAM_GB} * 0.20}")
                 telegram_msg="${telegram_msg}
   - Compressor: ${ZSWAP_COMPRESSOR}
-  - Pool: 20% of RAM
+  - Pool: 20% of RAM (~${POOL_SIZE_GB}GB)
   - Zpool: ${ZSWAP_ZPOOL}"
             fi
         fi
