@@ -3451,13 +3451,15 @@ Examples:
     
     # Final cleanup of temporary test files
     log_info("Cleaning up temporary test files...")
-    cleanup_patterns = [
-        '/tmp/fio_*.job',
+    cleanup_test_files()
+    
+    # Additional cleanup patterns specific to main test run
+    additional_patterns = [
         '/tmp/fio_test*',
         '/tmp/swap_test*',
         '/tmp/ptable-*',
     ]
-    for pattern in cleanup_patterns:
+    for pattern in additional_patterns:
         try:
             for f in glob.glob(pattern):
                 if os.path.isfile(f):
@@ -3563,7 +3565,7 @@ Examples:
                     else:
                         log_warn("Failed to send charts as media group, falling back to individual messages")
                         # Fallback: send charts one by one
-                        timestamp_str = datetime.now().strftime('%Y%m%d-%H%M%S')
+                        # Use the same timestamp_str for consistency
                         for chart_file in chart_files:
                             # Handle both .png and .webp extensions
                             chart_name = os.path.basename(chart_file)
