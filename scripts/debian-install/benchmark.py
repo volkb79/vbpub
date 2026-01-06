@@ -1697,6 +1697,171 @@ def generate_charts(results, output_dir='/var/log/debian-install'):
                 chart_files.append(chart_file)
                 log_info(f"Generated compression chart: {chart_file}")
         
+        # Chart 5: Read Latency Heatmap
+        if 'latency_comparison' in results and 'read_latency' in results['latency_comparison']:
+            read_latencies = results['latency_comparison']['read_latency']
+            valid_reads = [r for r in read_latencies if 'error' not in r and 'avg_read_us' in r]
+            
+            if valid_reads:
+                # Create a matrix for heatmap: compressor × allocator
+                compressors = sorted(list(set(r['compressor'] for r in valid_reads)))
+                allocators = sorted(list(set(r['allocator'] for r in valid_reads)))
+                patterns = sorted(list(set(r.get('access_pattern', 'unknown') for r in valid_reads)))
+                
+                if len(patterns) > 1:
+                    # Multiple patterns - create subplots
+                    fig, axes = plt.subplots(1, len(patterns), figsize=(6*len(patterns), 5))
+                    if len(patterns) == 1:
+                        axes = [axes]
+                    
+                    for idx, pattern in enumerate(patterns):
+                        pattern_data = [r for r in valid_reads if r.get('access_pattern') == pattern]
+                        
+                        # Build matrix
+                        matrix = []
+                        for comp in compressors:
+                            row = []
+                            for alloc in allocators:
+                                matching = [r for r in pattern_data if r['compressor'] == comp and r['allocator'] == alloc]
+                                if matching:
+                                    row.append(matching[0]['avg_read_us'])
+                                else:
+                                    row.append(0)
+                            matrix.append(row)
+                        
+                        im = axes[idx].imshow(matrix, cmap='RdYlGn_r', aspect='auto')
+                        axes[idx].set_xticks(range(len(allocators)))
+                        axes[idx].set_yticks(range(len(compressors)))
+                        axes[idx].set_xticklabels(allocators, rotation=45, ha='right')
+                        axes[idx].set_yticklabels(compressors)
+                        axes[idx].set_title(f'Read Latency (µs) - {pattern}', fontweight='bold')
+                        
+                        # Add text annotations
+                        for i in range(len(compressors)):
+                            for j in range(len(allocators)):
+                                if matrix[i][j] > 0:
+                                    text = axes[idx].text(j, i, f'{matrix[i][j]:.1f}',
+                                                   ha="center", va="center", color="black", fontsize=9)
+                        
+                        plt.colorbar(im, ax=axes[idx], label='Latency (µs)')
+                    
+                    chart_file = f"{output_dir}/benchmark-read-latency-{timestamp}.png"
+                    plt.tight_layout()
+                    plt.savefig(chart_file, dpi=150)
+                    plt.close()
+                    chart_files.append(chart_file)
+                    log_info(f"Generated read latency chart: {chart_file}")
+        
+        # Chart 6: Write Latency Heatmap
+        if 'latency_comparison' in results and 'write_latency' in results['latency_comparison']:
+            write_latencies = results['latency_comparison']['write_latency']
+            valid_writes = [w for w in write_latencies if 'error' not in w and 'avg_write_us' in w]
+            
+            if valid_writes:
+                compressors = sorted(list(set(w['compressor'] for w in valid_writes)))
+                allocators = sorted(list(set(w['allocator'] for w in valid_writes)))
+                
+                # Build matrix
+                matrix = []
+                for comp in compressors:
+                    row = []
+                    for alloc in allocators:
+                        matching = [w for w in valid_writes if w['compressor'] == comp and w['allocator'] == alloc]
+                        if matching:
+                            row.append(matching[0]['avg_write_us'])
+                        else:
+                            row.append(0)
+                    matrix.append(row)
+                
+                fig, ax = plt.subplots(figsize=(8, 6))
+                im = ax.imshow(matrix, cmap='RdYlGn_r', aspect='auto')
+                ax.set_xticks(range(len(allocators)))
+                ax.set_yticks(range(len(compressors)))
+                ax.set_xticklabels(allocators, rotation=45, ha='right')
+                ax.set_yticklabels(compressors)
+                ax.set_title('Write Latency (µs) - Compressor × Allocator', fontsize=14, fontweight='bold')
+                
+                # Add text annotations
+                for i in range(len(compressors)):
+                    for j in range(len(allocators)):
+                        if matrix[i][j] > 0:
+                            text = ax.text(j, i, f'{matrix[i][j]:.1f}',
+                                       ha="center", va="center", color="black", fontsize=10)
+                
+                plt.colorbar(im, ax=ax, label='Latency (µs)')
+                
+                chart_file = f"{output_dir}/benchmark-write-latency-{timestamp}.png"
+                plt.tight_layout()
+                plt.savefig(chart_file, dpi=150)
+                plt.close()
+                chart_files.append(chart_file)
+                log_info(f"Generated write latency chart: {chart_file}")
+        
+        # Chart 7: Latency Distribution (Box Plot)
+        if 'latency_comparison' in results:
+            comp = results['latency_comparison']
+            has_read = 'read_latency' in comp and any('p50_read_us' in r for r in comp['read_latency'] if 'error' not in r)
+            has_write = 'write_latency' in comp and any('p50_write_us' in w for w in comp['write_latency'] if 'error' not in w)
+            
+            if has_read or has_write:
+                fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+                
+                # Read latency distribution
+                if has_read:
+                    read_data = comp['read_latency']
+                    valid_reads = [r for r in read_data if 'error' not in r and 'p50_read_us' in r]
+                    
+                    labels = []
+                    box_data = []
+                    for r in valid_reads:
+                        label = f"{r['compressor']}\n{r['allocator']}\n{r.get('access_pattern', '')}"
+                        labels.append(label)
+                        # Approximate box plot from percentiles
+                        box_data.append([
+                            r.get('min_read_us', 0),
+                            r.get('p50_read_us', 0) - (r.get('p50_read_us', 0) - r.get('min_read_us', 0)) * 0.5,
+                            r.get('p50_read_us', 0),
+                            r.get('p95_read_us', 0),
+                            r.get('max_read_us', 0)
+                        ])
+                    
+                    axes[0].boxplot(box_data, labels=labels, patch_artist=True)
+                    axes[0].set_ylabel('Latency (µs)', fontsize=12)
+                    axes[0].set_title('Read Latency Distribution', fontsize=12, fontweight='bold')
+                    axes[0].tick_params(axis='x', rotation=45)
+                    axes[0].grid(True, alpha=0.3, axis='y')
+                
+                # Write latency distribution
+                if has_write:
+                    write_data = comp['write_latency']
+                    valid_writes = [w for w in write_data if 'error' not in w and 'p50_write_us' in w]
+                    
+                    labels = []
+                    box_data = []
+                    for w in valid_writes:
+                        label = f"{w['compressor']}\n{w['allocator']}"
+                        labels.append(label)
+                        box_data.append([
+                            w.get('min_write_us', 0),
+                            w.get('p50_write_us', 0) - (w.get('p50_write_us', 0) - w.get('min_write_us', 0)) * 0.5,
+                            w.get('p50_write_us', 0),
+                            w.get('p95_write_us', 0),
+                            w.get('max_write_us', 0)
+                        ])
+                    
+                    axes[1].boxplot(box_data, labels=labels, patch_artist=True)
+                    axes[1].set_ylabel('Latency (µs)', fontsize=12)
+                    axes[1].set_title('Write Latency Distribution', fontsize=12, fontweight='bold')
+                    axes[1].tick_params(axis='x', rotation=45)
+                    axes[1].grid(True, alpha=0.3, axis='y')
+                
+                chart_file = f"{output_dir}/benchmark-latency-distribution-{timestamp}.png"
+                plt.tight_layout()
+                plt.savefig(chart_file, dpi=150)
+                plt.close()
+                chart_files.append(chart_file)
+                log_info(f"Generated latency distribution chart: {chart_file}")
+        
     except Exception as e:
         log_error(f"Failed to generate charts: {e}")
         import traceback
@@ -1838,6 +2003,61 @@ def format_benchmark_html(results):
             marker = " ⭐" if is_best else ""
             html += f"  {files_str} files: {bar} ↑{write_mb:.0f} ↓{read_mb:.0f} MB/s{marker}\n"
         html += "\n"
+    
+    # Latency comparison results
+    if 'latency_comparison' in results:
+        lat_comp = results['latency_comparison']
+        
+        # Baseline
+        if 'baseline' in lat_comp and 'read_ns' in lat_comp['baseline']:
+            baseline = lat_comp['baseline']
+            html += "<b>⚡ Memory Latency:</b>\n"
+            html += f"  <i>Baseline (Native RAM):</i>\n"
+            html += f"  Read:  {baseline['read_ns']:.0f} ns/page\n"
+            html += f"  Write: {baseline['write_ns']:.0f} ns/page\n\n"
+        
+        # Write latency
+        if 'write_latency' in lat_comp and lat_comp['write_latency']:
+            html += "  <i>Write Latency (swap-out):</i>\n"
+            valid_writes = [w for w in lat_comp['write_latency'] if 'error' not in w and 'avg_write_us' in w]
+            if valid_writes:
+                min_latency = min(w['avg_write_us'] for w in valid_writes)
+                max_latency = max(w['avg_write_us'] for w in valid_writes)
+                
+                for w in valid_writes[:4]:  # Limit to top 4
+                    avg_us = w['avg_write_us']
+                    bar_len = int(10 * (avg_us - min_latency) / (max_latency - min_latency + 1)) if max_latency > min_latency else 5
+                    bar = '█' * bar_len + '░' * (10 - bar_len)
+                    is_best = (avg_us == min_latency)
+                    marker = " ⭐" if is_best else ""
+                    html += f"  {w['compressor']:6s}+{w['allocator']:8s}: {bar} {avg_us:6.1f}µs{marker}\n"
+            html += "\n"
+        
+        # Read latency
+        if 'read_latency' in lat_comp and lat_comp['read_latency']:
+            html += "  <i>Read Latency (page fault):</i>\n"
+            valid_reads = [r for r in lat_comp['read_latency'] if 'error' not in r and 'avg_read_us' in r]
+            if valid_reads:
+                # Group by compressor+allocator
+                unique_configs = {}
+                for r in valid_reads:
+                    key = f"{r['compressor']}+{r['allocator']}"
+                    if key not in unique_configs or r.get('access_pattern') == 'random':
+                        unique_configs[key] = r
+                
+                configs_list = list(unique_configs.values())
+                min_latency = min(r['avg_read_us'] for r in configs_list)
+                max_latency = max(r['avg_read_us'] for r in configs_list)
+                
+                for r in configs_list[:4]:  # Limit to top 4
+                    avg_us = r['avg_read_us']
+                    pattern = r.get('access_pattern', 'seq')[:3]
+                    bar_len = int(10 * (avg_us - min_latency) / (max_latency - min_latency + 1)) if max_latency > min_latency else 5
+                    bar = '█' * bar_len + '░' * (10 - bar_len)
+                    is_best = (avg_us == min_latency)
+                    marker = " ⭐" if is_best else ""
+                    html += f"  {r['compressor']:6s}+{r['allocator']:8s}({pattern}): {bar} {avg_us:6.1f}µs{marker}\n"
+            html += "\n"
     
     # Memory-only comparison
     if 'memory_only_comparison' in results:
