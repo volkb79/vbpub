@@ -2223,6 +2223,8 @@ Examples:
                        help='Export shell configuration file')
     parser.add_argument('--telegram', action='store_true',
                        help='Send results to Telegram (requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)')
+    parser.add_argument('--webp', action='store_true',
+                       help='Convert charts to WebP format for smaller file size (requires Pillow)')
     
     args = parser.parse_args()
     
@@ -2492,9 +2494,9 @@ Examples:
             try:
                 telegram = TelegramClient()
                 
-                # Generate charts
+                # Generate charts (with WebP conversion if requested)
                 log_info("Generating performance charts...")
-                chart_files = generate_charts(results)
+                chart_files = generate_charts(results, webp=args.webp)
                 
                 # Send HTML summary
                 html_message = format_benchmark_html(results)

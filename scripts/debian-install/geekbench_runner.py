@@ -144,11 +144,16 @@ class GeekbenchRunner:
             error_msg = f"✗ Downloaded file too small ({file_size} bytes) - likely an error page"
             print(error_msg)
             self.results['error'] = error_msg
-            # Try to read and show content if it's text
+            # Try to read and show content if it's text (use binary mode to avoid decode errors)
             try:
-                with open(tarball, 'r') as f:
+                with open(tarball, 'rb') as f:
                     content = f.read(500)
-                    print(f"File content preview: {content}")
+                    # Try to decode as UTF-8, but don't fail if it's binary
+                    try:
+                        content_str = content.decode('utf-8', errors='replace')
+                        print(f"File content preview: {content_str}")
+                    except:
+                        print(f"File appears to be binary or corrupt (first bytes): {content[:50]}")
             except:
                 pass
             return False

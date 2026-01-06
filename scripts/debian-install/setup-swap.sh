@@ -965,6 +965,62 @@ detect_disk_layout() {
     return 0
 }
 
+# Helper function to update kernel partition table with multiple methods
+update_kernel_partition_table() {
+    local disk="$1"
+    local log_file="${2:-/dev/null}"
+    
+    log_info "Updating kernel partition table for /dev/$disk..."
+    
+    # Sync first
+    sync
+    sleep 2
+    
+    # Method 1: blockdev --rereadpt (force kernel to re-read partition table)
+    if command -v blockdev >/dev/null 2>&1; then
+        log_info "Using blockdev --rereadpt..."
+        if blockdev --rereadpt "/dev/$disk" 2>&1 | tee -a "$log_file"; then
+            log_info "✓ blockdev completed successfully"
+        else
+            log_warn "blockdev reported errors (expected for in-use disk)"
+        fi
+    fi
+    
+    # Method 2: partprobe (most comprehensive)
+    if command -v partprobe >/dev/null 2>&1; then
+        log_info "Using partprobe..."
+        if partprobe "/dev/$disk" 2>&1 | tee -a "$log_file"; then
+            log_info "✓ partprobe completed successfully"
+        else
+            log_warn "partprobe reported errors (expected for in-use disk)"
+        fi
+    fi
+    
+    # Method 3: partx (alternative method)
+    if command -v partx >/dev/null 2>&1; then
+        log_info "Using partx..."
+        if partx -u "/dev/$disk" 2>&1 | tee -a "$log_file"; then
+            log_info "✓ partx completed successfully"
+        else
+            log_warn "partx reported errors (expected for in-use disk)"
+        fi
+    fi
+    
+    # Settle udev events
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm settle 2>&1 | tee -a "$log_file" || true
+        log_info "Settled udev events"
+    fi
+    
+    # Final sync and wait
+    sync
+    sleep 3
+    
+    log_info "✓ Kernel partition table update completed"
+}
+
+# Detect disk layout and determine strategy (keeping original function name for compatibility)
+
 # Create swap partition at end of disk using sfdisk
 create_swap_partition() {
     log_step "Creating swap partition at end of disk"
@@ -1158,49 +1214,8 @@ create_swap_partition() {
     sync
     sleep 2
     
-    # Inform kernel of partition table changes with multiple methods
-    log_info "Informing kernel of partition table changes..."
-    
-    # Method 1: blockdev --rereadpt (force kernel to re-read partition table)
-    if command -v blockdev >/dev/null 2>&1; then
-        log_info "Using blockdev --rereadpt to force partition table update..."
-        if blockdev --rereadpt "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
-            log_info "✓ blockdev successfully updated partition table"
-        else
-            log_warn "blockdev reported errors (expected for in-use disk)"
-        fi
-    fi
-    
-    # Method 2: Try partprobe (most comprehensive)
-    if command -v partprobe >/dev/null 2>&1; then
-        log_info "Using partprobe to update kernel partition table..."
-        if partprobe "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
-            log_info "✓ partprobe completed successfully"
-        else
-            log_warn "partprobe reported errors (expected for in-use disk)"
-        fi
-    fi
-    
-    # Method 3: Try partx as well (alternative method)
-    if command -v partx >/dev/null 2>&1; then
-        # Use -u (update) instead of -a (add) to handle existing partitions gracefully
-        log_info "Using partx to update kernel partition table..."
-        if partx -u "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
-            log_info "✓ partx completed successfully"
-        else
-            log_warn "partx reported errors (expected for in-use disk)"
-        fi
-    fi
-    
-    # Settle udev events
-    if command -v udevadm >/dev/null 2>&1; then
-        udevadm settle 2>&1 | tee -a "$LOG_FILE" || true
-        log_info "Settled udev events"
-    fi
-    
-    # Additional sync and wait
-    sync
-    sleep 3
+    # Inform kernel of partition table changes
+    update_kernel_partition_table "$ROOT_DISK" "$LOG_FILE"
     fi
     
     # Additional wait for device node creation
@@ -1454,30 +1469,8 @@ extend_root_partition() {
     sync
     sleep 2
     
-    # Inform kernel of partition table changes with multiple methods
-    log_info "Informing kernel of partition table changes..."
-    
-    # Use blockdev first
-    if command -v blockdev >/dev/null 2>&1; then
-        log_info "Using blockdev --rereadpt..."
-        blockdev --rereadpt "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
-    fi
-    
-    # Then partprobe
-    if command -v partprobe >/dev/null 2>&1; then
-        log_info "Using partprobe..."
-        partprobe "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
-    fi
-    
-    # Then partx
-    if command -v partx >/dev/null 2>&1; then
-        log_info "Using partx..."
-        partx --update "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
-    fi
-    
-    # Final sync and wait
-    sync
-    sleep 3
+    # Inform kernel of partition table changes
+    update_kernel_partition_table "$ROOT_DISK" "$LOG_FILE"
     
     # Verify the partition is visible to the kernel
     log_info "Verifying partition table update..."
