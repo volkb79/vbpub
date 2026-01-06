@@ -201,6 +201,55 @@ install_essential_packages() {
     log_info "✓ Essential packages installed"
 }
 
+print_bootstrap_summary() {
+    log_info ""
+    log_info "=========================================="
+    log_info "  BOOTSTRAP COMPLETE - SUMMARY"
+    log_info "=========================================="
+    log_info ""
+    
+    # System info
+    local hostname=$(hostname)
+    local ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    local ram_gb=$(free -g | awk '/^Mem:/{print $2}')
+    log_info "✓ System configured: ${hostname} (${ip})"
+    log_info "✓ RAM: ${ram_gb}GB"
+    
+    # Swap configuration
+    if [ -n "${SWAP_RAM_SOLUTION:-}" ]; then
+        log_info "✓ Swap: ${SWAP_RAM_SOLUTION}"
+    fi
+    
+    # Docker version
+    if command -v docker >/dev/null 2>&1; then
+        local docker_version=$(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',')
+        log_info "✓ Docker: ${docker_version}"
+    fi
+    
+    log_info ""
+    log_info "Key Reports:"
+    
+    # Find most recent reports
+    local benchmark_summary=$(ls -t /var/log/debian-install/benchmark-summary-*.txt 2>/dev/null | head -1)
+    local swap_config=$(ls -t /var/log/debian-install/swap-config-decisions-*.txt 2>/dev/null | head -1)
+    
+    if [ -n "$benchmark_summary" ] && [ -f "$benchmark_summary" ]; then
+        log_info "  • Benchmark: $benchmark_summary"
+    fi
+    
+    if [ -n "$swap_config" ] && [ -f "$swap_config" ]; then
+        log_info "  • Swap Config: $swap_config"
+    fi
+    
+    log_info "  • Full Log: $LOG_FILE"
+    log_info ""
+    log_info "Next Steps:"
+    log_info "  1. Review benchmark report for performance insights"
+    log_info "  2. Reboot to apply all changes"
+    log_info "  3. Monitor: ./swap-monitor.sh (if available)"
+    log_info ""
+}
+
 main() {
     mkdir -p "$LOG_DIR"
     log_info "Debian System Setup Bootstrap"
@@ -405,6 +454,9 @@ Check the log file for detailed error messages."
             rm -f "$SYSINFO_FILE"
         fi
     fi
+    
+    # Print bootstrap summary
+    print_bootstrap_summary
     
     log_info "🎉 System setup complete!"
     log_info "Log: $LOG_FILE"

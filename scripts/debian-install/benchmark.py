@@ -2257,6 +2257,251 @@ def export_shell_config(results, output_file):
     
     log_info(f"Configuration saved to {output_file}")
 
+def generate_benchmark_summary_report(results, output_file):
+    """Generate human-readable benchmark summary report"""
+    log_step(f"Generating benchmark summary report: {output_file}")
+    
+    system_info = results.get('system_info', {})
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    with open(output_file, 'w') as f:
+        f.write("=" * 68 + "\n")
+        f.write("SWAP PERFORMANCE BENCHMARK REPORT\n")
+        f.write(f"System: {system_info.get('hostname', 'unknown')} - ")
+        f.write(f"{system_info.get('ram_gb', '?')}GB RAM, ")
+        f.write(f"{system_info.get('cpu_cores', '?')} CPU cores")
+        if 'cpu_model' in system_info:
+            f.write(f", {system_info['cpu_model']}")
+        f.write(f"\nDate: {timestamp}\n")
+        f.write("=" * 68 + "\n\n")
+        
+        # Optimal configuration section
+        f.write("OPTIMAL CONFIGURATION\n")
+        f.write("-" * 68 + "\n")
+        
+        if 'block_sizes' in results and results['block_sizes']:
+            best_block = max(results['block_sizes'], 
+                           key=lambda x: x.get('read_mb_per_sec', 0) + x.get('write_mb_per_sec', 0))
+            block_to_cluster = {4: 0, 8: 1, 16: 2, 32: 3, 64: 4, 128: 5}
+            cluster = block_to_cluster.get(best_block['block_size_kb'], 3)
+            f.write(f"✓ Page Cluster:        {cluster} ({best_block['block_size_kb']}KB blocks)\n")
+        
+        if 'compressors' in results and results['compressors']:
+            best_comp = max(results['compressors'], 
+                          key=lambda x: x.get('compression_ratio', 0))
+            f.write(f"✓ Compressor:          {best_comp['compressor']} ")
+            f.write(f"({best_comp.get('compression_ratio', 0):.2f}x compression ratio)\n")
+        
+        if 'allocators' in results and results['allocators']:
+            best_alloc = max(results['allocators'], 
+                           key=lambda x: x.get('efficiency_pct', 0))
+            f.write(f"✓ Allocator:           {best_alloc['allocator']} ")
+            f.write(f"({best_alloc.get('efficiency_pct', 0):.1f}% efficiency)\n")
+        
+        if 'concurrency' in results and results['concurrency']:
+            best_concur = max(results['concurrency'], 
+                            key=lambda x: x.get('write_mb_per_sec', 0) + x.get('read_mb_per_sec', 0))
+            f.write(f"✓ Stripe Width:        {best_concur['num_files']} devices ")
+            f.write(f"(optimal concurrency)\n")
+        
+        f.write("\n")
+        
+        # Performance highlights
+        f.write("PERFORMANCE HIGHLIGHTS\n")
+        f.write("-" * 68 + "\n")
+        
+        if 'block_sizes' in results and results['block_sizes']:
+            best_block = max(results['block_sizes'], 
+                           key=lambda x: x.get('read_mb_per_sec', 0))
+            f.write(f"• Best Block Size:     {best_block['block_size_kb']}KB ")
+            f.write(f"({best_block.get('read_mb_per_sec', 0):.0f} MB/s read)\n")
+        
+        if 'compressors' in results and results['compressors']:
+            best_comp = max(results['compressors'], 
+                          key=lambda x: x.get('compression_ratio', 0))
+            space_eff = (1 - 1/best_comp.get('compression_ratio', 1)) * 100
+            f.write(f"• Best Compressor:     {best_comp['compressor']} ")
+            f.write(f"({space_eff:.1f}% space efficiency)\n")
+        
+        if 'concurrency' in results and results['concurrency']:
+            best_concur = max(results['concurrency'], 
+                            key=lambda x: x.get('write_mb_per_sec', 0))
+            f.write(f"• Best Concurrency:    {best_concur['num_files']} files ")
+            f.write(f"({best_concur.get('write_mb_per_sec', 0):.0f} MB/s write)\n")
+        
+        # Latency comparison
+        if 'latency' in results:
+            latency = results['latency']
+            if 'ram_baseline' in latency and 'zram_lz4' in latency:
+                ram_lat = latency['ram_baseline'].get('avg_latency_ns', 0)
+                zram_lat = latency['zram_lz4'].get('write_latency_us', 0) * 1000
+                if ram_lat > 0 and zram_lat > 0:
+                    slowdown = zram_lat / ram_lat
+                    f.write(f"• RAM Access:          {ram_lat:.0f} ns/page (baseline)\n")
+                    f.write(f"• ZRAM Latency:        {zram_lat/1000:.2f} µs ({slowdown:.0f}x slower than RAM)\n")
+        
+        f.write("\n")
+        
+        # Detailed results summary
+        f.write("DETAILED RESULTS\n")
+        f.write("-" * 68 + "\n")
+        
+        if 'block_sizes' in results and results['block_sizes']:
+            f.write("Block Size Performance:\n")
+            for bs in results['block_sizes'][:5]:  # Top 5
+                f.write(f"  {bs['block_size_kb']:3d}KB: ")
+                f.write(f"R={bs.get('read_mb_per_sec', 0):6.0f} MB/s, ")
+                f.write(f"W={bs.get('write_mb_per_sec', 0):6.0f} MB/s\n")
+            f.write("\n")
+        
+        if 'compressors' in results and results['compressors']:
+            f.write("Compression Performance:\n")
+            for comp in results['compressors']:
+                f.write(f"  {comp['compressor']:8s}: ")
+                f.write(f"{comp.get('compression_ratio', 0):.2f}x compression\n")
+            f.write("\n")
+        
+        # Recommendations
+        f.write("RECOMMENDATIONS\n")
+        f.write("-" * 68 + "\n")
+        
+        if 'block_sizes' in results and results['block_sizes']:
+            best_block = max(results['block_sizes'], 
+                           key=lambda x: x.get('read_mb_per_sec', 0) + x.get('write_mb_per_sec', 0))
+            block_to_cluster = {4: 0, 8: 1, 16: 2, 32: 3, 64: 4, 128: 5}
+            cluster = block_to_cluster.get(best_block['block_size_kb'], 3)
+            f.write(f"1. Use vm.page-cluster={cluster} for optimal I/O performance\n")
+        
+        if 'compressors' in results and results['compressors']:
+            best_comp = max(results['compressors'], 
+                          key=lambda x: x.get('compression_ratio', 0))
+            f.write(f"2. Enable ZSWAP with {best_comp['compressor']} compressor for best compression\n")
+        
+        if 'concurrency' in results and results['concurrency']:
+            best_concur = max(results['concurrency'], 
+                            key=lambda x: x.get('write_mb_per_sec', 0) + x.get('read_mb_per_sec', 0))
+            f.write(f"3. Configure {best_concur['num_files']} parallel swap devices for maximum throughput\n")
+        
+        if 'compressors' in results and results['compressors']:
+            best_comp = max(results['compressors'], 
+                          key=lambda x: x.get('compression_ratio', 0))
+            f.write(f"4. Expected memory extension: {best_comp.get('compression_ratio', 0):.1f}x with {best_comp['compressor']} compression\n")
+        
+        f.write("\n")
+        f.write("=" * 68 + "\n")
+    
+    log_info(f"✓ Benchmark summary report saved to {output_file}")
+
+def generate_swap_config_report(results, output_file):
+    """Generate human-readable swap configuration decisions report"""
+    log_step(f"Generating swap configuration report: {output_file}")
+    
+    system_info = results.get('system_info', {})
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    ram_gb = system_info.get('ram_gb', 0)
+    
+    with open(output_file, 'w') as f:
+        f.write("=" * 68 + "\n")
+        f.write("SWAP CONFIGURATION DECISIONS\n")
+        f.write(f"System: {system_info.get('hostname', 'unknown')} - ")
+        f.write(f"{ram_gb}GB RAM\n")
+        f.write(f"Date: {timestamp}\n")
+        f.write("=" * 68 + "\n\n")
+        
+        # Auto-detection results
+        f.write("AUTO-DETECTION RESULTS\n")
+        f.write("-" * 68 + "\n")
+        
+        # Determine RAM solution based on system RAM
+        if ram_gb < 4:
+            ram_solution = "zram"
+            reason = "low RAM system (<4GB)"
+        elif ram_gb < 16:
+            ram_solution = "zswap"
+            reason = "medium RAM system (4-16GB)"
+        else:
+            ram_solution = "zswap"
+            reason = "high RAM system (>16GB)"
+        
+        f.write(f"RAM Solution:    {ram_solution} ({reason})\n")
+        f.write(f"Backing Type:    files_in_root (SSD with adequate space)\n")
+        f.write(f"RAM Swap:        {int(ram_gb * 0.5)}GB (50% of RAM)\n")
+        f.write(f"Disk Swap:       {int(ram_gb * 1.0)}GB (overflow protection)\n")
+        
+        if 'concurrency' in results and results['concurrency']:
+            best_concur = max(results['concurrency'], 
+                            key=lambda x: x.get('write_mb_per_sec', 0) + x.get('read_mb_per_sec', 0))
+            f.write(f"Stripe Width:    {best_concur['num_files']} devices\n")
+        
+        f.write("\n")
+        
+        # Rationale
+        f.write("RATIONALE\n")
+        f.write("-" * 68 + "\n")
+        f.write(f"• Selected {ram_solution.upper()}: System has {ram_gb}GB RAM ({reason})\n")
+        
+        if ram_solution == "zswap":
+            f.write("• ZSWAP advantages: Lower overhead, good compression\n")
+        else:
+            f.write("• ZRAM advantages: Better compression, simpler setup\n")
+        
+        f.write("• Disk backing required: Prevents OOM situations\n")
+        
+        if 'concurrency' in results and results['concurrency']:
+            best_concur = max(results['concurrency'], 
+                            key=lambda x: x.get('write_mb_per_sec', 0) + x.get('read_mb_per_sec', 0))
+            cpu_cores = system_info.get('cpu_cores', 4)
+            f.write(f"• {best_concur['num_files']} swap files: ")
+            if best_concur['num_files'] >= cpu_cores:
+                f.write(f"Matches/exceeds CPU core count for parallelism\n")
+            else:
+                f.write(f"Optimal for this workload\n")
+        
+        f.write("\n")
+        
+        # Applied configuration
+        f.write("APPLIED CONFIGURATION\n")
+        f.write("-" * 68 + "\n")
+        
+        if 'compressors' in results and results['compressors']:
+            best_comp = max(results['compressors'], 
+                          key=lambda x: x.get('compression_ratio', 0))
+            f.write(f"Compressor:      {best_comp['compressor']}\n")
+            f.write(f"Compression:     {best_comp.get('compression_ratio', 0):.2f}x ratio\n")
+        
+        if 'allocators' in results and results['allocators']:
+            best_alloc = max(results['allocators'], 
+                           key=lambda x: x.get('efficiency_pct', 0))
+            f.write(f"Allocator:       {best_alloc['allocator']}\n")
+        
+        if 'block_sizes' in results and results['block_sizes']:
+            best_block = max(results['block_sizes'], 
+                           key=lambda x: x.get('read_mb_per_sec', 0) + x.get('write_mb_per_sec', 0))
+            block_to_cluster = {4: 0, 8: 1, 16: 2, 32: 3, 64: 4, 128: 5}
+            cluster = block_to_cluster.get(best_block['block_size_kb'], 3)
+            f.write(f"Page Cluster:    vm.page-cluster={cluster}\n")
+        
+        f.write("\n")
+        
+        # Warnings
+        f.write("WARNINGS\n")
+        f.write("-" * 68 + "\n")
+        
+        warnings_found = False
+        if 'compressors' in results:
+            for comp in results['compressors']:
+                if 'warning' in comp:
+                    f.write(f"⚠ {comp['warning']}\n")
+                    warnings_found = True
+        
+        if not warnings_found:
+            f.write("No warnings\n")
+        
+        f.write("\n")
+        f.write("=" * 68 + "\n")
+    
+    log_info(f"✓ Swap configuration report saved to {output_file}")
+
 def generate_charts(results, output_dir='/var/log/debian-install', webp=False):
     """
     Generate matplotlib charts for benchmark results
@@ -3268,6 +3513,24 @@ Examples:
     # Export shell config
     if args.shell_config:
         export_shell_config(results, args.shell_config)
+    
+    # Generate human-readable reports
+    timestamp_str = datetime.now().strftime('%Y%m%d-%H%M%S')
+    report_dir = '/var/log/debian-install'
+    os.makedirs(report_dir, exist_ok=True)
+    
+    summary_report = f"{report_dir}/benchmark-summary-{timestamp_str}.txt"
+    config_report = f"{report_dir}/swap-config-decisions-{timestamp_str}.txt"
+    
+    try:
+        generate_benchmark_summary_report(results, summary_report)
+    except Exception as e:
+        log_warn(f"Failed to generate benchmark summary report: {e}")
+    
+    try:
+        generate_swap_config_report(results, config_report)
+    except Exception as e:
+        log_warn(f"Failed to generate swap config report: {e}")
     
     # Send to Telegram if requested
     if args.telegram:
