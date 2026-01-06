@@ -211,7 +211,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    // Allocate latency stats
+    // Allocate latency stats - check for overflow
+    if (num_pages > SIZE_MAX / sizeof(uint64_t)) {
+        fprintf(stderr, "Error: Test size too large, would overflow\n");
+        munmap(memory, total_size);
+        return 1;
+    }
+    
     latency_stats_t stats;
     stats.latencies = malloc(num_pages * sizeof(uint64_t));
     if (stats.latencies == NULL) {
@@ -229,7 +235,8 @@ int main(int argc, char *argv[]) {
     for (size_t i = 0; i < num_pages && !interrupted; i++) {
         fill_page(memory + (i * PAGE_SIZE), pattern_type, i);
         
-        if ((i + 1) % (num_pages / 10) == 0 || i == num_pages - 1) {
+        // Report progress - avoid division by zero
+        if (num_pages >= 10 && ((i + 1) % (num_pages / 10) == 0 || i == num_pages - 1)) {
             fprintf(stderr, "[mem_write_bench] Progress: %zu/%zu pages (%.0f%%)\n",
                     i + 1, num_pages, ((i + 1) * 100.0) / num_pages);
         }

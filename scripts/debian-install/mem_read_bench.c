@@ -188,7 +188,13 @@ int main(int argc, char *argv[]) {
         madvise(memory, total_size, MADV_RANDOM);
     }
     
-    // Allocate latency stats
+    // Allocate latency stats - check for overflow
+    if (num_pages > SIZE_MAX / sizeof(uint64_t)) {
+        fprintf(stderr, "Error: Test size too large, would overflow\n");
+        munmap(memory, total_size);
+        return 1;
+    }
+    
     latency_stats_t stats;
     stats.latencies = malloc(num_pages * sizeof(uint64_t));
     if (stats.latencies == NULL) {
@@ -207,7 +213,8 @@ int main(int argc, char *argv[]) {
             page[j] = (unsigned char)((i + j) % 256);
         }
         
-        if ((i + 1) % (num_pages / 10) == 0 || i == num_pages - 1) {
+        // Report progress - avoid division by zero
+        if (num_pages >= 10 && ((i + 1) % (num_pages / 10) == 0 || i == num_pages - 1)) {
             fprintf(stderr, "[mem_read_bench] Fill progress: %zu/%zu pages\n", i + 1, num_pages);
         }
     }
@@ -224,7 +231,8 @@ int main(int argc, char *argv[]) {
     for (size_t i = 0; i < num_pages && !interrupted; i++) {
         madvise(memory + (i * PAGE_SIZE), PAGE_SIZE, MADV_PAGEOUT);
         
-        if ((i + 1) % (num_pages / 10) == 0 || i == num_pages - 1) {
+        // Report progress - avoid division by zero
+        if (num_pages >= 10 && ((i + 1) % (num_pages / 10) == 0 || i == num_pages - 1)) {
             fprintf(stderr, "[mem_read_bench] Pageout progress: %zu/%zu pages\n", i + 1, num_pages);
         }
     }

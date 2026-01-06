@@ -2119,6 +2119,15 @@ Examples:
     
     args = parser.parse_args()
     
+    # Validate arguments
+    if args.latency_size <= 0 or args.latency_size > 10240:
+        log_error(f"Invalid --latency-size: {args.latency_size}. Must be between 1 and 10240 MB")
+        sys.exit(1)
+    
+    if args.duration < 1 or args.duration > 3600:
+        log_error(f"Invalid --duration: {args.duration}. Must be between 1 and 3600 seconds")
+        sys.exit(1)
+    
     # Check root and dependencies
     check_root()
     check_dependencies()
