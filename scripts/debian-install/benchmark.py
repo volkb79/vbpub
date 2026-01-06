@@ -1265,13 +1265,14 @@ def get_device_io_stats(device_path):
     """
     Get I/O statistics for a block device from /sys/block or /proc/diskstats
     
-    Returns dict with sectors_read, sectors_written, etc.
+    Returns dict with sectors_read, sectors_written, sector_size, etc.
     """
     stats = {
         'sectors_read': 0,
         'sectors_written': 0,
         'read_ios': 0,
-        'write_ios': 0
+        'write_ios': 0,
+        'sector_size': 512  # Default, will try to read actual value
     }
     
     try:
@@ -1282,6 +1283,16 @@ def get_device_io_stats(device_path):
             return stats
         
         base_device = device_match.group(1)
+        
+        # Get actual sector size from sysfs (usually 512, but can be 4096 for advanced format drives)
+        sector_size_path = f'/sys/block/{base_device}/queue/hw_sector_size'
+        try:
+            if os.path.exists(sector_size_path):
+                with open(sector_size_path, 'r') as f:
+                    stats['sector_size'] = int(f.read().strip())
+                    log_debug(f"Device {base_device} sector size: {stats['sector_size']} bytes")
+        except Exception as e:
+            log_debug(f"Could not read sector size, using default 512: {e}")
         
         # Try reading from /sys/block first
         stat_path = f'/sys/block/{base_device}/stat'
@@ -1539,9 +1550,12 @@ def benchmark_zswap_comprehensive(swap_device='/dev/vda4', test_size_mb=256, com
         write_ios_delta = final_device_stats['write_ios'] - initial_device_stats['write_ios']
         read_ios_delta = final_device_stats['read_ios'] - initial_device_stats['read_ios']
         
-        # Convert sectors to MB (512 bytes per sector)
-        mb_written = (sectors_written_delta * 512) / (1024 * 1024)
-        mb_read = (sectors_read_delta * 512) / (1024 * 1024)
+        # Get sector size (typically 512, but can be 4096 for advanced format drives)
+        sector_size = final_device_stats.get('sector_size', 512)
+        
+        # Convert sectors to MB using actual sector size
+        mb_written = (sectors_written_delta * sector_size) / (1024 * 1024)
+        mb_read = (sectors_read_delta * sector_size) / (1024 * 1024)
         
         results['disk_mb_written'] = round(mb_written, 2)
         results['disk_mb_read'] = round(mb_read, 2)
