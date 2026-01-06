@@ -190,10 +190,33 @@ detect_system() {
     RAM_GB=$((RAM_TOTAL_KB / 1024 / 1024))
     log_info "RAM: ${RAM_GB}GB"
     
-    # Disk space in GB
+    # Disk space - get both available space and total capacity
     DISK_AVAIL_KB=$(df -k / | tail -1 | awk '{print $4}')
-    DISK_GB=$((DISK_AVAIL_KB / 1024 / 1024))
-    log_info "Available disk space: ${DISK_GB}GB"
+    DISK_AVAIL_GB=$((DISK_AVAIL_KB / 1024 / 1024))
+    log_info "Available disk space: ${DISK_AVAIL_GB}GB"
+    
+    # Get total disk capacity (not just available space)
+    # Find root partition and disk (using temporary variables to avoid conflicts with later usage)
+    local detect_root_partition=$(findmnt -n -o SOURCE / 2>/dev/null || echo "")
+    if [ -n "$detect_root_partition" ]; then
+        local detect_root_disk=$(lsblk -no PKNAME "$detect_root_partition" 2>/dev/null | head -1)
+        if [ -n "$detect_root_disk" ]; then
+            DISK_SIZE_SECTORS=$(blockdev --getsz "/dev/$detect_root_disk" 2>/dev/null || echo "0")
+            DISK_TOTAL_GB=$((DISK_SIZE_SECTORS / 2048 / 1024))
+            log_info "Total disk capacity: ${DISK_TOTAL_GB}GB"
+        else
+            DISK_TOTAL_GB=$DISK_AVAIL_GB
+            log_warn "Could not determine disk capacity, using available space"
+        fi
+    else
+        DISK_TOTAL_GB=$DISK_AVAIL_GB
+        log_warn "Could not determine root partition, using available space"
+    fi
+    
+    # Use DISK_GB for backward compatibility (will be set based on context)
+    # For partition-based swap, we'll use DISK_TOTAL_GB
+    # For file-based swap, we'll use DISK_AVAIL_GB
+    DISK_GB=$DISK_AVAIL_GB
     
     # CPU cores
     CPU_CORES=$(nproc)
@@ -259,22 +282,30 @@ auto_detect_swap_configuration() {
     if [ -z "$SWAP_BACKING_TYPE" ] || [ "$SWAP_BACKING_TYPE" = "auto" ]; then
         # Decision tree based on available disk space and storage type
         # NEVER select "none" - always have disk overflow protection
-        if [ "$DISK_GB" -lt 15 ]; then
-            # Very low disk space: use files in root (most flexible)
-            SWAP_BACKING_TYPE="files_in_root"
-            log_info "Auto-selected: Swap files in root (very low disk space <15GB, but overflow protection required)"
+        # Use DISK_AVAIL_GB for file-based decisions (needs free space NOW)
+        # Use DISK_TOTAL_GB for partition-based decisions (will create space via repartitioning)
+        if [ "$DISK_AVAIL_GB" -lt 15 ]; then
+            # Very low available space: use partition-based swap (will repartition)
+            if [ "$DISK_TOTAL_GB" -ge 50 ]; then
+                SWAP_BACKING_TYPE="partitions_swap"
+                log_info "Auto-selected: Swap partitions (low available space but adequate total capacity)"
+            else
+                # Very small disk: use files in root (most flexible)
+                SWAP_BACKING_TYPE="files_in_root"
+                log_info "Auto-selected: Swap files in root (very low disk space <15GB, but overflow protection required)"
+            fi
         elif [ "$ZFS_AVAILABLE" -eq 1 ]; then
             # ZFS available: use zvol for compressed swap
             SWAP_BACKING_TYPE="partitions_zvol"
             log_info "Auto-selected: ZFS zvol swap (ZFS available)"
-        elif [ "$STORAGE_TYPE" = "ssd" ] && [ "$DISK_GB" -ge 50 ]; then
-            # SSD with sufficient space: use files for flexibility
-            SWAP_BACKING_TYPE="files_in_root"
-            log_info "Auto-selected: Swap files (SSD with adequate space)"
-        elif [ "$STORAGE_TYPE" = "hdd" ] && [ "$DISK_GB" -ge 100 ]; then
-            # HDD with good space: use partitions for better I/O
+        elif [ "$STORAGE_TYPE" = "ssd" ] && [ "$DISK_TOTAL_GB" -ge 50 ]; then
+            # SSD with sufficient total capacity: prefer partitions for better performance
             SWAP_BACKING_TYPE="partitions_swap"
-            log_info "Auto-selected: Swap partitions (HDD with ample space)"
+            log_info "Auto-selected: Swap partitions (SSD with adequate capacity)"
+        elif [ "$STORAGE_TYPE" = "hdd" ] && [ "$DISK_TOTAL_GB" -ge 100 ]; then
+            # HDD with good capacity: use partitions for better I/O
+            SWAP_BACKING_TYPE="partitions_swap"
+            log_info "Auto-selected: Swap partitions (HDD with ample capacity)"
         else
             # Default fallback: files in root (safest, most flexible)
             SWAP_BACKING_TYPE="files_in_root"
@@ -294,6 +325,17 @@ calculate_swap_sizes() {
     # Calculate SWAP_DISK_TOTAL_GB if auto
     # ALWAYS ensure disk-based swap for overflow protection
     if [ "$SWAP_DISK_TOTAL_GB" = "auto" ]; then
+        # For partition-based swap, use DISK_TOTAL_GB (will repartition to create space)
+        # For file-based swap, use DISK_AVAIL_GB (needs free space now)
+        local disk_reference_gb
+        if [[ "$SWAP_BACKING_TYPE" == "partitions_swap" || "$SWAP_BACKING_TYPE" == "partitions_zvol" || "$SWAP_BACKING_TYPE" == "files_in_partitions" ]]; then
+            disk_reference_gb=$DISK_TOTAL_GB
+            log_info "Using total disk capacity (${DISK_TOTAL_GB}GB) for partition-based swap sizing"
+        else
+            disk_reference_gb=$DISK_AVAIL_GB
+            log_info "Using available space (${DISK_AVAIL_GB}GB) for file-based swap sizing"
+        fi
+        
         if [ "$RAM_GB" -le 2 ]; then
             # For very low RAM, use 2x RAM for disk swap
             SWAP_DISK_TOTAL_GB=$((RAM_GB * 2))
@@ -317,21 +359,26 @@ calculate_swap_sizes() {
             SWAP_DISK_TOTAL_GB=32
             log_info "High RAM system: Using ${SWAP_DISK_TOTAL_GB}GB disk swap (capped)"
         fi
+        
+        # Check if we have enough space
+        if [ "$SWAP_DISK_TOTAL_GB" -gt "$disk_reference_gb" ]; then
+            log_warn "Requested swap (${SWAP_DISK_TOTAL_GB}GB) exceeds available capacity (${disk_reference_gb}GB)"
+            # Cap at 25% of disk for safety
+            SWAP_DISK_TOTAL_GB=$((disk_reference_gb / 4))
+            [ "$SWAP_DISK_TOTAL_GB" -lt 2 ] && SWAP_DISK_TOTAL_GB=2
+            log_warn "Adjusted disk swap to ${SWAP_DISK_TOTAL_GB}GB (25% of capacity)"
+        fi
     fi
     
     # Override backing type to ensure disk swap unless explicitly set to none
     # NEVER auto-select "none" - always have disk overflow
     if [ "$SWAP_BACKING_TYPE" = "auto" ]; then
         # Re-evaluate backing type but never choose "none"
-        if [ "$DISK_GB" -lt 20 ]; then
-            log_warn "Low disk space (<20GB) but disk swap is required for overflow protection"
-            log_warn "Using minimal disk swap configuration"
-            SWAP_BACKING_TYPE="files_in_root"
-            # Reduce disk swap size if space is very tight
-            if [ "$DISK_GB" -lt 15 ] && [ "$SWAP_DISK_TOTAL_GB" -gt 4 ]; then
-                SWAP_DISK_TOTAL_GB=4
-                log_warn "Reduced disk swap to ${SWAP_DISK_TOTAL_GB}GB due to space constraints"
-            fi
+        if [ "$DISK_AVAIL_GB" -lt 20 ]; then
+            log_warn "Low available space (<20GB) but disk swap is required for overflow protection"
+            log_warn "Using partition-based swap to leverage total disk capacity (${DISK_TOTAL_GB}GB)"
+            SWAP_BACKING_TYPE="partitions_swap"
+            # Keep swap size as calculated above
         fi
     fi
     
@@ -348,13 +395,22 @@ calculate_swap_sizes() {
         log_info "✓ Disk-based swap enabled for overflow protection"
     fi
     
-    # Check disk constraints
-    if [ "$SWAP_DISK_TOTAL_GB" -gt 0 ] && [ "$DISK_GB" -lt 30 ]; then
-        log_warn "Low disk space (<30GB). Disk swap may impact available storage"
-        if [ "$SWAP_DISK_TOTAL_GB" -gt "$((DISK_GB / 4))" ]; then
-            SWAP_DISK_TOTAL_GB=$((DISK_GB / 4))
-            [ "$SWAP_DISK_TOTAL_GB" -lt 2 ] && SWAP_DISK_TOTAL_GB=2
-            log_warn "Adjusted disk swap to ${SWAP_DISK_TOTAL_GB}GB (25% of disk space)"
+    # Check disk constraints - use appropriate reference
+    if [ "$SWAP_DISK_TOTAL_GB" -gt 0 ]; then
+        local disk_ref_for_check
+        if [[ "$SWAP_BACKING_TYPE" == "partitions_swap" || "$SWAP_BACKING_TYPE" == "partitions_zvol" || "$SWAP_BACKING_TYPE" == "files_in_partitions" ]]; then
+            disk_ref_for_check=$DISK_TOTAL_GB
+        else
+            disk_ref_for_check=$DISK_AVAIL_GB
+        fi
+        
+        if [ "$disk_ref_for_check" -lt 30 ]; then
+            log_warn "Limited disk space (${disk_ref_for_check}GB). Adjusting swap configuration if needed"
+            if [ "$SWAP_DISK_TOTAL_GB" -gt "$((disk_ref_for_check / 4))" ]; then
+                SWAP_DISK_TOTAL_GB=$((disk_ref_for_check / 4))
+                [ "$SWAP_DISK_TOTAL_GB" -lt 2 ] && SWAP_DISK_TOTAL_GB=2
+                log_warn "Adjusted disk swap to ${SWAP_DISK_TOTAL_GB}GB (25% of disk capacity)"
+            fi
         fi
     fi
     
@@ -406,7 +462,8 @@ print_system_analysis_and_plan() {
     echo ""
     echo "Hardware Detected:"
     echo "  RAM:           ${RAM_GB}GB"
-    echo "  Disk Space:    ${DISK_GB}GB available"
+    echo "  Disk Total:    ${DISK_TOTAL_GB}GB"
+    echo "  Disk Available: ${DISK_AVAIL_GB}GB"
     echo "  CPU Cores:     ${CPU_CORES}"
     echo "  Storage Type:  ${STORAGE_TYPE}"
     if [ "$SWAP_BACKING_TYPE" != "files_in_root" ] && [ "$SWAP_BACKING_TYPE" != "none" ]; then
@@ -545,20 +602,38 @@ print_system_analysis_and_plan() {
     echo ""
     
     # Warnings
-    if [ "$DISK_GB" -lt 30 ] && [ "$SWAP_DISK_TOTAL_GB" -gt 0 ]; then
-        log_warn "⚠️  Low disk space detected (<30GB)"
-        log_warn "⚠️  Consider SWAP_BACKING_TYPE=none or SWAP_RAM_SOLUTION=zram only"
-        echo ""
+    local show_warnings=0
+    local warning_msgs=""
+    
+    # Check available space for file-based swap
+    if [ "$SWAP_BACKING_TYPE" = "files_in_root" ] && [ "$DISK_AVAIL_GB" -lt 30 ] && [ "$SWAP_DISK_TOTAL_GB" -gt 0 ]; then
+        show_warnings=1
+        warning_msgs="${warning_msgs}⚠️  Low available disk space (${DISK_AVAIL_GB}GB)\n"
+        warning_msgs="${warning_msgs}⚠️  Consider using partition-based swap to leverage full disk capacity\n"
+    fi
+    
+    # Check for partition-based swap on small total disks
+    if [[ "$SWAP_BACKING_TYPE" == "partitions_swap" || "$SWAP_BACKING_TYPE" == "partitions_zvol" || "$SWAP_BACKING_TYPE" == "files_in_partitions" ]]; then
+        if [ "$DISK_TOTAL_GB" -lt 50 ]; then
+            show_warnings=1
+            warning_msgs="${warning_msgs}⚠️  Small total disk capacity (${DISK_TOTAL_GB}GB)\n"
+            warning_msgs="${warning_msgs}⚠️  Root partition will be extended, then swap partitions added at end\n"
+        fi
     fi
     
     if [ "$RAM_GB" -le 2 ]; then
-        log_warn "⚠️  Low RAM detected (${RAM_GB}GB)"
+        show_warnings=1
+        warning_msgs="${warning_msgs}⚠️  Low RAM detected (${RAM_GB}GB)\n"
         if [ "$SWAP_RAM_SOLUTION" = "zswap" ]; then
-            log_warn "⚠️  Recommended: ZSWAP_COMPRESSOR=zstd for better compression"
+            warning_msgs="${warning_msgs}⚠️  Recommended: ZSWAP_COMPRESSOR=zstd for better compression\n"
         elif [ "$SWAP_RAM_SOLUTION" = "zram" ]; then
-            log_warn "⚠️  Recommended: ZRAM_COMPRESSOR=zstd for better compression"
+            warning_msgs="${warning_msgs}⚠️  Recommended: ZRAM_COMPRESSOR=zstd for better compression\n"
         fi
+    fi
+    
+    if [ "$show_warnings" -eq 1 ]; then
         echo ""
+        printf '%b\n' "$warning_msgs"
     fi
     
     # Send configuration plan to Telegram
@@ -567,7 +642,8 @@ print_system_analysis_and_plan() {
 
 📊 <b>System Analysis:</b>
 • RAM: ${RAM_GB}GB
-• Disk: ${DISK_GB}GB available
+• Disk Total: ${DISK_TOTAL_GB}GB
+• Disk Available: ${DISK_AVAIL_GB}GB
 • Storage: ${STORAGE_TYPE}
 • CPU: ${CPU_CORES} cores
 
@@ -651,11 +727,40 @@ ${step}. Configure kernel parameters
 $((step+1)). Add swap to /etc/fstab for persistence"
         
         # Add warnings
-        if [ "$DISK_GB" -lt 30 ] && [ "$SWAP_DISK_TOTAL_GB" -gt 0 ]; then
-            telegram_msg="${telegram_msg}
+        local has_warnings=0
+        if [ "$SWAP_BACKING_TYPE" = "files_in_root" ] && [ "$DISK_AVAIL_GB" -lt 30 ] && [ "$SWAP_DISK_TOTAL_GB" -gt 0 ]; then
+            if [ "$has_warnings" -eq 0 ]; then
+                telegram_msg="${telegram_msg}
 
-⚠️ <b>Warnings:</b>
-• Low disk space (&lt;30GB) - swap may impact storage"
+⚠️ <b>Warnings:</b>"
+                has_warnings=1
+            fi
+            telegram_msg="${telegram_msg}
+• Low available space (${DISK_AVAIL_GB}GB), but total disk is ${DISK_TOTAL_GB}GB"
+        fi
+        
+        if [[ "$SWAP_BACKING_TYPE" == "partitions_swap" || "$SWAP_BACKING_TYPE" == "partitions_zvol" || "$SWAP_BACKING_TYPE" == "files_in_partitions" ]]; then
+            if [ "$DISK_TOTAL_GB" -lt 50 ]; then
+                if [ "$has_warnings" -eq 0 ]; then
+                    telegram_msg="${telegram_msg}
+
+⚠️ <b>Warnings:</b>"
+                    has_warnings=1
+                fi
+                telegram_msg="${telegram_msg}
+• Small disk (${DISK_TOTAL_GB}GB) - will repartition to create swap space"
+            fi
+        fi
+        
+        if [ "$RAM_GB" -le 2 ]; then
+            if [ "$has_warnings" -eq 0 ]; then
+                telegram_msg="${telegram_msg}
+
+⚠️ <b>Warnings:</b>"
+                has_warnings=1
+            fi
+            telegram_msg="${telegram_msg}
+• Low RAM (${RAM_GB}GB) - recommend zstd compression"
         fi
         
         telegram_send "$telegram_msg"
