@@ -182,13 +182,26 @@ IMPORTANT: Send a message to your bot first before it can message you!
             summary = runner.get_summary()
             print("\n" + summary)
             
-            # Upload and get URLs
-            urls = runner.upload_results()
+            # For free version, URLs are already in results from run_benchmark
+            # For pro version, need to check if manual upload is needed
+            urls = None
+            if not runner.results.get('free_version'):
+                # Pro version - try to upload if not already uploaded
+                urls = runner.upload_results()
+            else:
+                # Free version already uploaded, extract URLs from results
+                if 'result_url' in runner.results:
+                    urls = {
+                        'result_url': runner.results['result_url']
+                    }
+                    if 'claim_url' in runner.results:
+                        urls['claim_url'] = runner.results['claim_url']
             
             # Send via Telegram if enabled
             if args.notify and telegram:
                 full_message = summary
-                if urls:
+                # URLs are already in summary for free version, but add them again for backwards compatibility
+                if urls and not runner.results.get('free_version'):
                     full_message += f"\n<b>🔗 Results:</b>\n"
                     full_message += f"  {urls.get('result_url', 'N/A')}\n"
                     if 'claim_url' in urls:

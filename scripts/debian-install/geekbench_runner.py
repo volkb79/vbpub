@@ -314,21 +314,43 @@ class GeekbenchRunner:
                 if multi_match:
                     multi_score = int(multi_match.group(1))
                 
+                # Extract result URL (free version uploads automatically)
+                result_url = None
+                claim_url = None
+                
+                # Pattern: https://browser.geekbench.com/v6/cpu/15956833
+                url_pattern = r'https://browser\.geekbench\.com/v\d+/cpu/\d+'
+                url_match = re.search(url_pattern, result.stdout)
+                if url_match:
+                    result_url = url_match.group(0)
+                    print(f"✓ Found result URL: {result_url}")
+                
+                # Pattern: https://browser.geekbench.com/v6/cpu/15956833/claim?key=526696
+                claim_pattern = r'https://browser\.geekbench\.com/v\d+/cpu/\d+/claim\?key=\w+'
+                claim_match = re.search(claim_pattern, result.stdout)
+                if claim_match:
+                    claim_url = claim_match.group(0)
+                    print(f"✓ Found claim URL: {claim_url}")
+                
+                # Build results
+                self.results = {
+                    'free_version': True,
+                    'stdout': result.stdout
+                }
+                
                 if single_score or multi_score:
-                    self.results = {
-                        'score': {
-                            'singlecore_score': single_score,
-                            'multicore_score': multi_score
-                        },
-                        'free_version': True
+                    self.results['score'] = {
+                        'singlecore_score': single_score,
+                        'multicore_score': multi_score
                     }
                     print(f"✓ Extracted scores - Single: {single_score}, Multi: {multi_score}")
                 else:
-                    self.results = {
-                        'free_version': True,
-                        'stdout': result.stdout
-                    }
                     print("⚠ Could not extract scores from output")
+                
+                if result_url:
+                    self.results['result_url'] = result_url
+                if claim_url:
+                    self.results['claim_url'] = claim_url
                 
                 return True
                 
@@ -413,6 +435,13 @@ class GeekbenchRunner:
             summary += f"<b>📊 Scores:</b>\n"
             summary += f"  Single-Core: {score.get('singlecore_score', 'N/A')}\n"
             summary += f"  Multi-Core: {score.get('multicore_score', 'N/A')}\n"
+        
+        # URLs (for free version)
+        if 'result_url' in self.results:
+            summary += f"\n<b>🔗 Result URL:</b>\n  {self.results['result_url']}\n"
+        
+        if 'claim_url' in self.results:
+            summary += f"\n<b>📌 Claim URL:</b>\n  {self.results['claim_url']}\n"
         
         return summary
     
