@@ -146,6 +146,7 @@ Expanding root partition before continuing to prevent space issues..."
             log_info "Root filesystem: $fs_type"
             
             # Get partition number and info with error checking
+            # Extract only digits from the end of the device path
             local root_part_num=$(echo "$root_partition" | grep -oE '[0-9]+$')
             if [ -z "$root_part_num" ]; then
                 log_warn "Could not extract partition number from $root_partition - skipping early expansion"
@@ -153,12 +154,21 @@ Expanding root partition before continuing to prevent space issues..."
             fi
             
             # Get current partition layout with validation
-            local root_start=$(sfdisk -d "/dev/$root_disk" 2>/dev/null | grep "^$root_partition" | sed -E 's/.*start= *([0-9]+).*/\1/')
-            local root_size=$(sfdisk -d "/dev/$root_disk" 2>/dev/null | grep "^$root_partition" | sed -E 's/.*size= *([0-9]+).*/\1/')
+            # Use awk for more robust parsing of sfdisk output
+            local sfdisk_output=$(sfdisk -d "/dev/$root_disk" 2>/dev/null)
+            local root_start=$(echo "$sfdisk_output" | grep "^$root_partition" | awk '{for(i=1;i<=NF;i++) if($i ~ /^start=/) {sub(/^start=/,"",$i); sub(/,$/,"",$i); print $i}}')
+            local root_size=$(echo "$sfdisk_output" | grep "^$root_partition" | awk '{for(i=1;i<=NF;i++) if($i ~ /^size=/) {sub(/^size=/,"",$i); sub(/,$/,"",$i); print $i}}')
             
-            # Validate that we got values
+            # Validate that we got numeric values
             if [ -z "$root_start" ] || [ -z "$root_size" ]; then
                 log_warn "Could not extract partition info from sfdisk - skipping early expansion"
+                log_debug "root_start=$root_start, root_size=$root_size"
+                return 0
+            fi
+            
+            # Additional validation: check if values are numeric
+            if ! [[ "$root_start" =~ ^[0-9]+$ ]] || ! [[ "$root_size" =~ ^[0-9]+$ ]]; then
+                log_warn "Extracted partition info is not numeric - skipping early expansion"
                 log_debug "root_start=$root_start, root_size=$root_size"
                 return 0
             fi
@@ -172,10 +182,16 @@ Expanding root partition before continuing to prevent space issues..."
             if [ "$free_gb" -ge 5 ]; then
                 log_info "Expanding root partition to use most of disk (leaving some space for swap)"
                 
-                # Calculate new root size - use 90% of remaining disk, leave 10% for swap
-                # Using integer division: (disk_size - start - disk_size/10)
-                # This reserves approximately 10% of total disk at the end
-                local new_root_size_sectors=$((disk_size_sectors - root_start - (disk_size_sectors / 10)))
+                # Calculate new root size properly accounting for partition start
+                # Reserve 10% of available disk space (after partition start) for swap
+                # new_size = (total_disk - start) * 0.9 = available_space * 0.9
+                local available_for_root=$((disk_size_sectors - root_start))
+                local space_for_swap=$((available_for_root / 10))
+                local new_root_size_sectors=$((available_for_root - space_for_swap))
+                
+                log_debug "Available sectors after start: $available_for_root"
+                log_debug "Reserving for swap: $space_for_swap sectors"
+                log_debug "New root size: $new_root_size_sectors sectors"
                 
                 # Backup partition table
                 local backup_file="/tmp/ptable-early-backup-$(date +%s).dump"
