@@ -853,18 +853,68 @@ cat /sys/module/zram/parameters/*
 ### Benchmark Your Configuration
 
 ```bash
-# Test different configurations
+# Test all configurations (block sizes, compressors, allocators, concurrency, latency)
 sudo ./benchmark.py --test-all
 
 # Test specific block size (matching vm.page-cluster)
-sudo ./benchmark.py --block-size 64k
+sudo ./benchmark.py --block-size 64
 
 # Test compression algorithms
 sudo ./benchmark.py --test-compressors
 
+# Test memory allocators
+sudo ./benchmark.py --test-allocators
+
+# Test concurrency scaling
+sudo ./benchmark.py --test-concurrency 8
+
+# **NEW: Test memory access latency**
+# Comprehensive latency comparison (read/write, all compressors/allocators)
+sudo ./benchmark.py --test-latency --latency-size 100
+
 # Compare ZRAM vs ZSWAP memory-only performance
 sudo ./benchmark.py --compare-memory-only
+
+# Export results with charts and config
+sudo ./benchmark.py --test-all --output results.json --shell-config optimal.conf
+
+# Send results to Telegram (requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+sudo ./benchmark.py --test-all --telegram
 ```
+
+**Latency Test Output Example:**
+```
+=== Phase 1: Native RAM Baseline ===
+Native RAM read: 85 ns/page (11.8 GB/s)
+Native RAM write: 92 ns/page (10.9 GB/s)
+
+=== Phase 2: Write Latency Tests ===
+[1/4] lz4 + zsmalloc: avg=12.5µs, p95=18.7µs, p99=28.4µs
+[2/4] lz4 + zbud: avg=9.8µs, p95=15.2µs, p99=23.1µs
+
+=== Phase 3: Read Latency Tests ===
+[1/4] lz4 + zsmalloc (sequential): avg=24.1µs, p95=35.8µs
+[2/4] lz4 + zsmalloc (random): avg=28.3µs, p95=42.1µs
+
+=== Latency Comparison Summary ===
+lz4 + zbud write: 9.8µs (106x slower than RAM)  ⭐ Best for interactive
+zstd + zsmalloc write: 25.3µs (275x slower than RAM)
+lz4 + zsmalloc read (random): 28.3µs (333x slower than RAM)  ⭐ Best balance
+zstd + zsmalloc read (random): 45.2µs (532x slower than RAM)
+```
+
+**What Latency Tests Measure:**
+- **Native RAM baseline**: Pure RAM speed without swap (50-150 ns/page)
+- **Write latency**: Time to compress and swap-out pages (5-50 µs/page)
+- **Read latency**: Time for page fault + decompress (10-100 µs/page)
+- **Percentiles**: P50 (median), P95 (95th percentile), P99 (worst case)
+- **Slowdown factor**: How much slower than RAM (e.g., 280x slower)
+
+**Use latency data to choose:**
+- **Interactive/Desktop**: Choose lz4 + zbud (lowest latency, responsive UI)
+- **Server/Batch**: Choose zstd + zsmalloc (better compression, latency OK)
+- **Database/Random**: Choose lz4 + z3fold (balanced)
+- **Low RAM**: Choose zstd + zsmalloc (need max compression)
 
 ### KSM (Kernel Samepage Merging) Testing
 
