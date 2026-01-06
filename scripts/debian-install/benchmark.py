@@ -3012,14 +3012,18 @@ def format_benchmark_html(results):
     # Allocator comparison
     if 'allocators' in results and results['allocators']:
         html += "<b>💾 Allocator Performance:</b>\n"
-        max_ratio = max(a.get('compression_ratio', 0) for a in results['allocators'])
+        # Use efficiency percentage for bar chart (shows allocator overhead)
+        # Higher efficiency = better (less overhead)
+        max_eff = max(abs(a.get('efficiency_pct', 0)) for a in results['allocators'])
         for alloc in results['allocators']:
             name = alloc.get('allocator', 'N/A')
             ratio = alloc.get('compression_ratio', 0)
             eff = alloc.get('efficiency_pct', 0)
-            bar_length = int((ratio / max_ratio) * 10) if max_ratio > 0 else 0
+            # Bar shows efficiency: higher is better
+            # Use absolute value in case efficiency is negative (overhead)
+            bar_length = int((abs(eff) / max_eff) * 10) if max_eff > 0 else 0
             bar = '▓' * bar_length + '░' * (10 - bar_length)
-            is_best = ratio == max_ratio
+            is_best = abs(eff) == max_eff
             marker = " ⭐" if is_best else ""
             html += f"  {name:8s}: {bar} {ratio:.1f}x ratio, {eff:+.0f}% eff{marker}\n"
         html += "\n"
@@ -3053,6 +3057,57 @@ def format_benchmark_html(results):
                 is_best = (total == max_total and max_total > 0)
                 marker = " ⭐" if is_best else ""
                 html += f"  {files_str} files: {bar} ↑{write_mb:.0f} ↓{read_mb:.0f} MB/s{marker}\n"
+        html += "\n"
+    
+    # Matrix test results (block size × concurrency)
+    if 'matrix' in results and isinstance(results['matrix'], dict) and 'optimal' in results['matrix']:
+        matrix = results['matrix']
+        html += "<b>🎯 Optimal Configuration (Matrix Test):</b>\n"
+        
+        if 'best_combined' in matrix.get('optimal', {}):
+            best = matrix['optimal']['best_combined']
+            html += f"  Best Overall: {best['block_size_kb']}KB × {best['concurrency']} jobs = {best['throughput_mb_per_sec']:.0f} MB/s\n"
+        
+        if 'best_write' in matrix.get('optimal', {}):
+            best_w = matrix['optimal']['best_write']
+            html += f"  Best Write: {best_w['block_size_kb']}KB × {best_w['concurrency']} jobs = {best_w['throughput_mb_per_sec']:.0f} MB/s\n"
+        
+        if 'best_read' in matrix.get('optimal', {}):
+            best_r = matrix['optimal']['best_read']
+            html += f"  Best Read: {best_r['block_size_kb']}KB × {best_r['concurrency']} jobs = {best_r['throughput_mb_per_sec']:.0f} MB/s\n"
+        
+        # Show recommended settings
+        if 'recommended_page_cluster' in matrix.get('optimal', {}):
+            rec_cluster = matrix['optimal']['recommended_page_cluster']
+            rec_width = matrix['optimal'].get('recommended_swap_stripe_width', 'N/A')
+            html += f"\n  <i>Recommended:</i>\n"
+            html += f"  SWAP_PAGE_CLUSTER={rec_cluster}\n"
+            html += f"  SWAP_STRIPE_WIDTH={rec_width}\n"
+        html += "\n"
+    
+    # ZSWAP vs ZRAM comparison
+    if 'zswap_vs_zram' in results and 'error' not in results['zswap_vs_zram']:
+        comp = results['zswap_vs_zram']
+        html += "<b>⚔️ ZSWAP vs ZRAM:</b>\n"
+        
+        if 'zram' in comp and 'zswap' in comp:
+            zram_ratio = comp['zram'].get('compression_ratio', 0)
+            zswap_ratio = comp['zswap'].get('compression_ratio', 0)
+            zram_lat = comp['zram'].get('avg_latency_us', 0)
+            zswap_lat = comp['zswap'].get('avg_latency_us', 0)
+            
+            html += f"  ZRAM:  {zram_ratio:.1f}x ratio, {zram_lat:.1f}µs latency\n"
+            html += f"  ZSWAP: {zswap_ratio:.1f}x ratio, {zswap_lat:.1f}µs latency\n"
+            
+            # Determine winner
+            if zram_lat < zswap_lat:
+                winner = "ZRAM"
+                diff_pct = ((zswap_lat - zram_lat) / zram_lat) * 100
+                html += f"  ⭐ {winner} is {diff_pct:.0f}% faster\n"
+            elif zswap_lat < zram_lat:
+                winner = "ZSWAP"
+                diff_pct = ((zram_lat - zswap_lat) / zswap_lat) * 100
+                html += f"  ⭐ {winner} is {diff_pct:.0f}% faster\n"
         html += "\n"
     
     # Latency comparison results
@@ -3433,7 +3488,7 @@ Examples:
             results['zswap'] = {'error': str(e)}
     
     # ZSWAP vs ZRAM comparison
-    if args.compare_zswap_zram:
+    if args.compare_zswap_zram or args.test_all:
         try:
             log_info_ts("\n=== Comparing ZSWAP vs ZRAM ===")
             results['zswap_vs_zram'] = compare_zswap_vs_zram(
