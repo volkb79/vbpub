@@ -182,6 +182,7 @@ COMPRESSION_RATIO_SUSPICIOUS = 10.0  # Ratio above this is suspicious
 STRESS_NG_TIMEOUT_SEC = 15  # Timeout for stress-ng memory allocation
 STRESS_NG_WAIT_SEC = 20  # Maximum wait time for stress-ng process
 MEMORY_ACCESS_STEP_SIZE = 65536  # 64KB steps for memory access patterns
+COMPRESSION_TEST_TIMEOUT_SEC = 300  # Maximum time per compression test (5 minutes)
 
 # FIO test configuration constants
 FIO_TEST_FILE_SIZE = '1G'  # Test file size for fio benchmarks
@@ -250,6 +251,119 @@ def check_dependencies():
         log_error(f"Missing dependencies: {', '.join(missing)}")
         log_error("Install with: apt install " + " ".join(missing))
         sys.exit(1)
+
+def compile_c_programs():
+    """
+    Compile mem_locker and mem_pressure C programs at runtime.
+    Returns True if successful, False otherwise.
+    """
+    script_dir = Path(__file__).parent
+    programs = {
+        'mem_locker': script_dir / 'mem_locker.c',
+        'mem_pressure': script_dir / 'mem_pressure.c'
+    }
+    
+    log_info_ts("Compiling C memory management programs...")
+    
+    for prog_name, source_file in programs.items():
+        if not source_file.exists():
+            log_error(f"Source file not found: {source_file}")
+            return False
+        
+        output_file = script_dir / prog_name
+        
+        log_info(f"Compiling {prog_name}...")
+        try:
+            result = subprocess.run(
+                ['gcc', '-o', str(output_file), str(source_file), '-Wall', '-O2'],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30
+            )
+            log_info(f"✓ {prog_name} compiled successfully")
+        except subprocess.TimeoutExpired:
+            log_error(f"Compilation of {prog_name} timed out")
+            return False
+        except subprocess.CalledProcessError as e:
+            log_error(f"Failed to compile {prog_name}")
+            log_error(f"Error: {e.stderr}")
+            return False
+        except FileNotFoundError:
+            log_error("gcc not found - install with: apt install gcc")
+            return False
+    
+    log_info_ts("✓ All C programs compiled successfully")
+    return True
+
+def get_memory_info():
+    """
+    Get detailed memory information for test planning.
+    Returns dict with total_mb, available_mb, free_mb
+    """
+    info = {}
+    
+    with open('/proc/meminfo') as f:
+        for line in f:
+            if 'MemTotal:' in line:
+                info['total_mb'] = int(line.split()[1]) // 1024
+            elif 'MemAvailable:' in line:
+                info['available_mb'] = int(line.split()[1]) // 1024
+            elif 'MemFree:' in line:
+                info['free_mb'] = int(line.split()[1]) // 1024
+    
+    return info
+
+def calculate_memory_distribution(test_size_mb):
+    """
+    Calculate memory distribution for tests.
+    
+    Strategy:
+    - Reserve test_size_mb for the actual ZRAM/ZSWAP test
+    - Reserve 500MB safety buffer for system operations
+    - Lock the rest to prevent it from swapping
+    
+    Returns: (test_size_mb, lock_size_mb, available_mb)
+    """
+    mem_info = get_memory_info()
+    total_mb = mem_info['total_mb']
+    available_mb = mem_info['available_mb']
+    
+    log_debug_ts(f"Memory: Total={total_mb}MB, Available={available_mb}MB")
+    
+    # Safety buffer for system
+    SAFETY_BUFFER_MB = 500
+    
+    # Calculate how much we can lock
+    # We want to lock everything except: test_size + safety_buffer
+    lock_size_mb = max(0, available_mb - test_size_mb - SAFETY_BUFFER_MB)
+    
+    log_info_ts(f"Memory distribution: Test={test_size_mb}MB, Lock={lock_size_mb}MB, Buffer={SAFETY_BUFFER_MB}MB")
+    
+    return test_size_mb, lock_size_mb, available_mb
+
+def run_with_timeout(cmd, timeout_sec, description="Command"):
+    """
+    Run a command with timeout.
+    Returns (success, output, error_msg)
+    """
+    log_debug_ts(f"{description}: timeout={timeout_sec}s")
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec
+        )
+        return (result.returncode == 0, result.stdout, result.stderr)
+    except subprocess.TimeoutExpired:
+        log_warn_ts(f"{description} timed out after {timeout_sec}s")
+        return (False, "", f"Timeout after {timeout_sec}s")
+    except Exception as e:
+        log_error(f"{description} failed: {e}")
+        return (False, "", str(e))
 
 def run_command(cmd, check=True):
     """Run shell command and return output"""
@@ -550,6 +664,9 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         'timestamp': datetime.now().isoformat()
     }
     
+    # Initialize mem_locker_proc to None so it's in scope for cleanup
+    mem_locker_proc = None
+    
     try:
         # Ensure ZRAM is loaded and clean
         log_info("Ensuring ZRAM device is clean...")
@@ -591,6 +708,39 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         run_command('mkswap /dev/zram0')
         run_command('swapon -p 100 /dev/zram0')
         
+        # Optional: Start mem_locker to lock free RAM (prevents non-test memory from swapping)
+        # This is optional but makes tests more reliable and predictable
+        script_dir = Path(__file__).parent
+        mem_locker_path = script_dir / 'mem_locker'
+        
+        # Calculate how much memory to lock
+        test_alloc_mb, lock_mb, available_mb = calculate_memory_distribution(size_mb)
+        
+        if lock_mb > 100 and mem_locker_path.exists():
+            # Only use mem_locker if we have significant memory to lock (>100MB)
+            try:
+                log_info_ts(f"Starting mem_locker to reserve {lock_mb}MB of free RAM...")
+                mem_locker_proc = subprocess.Popen(
+                    [str(mem_locker_path), str(lock_mb)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                # Give it a moment to allocate and lock memory
+                time.sleep(2)
+                
+                # Check if it's still running
+                if mem_locker_proc.poll() is not None:
+                    log_warn("mem_locker exited prematurely, continuing without it")
+                    mem_locker_proc = None
+                else:
+                    log_info(f"✓ mem_locker running (PID: {mem_locker_proc.pid})")
+            except Exception as e:
+                log_warn(f"Failed to start mem_locker: {e}")
+                mem_locker_proc = None
+        elif lock_mb <= 100:
+            log_debug_ts(f"Skipping mem_locker (only {lock_mb}MB would be locked)")
+        
         # Create memory pressure to force actual swapping to ZRAM
         # The key is to allocate MORE than available RAM to force the kernel to swap
         
@@ -614,100 +764,50 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
             alloc_size_mb = size_mb * COMPRESSION_MEMORY_PERCENT // 100
             log_info(f"Creating memory pressure (allocating {alloc_size_mb}MB)...")
         
-        # Test with different data patterns - use stress-ng if available, otherwise Python allocation
-        # stress-ng is more reliable at forcing kernel swapping
-        use_stress_ng = False
+        # Use C-based mem_pressure for fast memory allocation
+        # This is MUCH faster than Python for large allocations (7+ GB)
+        script_dir = Path(__file__).parent
+        mem_pressure_path = script_dir / 'mem_pressure'
+        
+        if not mem_pressure_path.exists():
+            log_error(f"mem_pressure program not found at {mem_pressure_path}")
+            log_error("Run compile_c_programs() first")
+            results['error'] = "mem_pressure program not found"
+            return results
+        
+        # Use mixed pattern (0) for realistic workload
+        # Hold time of 15 seconds (default)
+        log_info_ts(f"Using C-based mem_pressure for allocation ({alloc_size_mb}MB)...")
+        
+        # Run with timeout to prevent hanging
+        log_info(f"Starting memory pressure test (timeout: {COMPRESSION_TEST_TIMEOUT_SEC}s)...")
+        
         try:
-            result = subprocess.run(['which', 'stress-ng'], capture_output=True, timeout=2)
-            use_stress_ng = (result.returncode == 0)
-        except:
-            pass
+            result = subprocess.run(
+                [str(mem_pressure_path), str(alloc_size_mb), '0', '15'],
+                capture_output=True,
+                text=True,
+                timeout=COMPRESSION_TEST_TIMEOUT_SEC
+            )
+            success = (result.returncode == 0)
+            stderr = result.stderr if not success else ""
+        except subprocess.TimeoutExpired:
+            success = False
+            stderr = f"Timeout after {COMPRESSION_TEST_TIMEOUT_SEC}s"
+            log_warn_ts(f"Memory pressure test timed out after {COMPRESSION_TEST_TIMEOUT_SEC}s")
+        except Exception as e:
+            success = False
+            stderr = str(e)
+            log_error(f"Memory pressure test failed: {e}")
         
-        if use_stress_ng:
-            log_info(f"Using stress-ng for memory allocation...")
-            try:
-                # stress-ng with vm-method all creates realistic memory pressure patterns
-                subprocess.run(
-                    ['stress-ng', '--vm', '1', '--vm-bytes', f'{alloc_size_mb}M', 
-                     '--vm-method', 'all', '--timeout', f'{STRESS_NG_TIMEOUT_SEC}s', '--metrics-brief'],
-                    timeout=STRESS_NG_WAIT_SEC,
-                    check=False  # Don't fail on non-zero exit (stress-ng returns 1 on timeout)
-                )
-                log_info("Memory allocation completed")
-            except subprocess.TimeoutExpired:
-                log_warn(f"stress-ng timed out after {STRESS_NG_WAIT_SEC}s (expected behavior)")
-            except Exception as e:
-                log_warn(f"stress-ng failed: {e}, falling back to Python allocation")
-                use_stress_ng = False
+        if not success:
+            log_error(f"Memory pressure test failed or timed out")
+            if stderr:
+                log_error(f"Error: {stderr}")
+            results['error'] = f"mem_pressure failed: {stderr}"
+            return results
         
-        if not use_stress_ng:
-            # Fallback: Python-based memory allocation with improved patterns
-            log_info("Using Python-based memory allocation...")
-            test_script = f"""
-python3 << 'PYEOF'
-import time
-import random
-import sys
-import os
-
-# Allocate MORE than available memory to force swapping
-size = {alloc_size_mb * 1024 * 1024}
-size_mb_actual = size // 1024 // 1024
-print("Allocating " + str(size_mb_actual) + "MB of memory...", file=sys.stderr)
-
-try:
-    data = bytearray(size)
-    print("Memory allocated successfully", file=sys.stderr)
-except MemoryError as e:
-    print("Failed to allocate memory: " + str(e), file=sys.stderr)
-    # Try with smaller allocation if initial fails
-    size = size // 2
-    size_mb_actual = size // 1024 // 1024
-    print("Retrying with " + str(size_mb_actual) + "MB...", file=sys.stderr)
-    try:
-        data = bytearray(size)
-        print("Memory allocated successfully", file=sys.stderr)
-    except MemoryError as e2:
-        print("Failed again: " + str(e2), file=sys.stderr)
-        sys.exit(1)
-
-# Fill with less compressible patterns (random data compresses poorly)
-print("Filling memory with varied patterns (less compressible)...", file=sys.stderr)
-random.seed(42)  # Reproducible but varied
-for i in range(0, len(data), 4096):
-    # Mix of patterns: some compressible, some not
-    pattern_type = i % 4
-    if pattern_type == 0:
-        # Random bytes (low compression)
-        chunk = bytes([random.randint(0, 255) for _ in range(min(4096, len(data)-i))])
-    elif pattern_type == 1:
-        # Repeated pattern (medium compression)
-        chunk = bytes([i % 256] * min(4096, len(data)-i))
-    elif pattern_type == 2:
-        # Zero bytes (high compression)
-        chunk = bytes(min(4096, len(data)-i))
-    else:
-        # Mixed (medium compression)
-        chunk = bytes([(i + j) % 256 for j in range(min(4096, len(data)-i))])
-    data[i:i+len(chunk)] = chunk
-
-print("Pattern filling complete", file=sys.stderr)
-
-# Touch all memory multiple times to ensure it's swapped
-print("Forcing memory to swap...", file=sys.stderr)
-for pass_num in range({COMPRESSION_MEMORY_PASSES}):
-    print("Forcing memory to swap (pass " + str(pass_num + 1) + " of {COMPRESSION_MEMORY_PASSES})...", file=sys.stderr)
-    # Access memory in varied patterns to trigger swapping
-    for i in range(0, len(data), {MEMORY_ACCESS_STEP_SIZE}):  # 64KB steps
-        data[i] = (data[i] + 1) % 256
-    time.sleep(0.3)
-
-print("Memory pressure test complete", file=sys.stderr)
-time.sleep(2)
-PYEOF
-"""
-            
-            run_command(test_script, check=False)
+        log_info("Memory pressure test completed successfully")
         
         duration = time.time() - start_time
         
@@ -786,7 +886,21 @@ PYEOF
         elapsed = time.time() - start_time
         log_error(f"Test failed after {elapsed:.1f}s")
     finally:
-        # Cleanup
+        # Cleanup mem_locker if it was started
+        if mem_locker_proc is not None:
+            try:
+                log_info("Stopping mem_locker...")
+                mem_locker_proc.terminate()
+                mem_locker_proc.wait(timeout=5)
+                log_info("✓ mem_locker stopped")
+            except subprocess.TimeoutExpired:
+                log_warn("mem_locker didn't stop gracefully, killing it")
+                mem_locker_proc.kill()
+                mem_locker_proc.wait()
+            except Exception as e:
+                log_warn(f"Error stopping mem_locker: {e}")
+        
+        # Cleanup swap
         run_command('swapoff /dev/zram0', check=False)
         if os.path.exists('/sys/block/zram0/reset'):
             try:
@@ -1363,6 +1477,12 @@ Examples:
     # Check root and dependencies
     check_root()
     check_dependencies()
+    
+    # Compile C programs for memory management
+    if not compile_c_programs():
+        log_error("Failed to compile C memory management programs")
+        log_error("Ensure gcc is installed: apt install gcc")
+        sys.exit(1)
     
     # Record overall start time
     benchmark_start_time = time.time()
