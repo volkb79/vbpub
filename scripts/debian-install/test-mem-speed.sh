@@ -18,7 +18,10 @@ if [ ! -f mem_pressure ]; then
     gcc -o mem_pressure mem_pressure.c -Wall -O2
 fi
 
-# Test size in MB
+# Test size: 100MB is chosen as a balance between:
+# - Large enough to show allocation/fill time differences
+# - Small enough to run quickly in CI/testing environments
+# - Representative of typical compression test sizes
 TEST_SIZE=100
 
 echo "Test 1: C-based memory allocation (mem_pressure)"

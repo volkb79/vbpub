@@ -182,6 +182,7 @@ COMPRESSION_RATIO_SUSPICIOUS = 10.0  # Ratio above this is suspicious
 STRESS_NG_TIMEOUT_SEC = 15  # Timeout for stress-ng memory allocation
 STRESS_NG_WAIT_SEC = 20  # Maximum wait time for stress-ng process
 MEMORY_ACCESS_STEP_SIZE = 65536  # 64KB steps for memory access patterns
+COMPRESSION_TEST_TIMEOUT_SEC = 300  # Maximum time per compression test (5 minutes)
 
 # FIO test configuration constants
 FIO_TEST_FILE_SIZE = '1G'  # Test file size for fio benchmarks
@@ -779,13 +780,12 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         log_info_ts(f"Using C-based mem_pressure for allocation ({alloc_size_mb}MB)...")
         mem_pressure_cmd = f"{mem_pressure_path} {alloc_size_mb} 0 15"
         
-        # Run with timeout to prevent hanging (5 minutes max)
-        TEST_TIMEOUT_SEC = 300
-        log_info(f"Starting memory pressure test (timeout: {TEST_TIMEOUT_SEC}s)...")
+        # Run with timeout to prevent hanging
+        log_info(f"Starting memory pressure test (timeout: {COMPRESSION_TEST_TIMEOUT_SEC}s)...")
         
         success, stdout, stderr = run_with_timeout(
             mem_pressure_cmd,
-            TEST_TIMEOUT_SEC,
+            COMPRESSION_TEST_TIMEOUT_SEC,
             "Memory pressure test"
         )
         
