@@ -45,6 +45,7 @@ fi
 
 # Configuration variables with defaults (NEW NAMING CONVENTION)
 # Load benchmark-optimized configuration if available
+SWAP_BENCHMARK_CONFIG="${SWAP_BENCHMARK_CONFIG:-}"
 if [ -n "$SWAP_BENCHMARK_CONFIG" ] && [ -f "$SWAP_BENCHMARK_CONFIG" ]; then
     # Security: Only source files from /tmp with expected name pattern
     case "$SWAP_BENCHMARK_CONFIG" in
