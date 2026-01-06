@@ -778,16 +778,27 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         # Use mixed pattern (0) for realistic workload
         # Hold time of 15 seconds (default)
         log_info_ts(f"Using C-based mem_pressure for allocation ({alloc_size_mb}MB)...")
-        mem_pressure_cmd = f"{mem_pressure_path} {alloc_size_mb} 0 15"
         
         # Run with timeout to prevent hanging
         log_info(f"Starting memory pressure test (timeout: {COMPRESSION_TEST_TIMEOUT_SEC}s)...")
         
-        success, stdout, stderr = run_with_timeout(
-            mem_pressure_cmd,
-            COMPRESSION_TEST_TIMEOUT_SEC,
-            "Memory pressure test"
-        )
+        try:
+            result = subprocess.run(
+                [str(mem_pressure_path), str(alloc_size_mb), '0', '15'],
+                capture_output=True,
+                text=True,
+                timeout=COMPRESSION_TEST_TIMEOUT_SEC
+            )
+            success = (result.returncode == 0)
+            stderr = result.stderr if not success else ""
+        except subprocess.TimeoutExpired:
+            success = False
+            stderr = f"Timeout after {COMPRESSION_TEST_TIMEOUT_SEC}s"
+            log_warn_ts(f"Memory pressure test timed out after {COMPRESSION_TEST_TIMEOUT_SEC}s")
+        except Exception as e:
+            success = False
+            stderr = str(e)
+            log_error(f"Memory pressure test failed: {e}")
         
         if not success:
             log_error(f"Memory pressure test failed or timed out")

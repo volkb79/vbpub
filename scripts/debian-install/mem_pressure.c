@@ -46,6 +46,8 @@ void print_timestamp() {
 }
 
 // Fast random number generator (LCG)
+// Note: Uses fixed seed for reproducible benchmark results
+// This is intentional for consistent testing, not for security purposes
 static unsigned long rand_state = 12345;
 static inline unsigned char fast_rand() {
     rand_state = (rand_state * 1103515245 + 12345) & 0x7fffffff;
