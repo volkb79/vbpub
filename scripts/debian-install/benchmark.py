@@ -2601,7 +2601,12 @@ def generate_matrix_heatmaps(matrix_results, output_prefix):
         log_warn("matplotlib not available - skipping matrix heatmap generation")
         return None
     
-    import numpy as np
+    try:
+        import numpy as np
+        import matplotlib.pyplot as plt
+    except ImportError:
+        log_warn("numpy or matplotlib not available - skipping matrix heatmap generation")
+        return None
     
     block_sizes = matrix_results['block_sizes']
     concurrency_levels = matrix_results['concurrency_levels'] 
