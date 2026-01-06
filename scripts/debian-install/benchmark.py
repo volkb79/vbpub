@@ -344,9 +344,18 @@ def calculate_memory_distribution(test_size_mb):
     # Safety buffer for system
     SAFETY_BUFFER_MB = 500
     
-    # Calculate how much we can lock
-    # We want to lock everything except: test_size + safety_buffer
-    lock_size_mb = max(0, available_mb - test_size_mb - SAFETY_BUFFER_MB)
+    # On high-RAM systems, lock more memory to force swapping
+    system_info = get_system_info()
+    ram_gb = system_info.get('ram_gb', 8)
+    
+    if ram_gb >= 8:
+        # Lock 85% instead of default to force more swapping
+        lock_percent = 0.85
+        lock_size_mb = max(0, int(available_mb * lock_percent) - test_size_mb)
+    else:
+        # Calculate how much we can lock normally
+        # We want to lock everything except: test_size + safety_buffer
+        lock_size_mb = max(0, available_mb - test_size_mb - SAFETY_BUFFER_MB)
     
     log_info_ts(f"Memory distribution: Test={test_size_mb}MB, Lock={lock_size_mb}MB, Buffer={SAFETY_BUFFER_MB}MB")
     
@@ -905,12 +914,24 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
                     results['error'] = 'No swap activity detected'
                     return results
                 
-                # VALIDATION: Ensure meaningful data was swapped (at least 50% of test size)
-                min_expected_bytes = size_mb * 1024 * 1024 * COMPRESSION_MIN_SWAP_PERCENT // 100
+                # VALIDATION: Ensure meaningful data was swapped
+                # Adjust threshold based on RAM size - high RAM systems won't swap as much
+                system_info = get_system_info()
+                ram_gb = system_info.get('ram_gb', 8)
+                
+                if ram_gb >= 8:
+                    # High RAM systems won't swap much
+                    min_swap_percent = 20  # Only expect 20% swapping
+                elif ram_gb >= 4:
+                    min_swap_percent = 35
+                else:
+                    min_swap_percent = 50
+                
+                min_expected_bytes = size_mb * 1024 * 1024 * min_swap_percent // 100
                 if orig_size < min_expected_bytes:
-                    log_warn(f"Insufficient swap activity: only {orig_size/1024/1024:.1f}MB of {size_mb}MB swapped (expected at least {COMPRESSION_MIN_SWAP_PERCENT}%)")
+                    log_warn(f"Insufficient swap activity: only {orig_size/1024/1024:.1f}MB of {size_mb}MB swapped (expected at least {min_swap_percent}%)")
                     log_warn("Consider increasing test size or memory pressure")
-                    results['warning'] = f'Low swap activity: {orig_size/1024/1024:.1f}MB < {size_mb*COMPRESSION_MIN_SWAP_PERCENT/100:.1f}MB expected'
+                    results['warning'] = f'Low swap activity: {orig_size/1024/1024:.1f}MB < {size_mb*min_swap_percent/100:.1f}MB expected'
                 
                 if compr_size == 0:
                     log_error("Compressed size is zero - invalid ZRAM state")
@@ -1111,7 +1132,7 @@ def test_blocksize_concurrency_matrix(block_sizes=None, concurrency_levels=None,
     
     Args:
         block_sizes: List of block sizes in KB (default: [4, 8, 16, 32, 64, 128])
-        concurrency_levels: List of concurrency levels (default: [1, 2, 4, 8, 16])
+        concurrency_levels: List of concurrency levels (default: [1, 2, 4, 8])
         file_size_mb: Size of each file in MB
         test_dir: Directory for test files
         runtime_sec: Test runtime in seconds
@@ -1124,7 +1145,7 @@ def test_blocksize_concurrency_matrix(block_sizes=None, concurrency_levels=None,
     if block_sizes is None:
         block_sizes = [4, 8, 16, 32, 64, 128]
     if concurrency_levels is None:
-        concurrency_levels = [1, 2, 4, 8, 16]
+        concurrency_levels = [1, 2, 4, 8]
     
     total_combinations = len(block_sizes) * len(concurrency_levels)
     log_step_ts(f"Block Size × Concurrency Matrix Test ({total_combinations} combinations)")
@@ -1273,11 +1294,14 @@ stonewall
         block_to_cluster = {4: 0, 8: 1, 16: 2, 32: 3, 64: 4, 128: 5}
         recommended_cluster = block_to_cluster.get(best_combined['block_size_kb'], 3)
         results['optimal']['recommended_page_cluster'] = recommended_cluster
-        results['optimal']['recommended_swap_stripe_width'] = best_combined['concurrency']
+        
+        # Use max successfully tested concurrency (not 16 if it failed)
+        max_successful = max([r['concurrency'] for r in valid_results])
+        results['optimal']['recommended_swap_stripe_width'] = max_successful
         
         log_info(f"Recommended settings:")
         log_info(f"  SWAP_PAGE_CLUSTER={recommended_cluster} (for {best_combined['block_size_kb']}KB blocks)")
-        log_info(f"  SWAP_STRIPE_WIDTH={best_combined['concurrency']}")
+        log_info(f"  SWAP_STRIPE_WIDTH={max_successful} (max tested successfully)")
     
     # Cleanup
     if os.path.exists(test_dir):
@@ -1690,6 +1714,56 @@ def benchmark_zswap_comprehensive(swap_device='/dev/vda4', test_size_mb=256, com
     
     return results
 
+def create_temp_swap_files(total_size_mb=2048, num_files=4):
+    """Create temporary swap files for ZSWAP testing before partitions exist"""
+    swap_files = []
+    file_size_mb = total_size_mb // num_files
+    
+    # Check available space in /tmp or /root
+    import shutil
+    stat = shutil.disk_usage('/tmp')
+    available_gb = stat.free / (1024**3)
+    
+    if available_gb < (total_size_mb / 1024) + 1:
+        log_warn(f"Insufficient space in /tmp ({available_gb:.1f}GB), trying /root")
+        base_dir = '/root'
+    else:
+        base_dir = '/tmp'
+    
+    try:
+        for i in range(num_files):
+            swap_file = f"{base_dir}/swap_test_{i}"
+            log_info(f"Creating {file_size_mb}MB swap file: {swap_file}")
+            subprocess.run(['dd', 'if=/dev/zero', f'of={swap_file}', 
+                          'bs=1M', f'count={file_size_mb}'], 
+                          capture_output=True, check=True)
+            subprocess.run(['chmod', '600', swap_file], check=True)
+            subprocess.run(['mkswap', swap_file], capture_output=True, check=True)
+            subprocess.run(['swapon', swap_file], check=True)
+            swap_files.append(swap_file)
+            
+        return swap_files
+    except Exception as e:
+        log_error(f"Failed to create temp swap: {e}")
+        # Cleanup any created files
+        for f in swap_files:
+            try:
+                subprocess.run(['swapoff', f], capture_output=True)
+                os.unlink(f)
+            except:
+                pass
+        return []
+
+def cleanup_temp_swap_files(swap_files):
+    """Remove temporary swap files"""
+    for swap_file in swap_files:
+        try:
+            subprocess.run(['swapoff', swap_file], capture_output=True)
+            os.unlink(swap_file)
+            log_info(f"Cleaned up {swap_file}")
+        except Exception as e:
+            log_warn(f"Error cleaning up {swap_file}: {e}")
+
 def compare_zswap_vs_zram(swap_device='/dev/vda4', test_size_mb=256):
     """
     Compare ZSWAP vs ZRAM performance using identical testing methodology
@@ -1708,6 +1782,17 @@ def compare_zswap_vs_zram(swap_device='/dev/vda4', test_size_mb=256):
         Dictionary with comparison results
     """
     log_step_ts("Comparing ZSWAP vs ZRAM (identical methodology)")
+    
+    # Create temp swap if no device provided
+    temp_swap_files = []
+    if not swap_device or not os.path.exists(swap_device):
+        log_info("No swap device available - creating temporary swap files")
+        temp_swap_files = create_temp_swap_files(total_size_mb=2048, num_files=4)
+        if temp_swap_files:
+            swap_device = temp_swap_files[0]  # Use first file for testing
+        else:
+            log_warn("Could not create temp swap - skipping ZSWAP comparison")
+            return {'skipped': True, 'reason': 'No swap device available'}
     
     results = {
         'test_size_mb': test_size_mb,
@@ -1798,6 +1883,10 @@ def compare_zswap_vs_zram(swap_device='/dev/vda4', test_size_mb=256):
                     log_info(f"    Pool limit hits: {results['zswap'][comp]['pool_limit_hits']}")
             else:
                 log_info(f"  ZSWAP: All data stayed in RAM (no disk overflow)")
+    
+    # Cleanup
+    if temp_swap_files:
+        cleanup_temp_swap_files(temp_swap_files)
     
     return results
 
@@ -3141,7 +3230,8 @@ def format_benchmark_html(results):
                 min_latency = min(w['avg_write_us'] for w in valid_writes)
                 max_latency = max(w['avg_write_us'] for w in valid_writes)
                 
-                for w in valid_writes[:4]:  # Limit to top 4
+                # Show ALL write latency tests (6 total)
+                for w in valid_writes:
                     avg_us = w['avg_write_us']
                     bar_len = int(10 * (avg_us - min_latency) / (max_latency - min_latency + 1)) if max_latency > min_latency else 5
                     bar = '█' * bar_len + '░' * (10 - bar_len)

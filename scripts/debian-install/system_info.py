@@ -193,8 +193,10 @@ class SystemInfo:
                     if len(parts) >= 3:
                         device_info = {
                             'device': parts[0],
-                            'size': parts[2],
-                            'priority': parts[3] if len(parts) > 3 else 'unknown'
+                            'type': parts[1] if len(parts) > 1 else 'unknown',
+                            'size': parts[2] if len(parts) > 2 else 'unknown',
+                            'used': parts[3] if len(parts) > 3 else 'unknown',
+                            'priority': parts[4] if len(parts) > 4 else 'unknown'
                         }
                         info['devices'].append(device_info)
                 
