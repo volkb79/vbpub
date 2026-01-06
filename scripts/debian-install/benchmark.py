@@ -254,16 +254,19 @@ def check_dependencies():
 
 def compile_c_programs():
     """
-    Compile mem_locker and mem_pressure C programs at runtime.
+    Compile mem_locker, mem_pressure, and latency measurement C programs at runtime.
     Returns True if successful, False otherwise.
     """
     script_dir = Path(__file__).parent
     programs = {
         'mem_locker': script_dir / 'mem_locker.c',
-        'mem_pressure': script_dir / 'mem_pressure.c'
+        'mem_pressure': script_dir / 'mem_pressure.c',
+        'mem_write_bench': script_dir / 'mem_write_bench.c',
+        'mem_read_bench': script_dir / 'mem_read_bench.c',
+        'mem_mixed_bench': script_dir / 'mem_mixed_bench.c'
     }
     
-    log_info_ts("Compiling C memory management programs...")
+    log_info_ts("Compiling C memory management and latency measurement programs...")
     
     for prog_name, source_file in programs.items():
         if not source_file.exists():
@@ -1064,6 +1067,423 @@ def compare_memory_only():
     
     return results
 
+def benchmark_write_latency(compressor, allocator, test_size_mb=100, pattern=0, test_num=None, total_tests=None):
+    """
+    Measure page write (swap-out) latency.
+    
+    Process:
+    1. Setup ZRAM/ZSWAP with specified compressor/allocator
+    2. Run mem_write_bench with specified data pattern
+    3. Collect latency statistics
+    
+    Args:
+        compressor: Compression algorithm (lz4, zstd, lzo-rle)
+        allocator: Memory allocator (zsmalloc, z3fold, zbud)
+        test_size_mb: Size of memory to test in MB
+        pattern: Data pattern (0=mixed, 1=random, 2=zeros, 3=sequential)
+        test_num: Current test number (for progress tracking)
+        total_tests: Total number of tests (for progress tracking)
+    
+    Returns:
+        Dictionary with latency statistics
+    """
+    start_time = time.time()
+    
+    progress_str = f"[{test_num}/{total_tests}] " if test_num and total_tests else ""
+    log_step_ts(f"{progress_str}Write latency test: {compressor} + {allocator} (pattern={pattern})")
+    
+    results = {
+        'compressor': compressor,
+        'allocator': allocator,
+        'test_size_mb': test_size_mb,
+        'pattern': pattern,
+        'timestamp': datetime.now().isoformat()
+    }
+    
+    try:
+        # Ensure ZRAM is loaded and clean
+        if not ensure_zram_loaded():
+            results['error'] = "Failed to load/reset ZRAM device"
+            return results
+        
+        # Set allocator
+        if os.path.exists('/sys/block/zram0/mem_pool'):
+            try:
+                with open('/sys/block/zram0/mem_pool', 'w') as f:
+                    f.write(f'{allocator}\n')
+            except:
+                log_warn(f"Could not set allocator to {allocator}")
+        
+        # Set compressor
+        if os.path.exists('/sys/block/zram0/comp_algorithm'):
+            try:
+                with open('/sys/block/zram0/comp_algorithm', 'w') as f:
+                    f.write(f'{compressor}\n')
+            except:
+                log_warn(f"Could not set compressor to {compressor}")
+        
+        # Set ZRAM size
+        size_bytes = test_size_mb * 1024 * 1024
+        try:
+            with open('/sys/block/zram0/disksize', 'w') as f:
+                f.write(str(size_bytes))
+        except OSError as e:
+            log_error(f"Failed to set ZRAM disk size: {e}")
+            results['error'] = f"Failed to set disksize: {e}"
+            return results
+        
+        # Enable swap
+        run_command('mkswap /dev/zram0')
+        run_command('swapon -p 100 /dev/zram0')
+        
+        # Run mem_write_bench
+        script_dir = Path(__file__).parent
+        mem_write_bench_path = script_dir / 'mem_write_bench'
+        
+        if not mem_write_bench_path.exists():
+            results['error'] = "mem_write_bench not found"
+            return results
+        
+        log_info(f"Running mem_write_bench ({test_size_mb}MB, pattern={pattern})...")
+        result = subprocess.run(
+            [str(mem_write_bench_path), str(test_size_mb), str(pattern)],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+        
+        if result.returncode == 0:
+            # Parse JSON output
+            try:
+                bench_results = json.loads(result.stdout)
+                results.update(bench_results)
+                log_info(f"  Write latency: avg={bench_results.get('avg_write_us', 0):.2f}µs, "
+                        f"p95={bench_results.get('p95_write_us', 0):.2f}µs, "
+                        f"p99={bench_results.get('p99_write_us', 0):.2f}µs")
+            except json.JSONDecodeError as e:
+                log_error(f"Failed to parse mem_write_bench output: {e}")
+                results['error'] = f"JSON parse error: {e}"
+        else:
+            log_error(f"mem_write_bench failed with code {result.returncode}")
+            log_debug(f"Stderr: {result.stderr}")
+            results['error'] = f"Exit code {result.returncode}"
+    
+    except subprocess.TimeoutExpired:
+        log_error("Write latency test timed out")
+        results['error'] = "Timeout"
+    except Exception as e:
+        log_error(f"Write latency test failed: {e}")
+        results['error'] = str(e)
+    finally:
+        # Cleanup
+        run_command('swapoff /dev/zram0', check=False)
+        if os.path.exists('/sys/block/zram0/reset'):
+            try:
+                with open('/sys/block/zram0/reset', 'w') as f:
+                    f.write('1\n')
+            except:
+                pass
+    
+    elapsed = time.time() - start_time
+    results['elapsed_sec'] = round(elapsed, 1)
+    log_info(f"✓ Test completed in {elapsed:.1f}s")
+    
+    return results
+
+def benchmark_read_latency(compressor, allocator, test_size_mb=100, access_pattern=0, test_num=None, total_tests=None):
+    """
+    Measure page read (page fault + decompress) latency.
+    
+    Process:
+    1. Setup ZRAM/ZSWAP
+    2. Run mem_read_bench with specified access pattern
+    3. Measure page fault latency
+    
+    Args:
+        compressor: Compression algorithm
+        allocator: Memory allocator
+        test_size_mb: Size of memory to test in MB
+        access_pattern: Access pattern (0=sequential, 1=random, 2=stride)
+        test_num: Current test number (for progress tracking)
+        total_tests: Total number of tests (for progress tracking)
+    
+    Returns:
+        Dictionary with latency statistics
+    """
+    start_time = time.time()
+    
+    pattern_names = ["sequential", "random", "stride"]
+    pattern_name = pattern_names[access_pattern] if 0 <= access_pattern <= 2 else "unknown"
+    
+    progress_str = f"[{test_num}/{total_tests}] " if test_num and total_tests else ""
+    log_step_ts(f"{progress_str}Read latency test: {compressor} + {allocator} ({pattern_name})")
+    
+    results = {
+        'compressor': compressor,
+        'allocator': allocator,
+        'test_size_mb': test_size_mb,
+        'access_pattern': pattern_name,
+        'timestamp': datetime.now().isoformat()
+    }
+    
+    try:
+        # Ensure ZRAM is loaded and clean
+        if not ensure_zram_loaded():
+            results['error'] = "Failed to load/reset ZRAM device"
+            return results
+        
+        # Set allocator
+        if os.path.exists('/sys/block/zram0/mem_pool'):
+            try:
+                with open('/sys/block/zram0/mem_pool', 'w') as f:
+                    f.write(f'{allocator}\n')
+            except:
+                log_warn(f"Could not set allocator to {allocator}")
+        
+        # Set compressor
+        if os.path.exists('/sys/block/zram0/comp_algorithm'):
+            try:
+                with open('/sys/block/zram0/comp_algorithm', 'w') as f:
+                    f.write(f'{compressor}\n')
+            except:
+                log_warn(f"Could not set compressor to {compressor}")
+        
+        # Set ZRAM size
+        size_bytes = test_size_mb * 1024 * 1024
+        try:
+            with open('/sys/block/zram0/disksize', 'w') as f:
+                f.write(str(size_bytes))
+        except OSError as e:
+            log_error(f"Failed to set ZRAM disk size: {e}")
+            results['error'] = f"Failed to set disksize: {e}"
+            return results
+        
+        # Enable swap
+        run_command('mkswap /dev/zram0')
+        run_command('swapon -p 100 /dev/zram0')
+        
+        # Run mem_read_bench
+        script_dir = Path(__file__).parent
+        mem_read_bench_path = script_dir / 'mem_read_bench'
+        
+        if not mem_read_bench_path.exists():
+            results['error'] = "mem_read_bench not found"
+            return results
+        
+        log_info(f"Running mem_read_bench ({test_size_mb}MB, {pattern_name})...")
+        result = subprocess.run(
+            [str(mem_read_bench_path), str(test_size_mb), str(access_pattern)],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+        
+        if result.returncode == 0:
+            # Parse JSON output
+            try:
+                bench_results = json.loads(result.stdout)
+                results.update(bench_results)
+                log_info(f"  Read latency: avg={bench_results.get('avg_read_us', 0):.2f}µs, "
+                        f"p95={bench_results.get('p95_read_us', 0):.2f}µs, "
+                        f"p99={bench_results.get('p99_read_us', 0):.2f}µs")
+            except json.JSONDecodeError as e:
+                log_error(f"Failed to parse mem_read_bench output: {e}")
+                results['error'] = f"JSON parse error: {e}"
+        else:
+            log_error(f"mem_read_bench failed with code {result.returncode}")
+            log_debug(f"Stderr: {result.stderr}")
+            results['error'] = f"Exit code {result.returncode}"
+    
+    except subprocess.TimeoutExpired:
+        log_error("Read latency test timed out")
+        results['error'] = "Timeout"
+    except Exception as e:
+        log_error(f"Read latency test failed: {e}")
+        results['error'] = str(e)
+    finally:
+        # Cleanup
+        run_command('swapoff /dev/zram0', check=False)
+        if os.path.exists('/sys/block/zram0/reset'):
+            try:
+                with open('/sys/block/zram0/reset', 'w') as f:
+                    f.write('1\n')
+            except:
+                pass
+    
+    elapsed = time.time() - start_time
+    results['elapsed_sec'] = round(elapsed, 1)
+    log_info(f"✓ Test completed in {elapsed:.1f}s")
+    
+    return results
+
+def benchmark_native_ram_baseline(test_size_mb=100):
+    """
+    Measure native RAM access latency (no swap).
+    
+    Provides baseline for comparison - this is the "ideal" performance target.
+    Measures pure RAM read/write speed without any swap or compression overhead.
+    
+    Args:
+        test_size_mb: Size of memory to test in MB
+    
+    Returns:
+        Dictionary with baseline read/write latency in nanoseconds
+    """
+    log_step_ts("Native RAM baseline test (no swap)")
+    
+    results = {
+        'type': 'native_ram',
+        'test_size_mb': test_size_mb,
+        'timestamp': datetime.now().isoformat()
+    }
+    
+    try:
+        # Run a simple memory access benchmark without any swap
+        # We'll use a minimal C-like approach via Python for simplicity
+        import array
+        import time
+        
+        size_bytes = test_size_mb * 1024 * 1024
+        
+        log_info(f"Testing native RAM access ({test_size_mb}MB)...")
+        
+        # Write test
+        log_info("Measuring write speed...")
+        data = bytearray(size_bytes)
+        
+        write_start = time.time()
+        for i in range(0, size_bytes, 4096):
+            data[i] = (i % 256)
+        write_end = time.time()
+        
+        write_ns_per_page = ((write_end - write_start) * 1e9) / (size_bytes / 4096)
+        
+        # Read test
+        log_info("Measuring read speed...")
+        dummy = 0
+        read_start = time.time()
+        for i in range(0, size_bytes, 4096):
+            dummy += data[i]
+        read_end = time.time()
+        
+        read_ns_per_page = ((read_end - read_start) * 1e9) / (size_bytes / 4096)
+        
+        # Calculate bandwidth
+        write_time = write_end - write_start
+        read_time = read_end - read_start
+        write_gb_per_sec = (size_bytes / (1024**3)) / write_time if write_time > 0 else 0
+        read_gb_per_sec = (size_bytes / (1024**3)) / read_time if read_time > 0 else 0
+        
+        results['read_ns'] = round(read_ns_per_page, 2)
+        results['write_ns'] = round(write_ns_per_page, 2)
+        results['read_gb_per_sec'] = round(read_gb_per_sec, 2)
+        results['write_gb_per_sec'] = round(write_gb_per_sec, 2)
+        
+        log_info(f"  Native RAM read: {read_ns_per_page:.0f} ns/page ({read_gb_per_sec:.2f} GB/s)")
+        log_info(f"  Native RAM write: {write_ns_per_page:.0f} ns/page ({write_gb_per_sec:.2f} GB/s)")
+        log_info(f"✓ Baseline established")
+        
+    except Exception as e:
+        log_error(f"Baseline test failed: {e}")
+        results['error'] = str(e)
+    
+    return results
+
+def benchmark_latency_comparison(test_size_mb=100):
+    """
+    Comprehensive comparison of latency across all configurations.
+    
+    Tests matrix:
+    - Baseline: Native RAM (no swap)
+    - ZRAM: lz4/zstd × zsmalloc/zbud (4 combinations for efficiency)
+    - Access patterns: sequential/random for reads
+    - Operations: read/write
+    
+    Args:
+        test_size_mb: Size of memory to test in MB
+    
+    Returns:
+        Dictionary with comprehensive latency comparison
+    """
+    log_step_ts("Comprehensive latency comparison")
+    
+    results = {
+        'timestamp': datetime.now().isoformat(),
+        'test_size_mb': test_size_mb,
+        'baseline': {},
+        'write_latency': [],
+        'read_latency': []
+    }
+    
+    # 1. Baseline: Native RAM
+    log_info("\n=== Phase 1: Native RAM Baseline ===")
+    results['baseline'] = benchmark_native_ram_baseline(test_size_mb)
+    
+    # 2. Write latency tests
+    log_info("\n=== Phase 2: Write Latency Tests ===")
+    write_configs = [
+        ('lz4', 'zsmalloc'),
+        ('lz4', 'zbud'),
+        ('zstd', 'zsmalloc'),
+        ('zstd', 'zbud')
+    ]
+    
+    for i, (comp, alloc) in enumerate(write_configs, 1):
+        result = benchmark_write_latency(comp, alloc, test_size_mb, pattern=0,
+                                        test_num=i, total_tests=len(write_configs))
+        results['write_latency'].append(result)
+    
+    # 3. Read latency tests (sequential and random)
+    log_info("\n=== Phase 3: Read Latency Tests ===")
+    read_configs = [
+        ('lz4', 'zsmalloc', 0),   # sequential
+        ('lz4', 'zsmalloc', 1),   # random
+        ('zstd', 'zsmalloc', 0),  # sequential
+        ('zstd', 'zsmalloc', 1),  # random
+    ]
+    
+    for i, (comp, alloc, pattern) in enumerate(read_configs, 1):
+        result = benchmark_read_latency(comp, alloc, test_size_mb, pattern,
+                                       test_num=i, total_tests=len(read_configs))
+        results['read_latency'].append(result)
+    
+    # 4. Generate comparison summary
+    log_info("\n=== Latency Comparison Summary ===")
+    
+    if 'read_ns' in results['baseline']:
+        baseline_read_ns = results['baseline']['read_ns']
+        baseline_write_ns = results['baseline']['write_ns']
+        
+        log_info(f"Baseline (Native RAM):")
+        log_info(f"  Read:  {baseline_read_ns:.0f} ns/page")
+        log_info(f"  Write: {baseline_write_ns:.0f} ns/page")
+        log_info("")
+        
+        # Compare write latencies
+        for result in results['write_latency']:
+            if 'avg_write_us' in result and 'error' not in result:
+                avg_us = result['avg_write_us']
+                avg_ns = avg_us * 1000
+                slowdown = avg_ns / baseline_write_ns if baseline_write_ns > 0 else 0
+                log_info(f"{result['compressor']:8s} + {result['allocator']:8s} write: "
+                        f"{avg_us:7.2f}µs ({slowdown:.0f}x slower than RAM)")
+        
+        log_info("")
+        
+        # Compare read latencies
+        for result in results['read_latency']:
+            if 'avg_read_us' in result and 'error' not in result:
+                avg_us = result['avg_read_us']
+                avg_ns = avg_us * 1000
+                slowdown = avg_ns / baseline_read_ns if baseline_read_ns > 0 else 0
+                pattern = result.get('access_pattern', 'unknown')
+                log_info(f"{result['compressor']:8s} + {result['allocator']:8s} read ({pattern:10s}): "
+                        f"{avg_us:7.2f}µs ({slowdown:.0f}x slower than RAM)")
+    
+    log_info("\n✓ Latency comparison complete")
+    
+    return results
+
 def export_shell_config(results, output_file):
     """Export optimal configuration as shell script"""
     log_step(f"Exporting configuration to {output_file}")
@@ -1442,13 +1862,14 @@ Examples:
   %(prog)s --test-compressors
   %(prog)s --test-allocators
   %(prog)s --test-concurrency 8
+  %(prog)s --test-latency --latency-size 100
   %(prog)s --compare-memory-only
   %(prog)s --output results.json --shell-config swap.conf
         """
     )
     
     parser.add_argument('--test-all', action='store_true',
-                       help='Run all benchmarks')
+                       help='Run all benchmarks including latency tests')
     parser.add_argument('--block-size', type=int, metavar='KB',
                        help='Test specific block size in KB')
     parser.add_argument('--test-compressors', action='store_true',
@@ -1459,6 +1880,10 @@ Examples:
                        help='Compare ZRAM configurations')
     parser.add_argument('--test-concurrency', type=int, metavar='N',
                        help='Test concurrency with N swap files')
+    parser.add_argument('--test-latency', action='store_true',
+                       help='Run comprehensive latency comparison tests')
+    parser.add_argument('--latency-size', type=int, metavar='MB', default=100,
+                       help='Size for latency tests in MB (default: 100)')
     parser.add_argument('--duration', type=int, metavar='SEC', default=5,
                        help='Test duration in seconds for each I/O parameter set (default: 5)')
     parser.add_argument('--small-tests', action='store_true',
@@ -1649,6 +2074,12 @@ Examples:
     
     if args.compare_memory_only:
         results['memory_only_comparison'] = compare_memory_only()
+    
+    # Latency tests
+    if args.test_all or args.test_latency:
+        latency_size = args.latency_size
+        log_info(f"\n=== Running Latency Tests ({latency_size}MB) ===")
+        results['latency_comparison'] = benchmark_latency_comparison(latency_size)
     
     # Calculate and log total elapsed time
     total_elapsed = time.time() - benchmark_start_time

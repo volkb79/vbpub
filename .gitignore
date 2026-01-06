@@ -9,6 +9,9 @@ __pycache__/
 # Compiled C programs (compile at runtime)
 scripts/debian-install/mem_locker
 scripts/debian-install/mem_pressure
+scripts/debian-install/mem_write_bench
+scripts/debian-install/mem_read_bench
+scripts/debian-install/mem_mixed_bench
 
 # Distribution / packaging
 .Python
