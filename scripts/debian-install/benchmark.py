@@ -704,6 +704,40 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         run_command('mkswap /dev/zram0')
         run_command('swapon -p 100 /dev/zram0')
         
+        # Optional: Start mem_locker to lock free RAM (prevents non-test memory from swapping)
+        # This is optional but makes tests more reliable and predictable
+        mem_locker_proc = None
+        script_dir = Path(__file__).parent
+        mem_locker_path = script_dir / 'mem_locker'
+        
+        # Calculate how much memory to lock
+        test_alloc_mb, lock_mb, available_mb = calculate_memory_distribution(size_mb)
+        
+        if lock_mb > 100 and mem_locker_path.exists():
+            # Only use mem_locker if we have significant memory to lock (>100MB)
+            try:
+                log_info_ts(f"Starting mem_locker to reserve {lock_mb}MB of free RAM...")
+                mem_locker_proc = subprocess.Popen(
+                    [str(mem_locker_path), str(lock_mb)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                # Give it a moment to allocate and lock memory
+                time.sleep(2)
+                
+                # Check if it's still running
+                if mem_locker_proc.poll() is not None:
+                    log_warn("mem_locker exited prematurely, continuing without it")
+                    mem_locker_proc = None
+                else:
+                    log_info(f"✓ mem_locker running (PID: {mem_locker_proc.pid})")
+            except Exception as e:
+                log_warn(f"Failed to start mem_locker: {e}")
+                mem_locker_proc = None
+        elif lock_mb <= 100:
+            log_debug_ts(f"Skipping mem_locker (only {lock_mb}MB would be locked)")
+        
         # Create memory pressure to force actual swapping to ZRAM
         # The key is to allocate MORE than available RAM to force the kernel to swap
         
@@ -839,7 +873,21 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         elapsed = time.time() - start_time
         log_error(f"Test failed after {elapsed:.1f}s")
     finally:
-        # Cleanup
+        # Cleanup mem_locker if it was started
+        if 'mem_locker_proc' in locals() and mem_locker_proc is not None:
+            try:
+                log_info("Stopping mem_locker...")
+                mem_locker_proc.terminate()
+                mem_locker_proc.wait(timeout=5)
+                log_info("✓ mem_locker stopped")
+            except subprocess.TimeoutExpired:
+                log_warn("mem_locker didn't stop gracefully, killing it")
+                mem_locker_proc.kill()
+                mem_locker_proc.wait()
+            except Exception as e:
+                log_warn(f"Error stopping mem_locker: {e}")
+        
+        # Cleanup swap
         run_command('swapoff /dev/zram0', check=False)
         if os.path.exists('/sys/block/zram0/reset'):
             try:
