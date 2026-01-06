@@ -498,6 +498,69 @@ def ensure_zram_loaded():
         log_error(f"Failed to ensure ZRAM loaded: {e}")
         return False
 
+def cleanup_zram_aggressive():
+    """
+    Aggressively clean up ZRAM device with retries.
+    Returns True on success, False on failure.
+    """
+    max_attempts = 5
+    for attempt in range(max_attempts):
+        try:
+            # Disable swap
+            subprocess.run(['swapoff', '/dev/zram0'], 
+                         stderr=subprocess.DEVNULL, check=False)
+            time.sleep(1)  # Wait for kernel to release device
+            
+            # Reset device
+            if os.path.exists('/sys/block/zram0/reset'):
+                with open('/sys/block/zram0/reset', 'w') as f:
+                    f.write('1\n')
+                
+                time.sleep(1)  # Wait for reset to complete
+                
+                # Verify device is clean
+                if os.path.exists('/sys/block/zram0/disksize'):
+                    with open('/sys/block/zram0/disksize', 'r') as f:
+                        disksize = f.read().strip()
+                        if disksize == '0':
+                            return True
+                else:
+                    return True
+                        
+        except Exception as e:
+            if attempt < max_attempts - 1:
+                log_debug(f"ZRAM cleanup attempt {attempt + 1} failed: {e}, retrying...")
+                time.sleep(2 ** attempt)  # Exponential backoff
+                continue
+            log_error(f"Failed to cleanup ZRAM after {max_attempts} attempts: {e}")
+            return False
+    
+    return False
+
+def cleanup_test_files():
+    """Clean up all temporary test files."""
+    patterns = [
+        '/tmp/fio_*.job',
+        '/tmp/benchmark-*.sh',
+        '/tmp/ptable-*.dump',
+        '/var/tmp/swapfile*',
+        # Compiled C programs
+        'mem_locker',
+        'mem_pressure', 
+        'mem_write_bench',
+        'mem_read_bench',
+        'mem_mixed_bench'
+    ]
+    
+    for pattern in patterns:
+        for file in glob.glob(pattern):
+            try:
+                if os.path.exists(file):
+                    os.remove(file)
+                    log_debug(f"Cleaned up: {file}")
+            except Exception as e:
+                log_debug(f"Failed to remove {file}: {e}")
+
 def benchmark_block_size_fio(size_kb, test_file='/tmp/fio_test', runtime_sec=5, pattern='sequential', test_num=None, total_tests=None):
     """
     Benchmark I/O performance with fio (more accurate than dd)
@@ -909,13 +972,7 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
                 log_warn(f"Error stopping mem_locker: {e}")
         
         # Cleanup swap
-        run_command('swapoff /dev/zram0', check=False)
-        if os.path.exists('/sys/block/zram0/reset'):
-            try:
-                with open('/sys/block/zram0/reset', 'w') as f:
-                    f.write('1\n')
-            except:
-                pass
+        cleanup_zram_aggressive()
     
     return results
 
@@ -1849,13 +1906,7 @@ def benchmark_write_latency(compressor, allocator, test_size_mb=100, pattern=0, 
         results['error'] = str(e)
     finally:
         # Cleanup
-        run_command('swapoff /dev/zram0', check=False)
-        if os.path.exists('/sys/block/zram0/reset'):
-            try:
-                with open('/sys/block/zram0/reset', 'w') as f:
-                    f.write('1\n')
-            except:
-                pass
+        cleanup_zram_aggressive()
     
     elapsed = time.time() - start_time
     results['elapsed_sec'] = round(elapsed, 1)
@@ -1975,13 +2026,7 @@ def benchmark_read_latency(compressor, allocator, test_size_mb=100, access_patte
         results['error'] = str(e)
     finally:
         # Cleanup
-        run_command('swapoff /dev/zram0', check=False)
-        if os.path.exists('/sys/block/zram0/reset'):
-            try:
-                with open('/sys/block/zram0/reset', 'w') as f:
-                    f.write('1\n')
-            except:
-                pass
+        cleanup_zram_aggressive()
     
     elapsed = time.time() - start_time
     results['elapsed_sec'] = round(elapsed, 1)
