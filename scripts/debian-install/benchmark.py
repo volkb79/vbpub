@@ -255,6 +255,7 @@ def check_dependencies():
 def compile_c_programs():
     """
     Compile mem_locker, mem_pressure, and latency measurement C programs at runtime.
+    Total: 5 programs (mem_locker, mem_pressure, mem_write_bench, mem_read_bench, mem_mixed_bench)
     Returns True if successful, False otherwise.
     """
     script_dir = Path(__file__).parent
@@ -1141,7 +1142,7 @@ def benchmark_write_latency(compressor, allocator, test_size_mb=100, pattern=0, 
         mem_write_bench_path = script_dir / 'mem_write_bench'
         
         if not mem_write_bench_path.exists():
-            results['error'] = "mem_write_bench not found"
+            results['error'] = "mem_write_bench executable not found. Run compilation first or check if the C program built successfully."
             return results
         
         log_info(f"Running mem_write_bench ({test_size_mb}MB, pattern={pattern})...")
@@ -1267,7 +1268,7 @@ def benchmark_read_latency(compressor, allocator, test_size_mb=100, access_patte
         mem_read_bench_path = script_dir / 'mem_read_bench'
         
         if not mem_read_bench_path.exists():
-            results['error'] = "mem_read_bench not found"
+            results['error'] = "mem_read_bench executable not found. Run compilation first or check if the C program built successfully."
             return results
         
         log_info(f"Running mem_read_bench ({test_size_mb}MB, {pattern_name})...")
