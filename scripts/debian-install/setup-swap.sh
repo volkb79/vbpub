@@ -1229,8 +1229,8 @@ create_swap_partition() {
             ext4|ext3|ext2)
                 # For ext filesystems, need to check first, then resize
                 log_info "Checking ext filesystem integrity..."
-                # Online check (read-only)
-                e2fsck -n -f "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE" || true
+                # Online check (read-only, -n flag prevents modifications, -v for verbose)
+                e2fsck -n -v "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE" || true
                 
                 log_info "Resizing ext filesystem to match partition..."
                 if resize2fs "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
@@ -1485,9 +1485,9 @@ extend_root_partition() {
     
     case "$FS_TYPE" in
         ext4|ext3|ext2)
-            # Check filesystem first
+            # Check filesystem first (read-only check for mounted partition)
             log_info "Checking filesystem integrity..."
-            e2fsck -f -y "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE" || true
+            e2fsck -n -v "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE" || true
             
             # Resize filesystem
             if resize2fs "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
@@ -1553,7 +1553,7 @@ extend_root_partition() {
     if command -v partprobe >/dev/null 2>&1; then
         partprobe "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
     else
-        partx --update "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
+        partx -u "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
     fi
     
     # Wait for device to appear
