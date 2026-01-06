@@ -3104,14 +3104,16 @@ def format_benchmark_html(results):
             html += f"  ZSWAP: {zswap_ratio:.1f}x ratio, {zswap_lat:.1f}µs latency\n"
             
             # Determine winner
-            if zram_lat < zswap_lat:
-                winner = "ZRAM"
-                diff_pct = ((zswap_lat - zram_lat) / zram_lat) * 100
-                html += f"  ⭐ {winner} is {diff_pct:.0f}% faster\n"
-            elif zswap_lat < zram_lat:
-                winner = "ZSWAP"
-                diff_pct = ((zram_lat - zswap_lat) / zswap_lat) * 100
-                html += f"  ⭐ {winner} is {diff_pct:.0f}% faster\n"
+            if zram_lat > 0 and zswap_lat > 0:
+                if zram_lat < zswap_lat:
+                    winner = "ZRAM"
+                    diff_pct = ((zswap_lat - zram_lat) / zram_lat) * 100
+                    html += f"  ⭐ {winner} is {diff_pct:.0f}% faster\n"
+                elif zswap_lat < zram_lat:
+                    winner = "ZSWAP"
+                    diff_pct = ((zram_lat - zswap_lat) / zswap_lat) * 100
+                    html += f"  ⭐ {winner} is {diff_pct:.0f}% faster\n"
+                # If equal, don't show a winner
         html += "\n"
     
     # Latency comparison results
