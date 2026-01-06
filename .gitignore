@@ -6,6 +6,10 @@ __pycache__/
 # C extensions
 *.so
 
+# Compiled C programs (compile at runtime)
+scripts/debian-install/mem_locker
+scripts/debian-install/mem_pressure
+
 # Distribution / packaging
 .Python
 build/
