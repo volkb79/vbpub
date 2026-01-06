@@ -38,7 +38,7 @@ SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE:-auto}"  # files_in_root, partitions_swap
 SWAP_DISK_TOTAL_GB="${SWAP_DISK_TOTAL_GB:-auto}"  # Total disk-based swap (auto = calculated)
 SWAP_STRIPE_WIDTH="${SWAP_STRIPE_WIDTH:-8}"  # Number of parallel swap devices (for I/O striping)
 SWAP_PRIORITY="${SWAP_PRIORITY:-10}"  # Priority for disk swap (lower than RAM)
-EXTEND_ROOT="${EXTEND_ROOT:-no}"
+EXTEND_ROOT="${EXTEND_ROOT:-yes}"
 
 # ZFS-specific
 ZFS_POOL="${ZFS_POOL:-tank}"
@@ -352,6 +352,7 @@ main() {
         log_info "✓ Swap configured"
     else
         log_error "✗ Swap config failed"
+        exit 1
     fi
     
     # Sync and send log file

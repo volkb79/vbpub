@@ -1263,7 +1263,7 @@ stonewall
             }
         }
         
-        log_success_ts("Matrix testing complete!")
+        log_step_ts("Matrix testing complete!")
         log_info(f"Optimal configuration:")
         log_info(f"  Best write: {best_write['block_size_kb']}KB × {best_write['concurrency']} jobs = {best_write['write_mb_per_sec']} MB/s")
         log_info(f"  Best read: {best_read['block_size_kb']}KB × {best_read['concurrency']} jobs = {best_read['read_mb_per_sec']} MB/s")
