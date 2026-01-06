@@ -1424,8 +1424,10 @@ def benchmark_latency_comparison(test_size_mb=100):
     log_info("\n=== Phase 2: Write Latency Tests ===")
     write_configs = [
         ('lz4', 'zsmalloc'),
+        ('lz4', 'z3fold'),
         ('lz4', 'zbud'),
         ('zstd', 'zsmalloc'),
+        ('zstd', 'z3fold'),
         ('zstd', 'zbud')
     ]
     
@@ -1438,8 +1440,12 @@ def benchmark_latency_comparison(test_size_mb=100):
     log_info("\n=== Phase 3: Read Latency Tests ===")
     read_configs = [
         ('lz4', 'zsmalloc', 0),   # sequential
+        ('lz4', 'z3fold', 0),     # sequential
+        ('lz4', 'zbud', 0),       # sequential
         ('lz4', 'zsmalloc', 1),   # random
         ('zstd', 'zsmalloc', 0),  # sequential
+        ('zstd', 'z3fold', 0),    # sequential
+        ('zstd', 'zbud', 0),      # sequential
         ('zstd', 'zsmalloc', 1),  # random
     ]
     
@@ -1534,11 +1540,11 @@ def export_shell_config(results, output_file):
     
     log_info(f"Configuration saved to {output_file}")
 
-def generate_charts(results, output_dir='/var/log/debian-install'):
+def generate_charts(results, output_dir='/var/log/debian-install', webp=False):
     """
     Generate matplotlib charts for benchmark results
     
-    Creates PNG charts for:
+    Creates PNG (or WebP) charts for:
     1. Block size vs Throughput (read/write, sequential/random)
     2. Block size vs Latency
     3. Concurrency vs Throughput scaling
@@ -1547,6 +1553,7 @@ def generate_charts(results, output_dir='/var/log/debian-install'):
     Args:
         results: Benchmark results dictionary
         output_dir: Directory to save PNG files
+        webp: If True, convert PNG to WebP format (smaller file size)
     
     Returns:
         List of generated chart file paths
@@ -1868,6 +1875,35 @@ def generate_charts(results, output_dir='/var/log/debian-install'):
         import traceback
         log_debug(traceback.format_exc())
     
+    # Convert PNG to WebP if requested
+    if webp and chart_files:
+        log_info("Converting charts to WebP format...")
+        webp_files = []
+        try:
+            from PIL import Image
+            for png_file in chart_files:
+                if png_file.endswith('.png'):
+                    webp_file = png_file.replace('.png', '.webp')
+                    try:
+                        img = Image.open(png_file)
+                        img.save(webp_file, 'WEBP', quality=85, method=6)
+                        webp_files.append(webp_file)
+                        # Remove original PNG to save space
+                        os.remove(png_file)
+                        log_info(f"Converted {os.path.basename(png_file)} to WebP")
+                    except Exception as e:
+                        log_warn(f"Failed to convert {png_file} to WebP: {e}")
+                        # Keep original PNG if conversion fails
+                        webp_files.append(png_file)
+            if webp_files:
+                chart_files = webp_files
+                log_info(f"✓ Converted {len(webp_files)} charts to WebP")
+        except ImportError:
+            log_warn("PIL (Pillow) not available - cannot convert to WebP")
+            log_info("Install with: pip3 install Pillow")
+        except Exception as e:
+            log_warn(f"WebP conversion failed: {e}")
+    
     return chart_files
 
 def format_benchmark_html(results):
@@ -1988,21 +2024,32 @@ def format_benchmark_html(results):
     # Concurrency tests with scaling chart
     if 'concurrency' in results and results['concurrency']:
         html += "<b>⚡ Concurrency Scaling:</b>\n"
-        max_total = max((c.get('write_mb_per_sec', 0) + c.get('read_mb_per_sec', 0)) for c in results['concurrency'])
+        # Only compute max_total from successful tests
+        successful_tests = [c for c in results['concurrency'] if 'error' not in c]
+        if successful_tests:
+            max_total = max((c.get('write_mb_per_sec', 0) + c.get('read_mb_per_sec', 0)) for c in successful_tests)
+        else:
+            max_total = 1  # Avoid division by zero
+        
         for concur in results['concurrency']:
             files = concur.get('num_files', 0)
             if files == 0 or not isinstance(files, int):
                 files_str = str(files)
             else:
                 files_str = f"{files:2d}"
-            write_mb = concur.get('write_mb_per_sec', 0)
-            read_mb = concur.get('read_mb_per_sec', 0)
-            total = write_mb + read_mb
-            bar_length = int((total / max_total) * 10) if max_total > 0 else 0
-            bar = '█' * bar_length + '░' * (10 - bar_length)
-            is_best = total == max_total
-            marker = " ⭐" if is_best else ""
-            html += f"  {files_str} files: {bar} ↑{write_mb:.0f} ↓{read_mb:.0f} MB/s{marker}\n"
+            
+            # Check if test failed
+            if 'error' in concur:
+                html += f"  {files_str} files: ❌ FAILED ({concur.get('error', 'unknown error')})\n"
+            else:
+                write_mb = concur.get('write_mb_per_sec', 0)
+                read_mb = concur.get('read_mb_per_sec', 0)
+                total = write_mb + read_mb
+                bar_length = int((total / max_total) * 10) if max_total > 0 else 0
+                bar = '█' * bar_length + '░' * (10 - bar_length)
+                is_best = (total == max_total and max_total > 0)
+                marker = " ⭐" if is_best else ""
+                html += f"  {files_str} files: {bar} ↑{write_mb:.0f} ↓{read_mb:.0f} MB/s{marker}\n"
         html += "\n"
     
     # Latency comparison results
@@ -2311,6 +2358,25 @@ Examples:
         log_info(f"\n=== Running Latency Tests ({latency_size}MB) ===")
         results['latency_comparison'] = benchmark_latency_comparison(latency_size)
     
+    # Final cleanup of temporary test files
+    log_info("Cleaning up temporary test files...")
+    cleanup_patterns = [
+        '/tmp/fio_*.job',
+        '/tmp/fio_test*',
+        '/tmp/swap_test*',
+        '/tmp/ptable-*',
+        '/var/log/debian-install/benchmark-*.png',  # Keep only final charts
+    ]
+    import glob
+    for pattern in cleanup_patterns:
+        try:
+            for f in glob.glob(pattern):
+                if os.path.isfile(f):
+                    os.remove(f)
+                    log_debug(f"Removed {f}")
+        except Exception as e:
+            log_debug(f"Cleanup warning for {pattern}: {e}")
+    
     # Calculate and log total elapsed time
     total_elapsed = time.time() - benchmark_start_time
     results['total_elapsed_sec'] = round(total_elapsed, 1)
@@ -2381,18 +2447,27 @@ Examples:
                     log_error("✗ Failed to send benchmark results to Telegram")
                     log_error(f"Results are available in {local_results_file}")
                 
-                # Send charts as attachments
+                # Send charts as media group (single message with all charts)
                 if chart_files:
-                    log_info(f"Sending {len(chart_files)} performance charts to Telegram...")
-                    # Extract timestamp once to ensure consistency
-                    timestamp_str = datetime.now().strftime('%Y%m%d-%H%M%S')
-                    for chart_file in chart_files:
-                        chart_name = os.path.basename(chart_file).replace('benchmark-', '').replace('.png', '').replace('-' + timestamp_str, '')
-                        caption = f"📊 {chart_name.title()} Chart"
-                        if telegram.send_document(chart_file, caption=caption):
-                            log_info(f"✓ Sent {chart_name} chart")
-                        else:
-                            log_warn(f"Failed to send {chart_name} chart")
+                    log_info(f"Sending {len(chart_files)} performance charts as media group...")
+                    caption = f"📊 Benchmark Charts ({len(chart_files)} charts)"
+                    if telegram.send_media_group(chart_files, caption=caption):
+                        log_info(f"✓ Sent all {len(chart_files)} charts in single message")
+                    else:
+                        log_warn("Failed to send charts as media group, falling back to individual messages")
+                        # Fallback: send charts one by one
+                        timestamp_str = datetime.now().strftime('%Y%m%d-%H%M%S')
+                        for chart_file in chart_files:
+                            # Handle both .png and .webp extensions
+                            chart_name = os.path.basename(chart_file)
+                            for ext in ['.png', '.webp']:
+                                chart_name = chart_name.replace(ext, '')
+                            chart_name = chart_name.replace('benchmark-', '').replace('-' + timestamp_str, '')
+                            caption = f"📊 {chart_name.title()} Chart"
+                            if telegram.send_document(chart_file, caption=caption):
+                                log_info(f"✓ Sent {chart_name} chart")
+                            else:
+                                log_warn(f"Failed to send {chart_name} chart")
             except ValueError as e:
                 log_error(f"Telegram configuration error: {e}")
             except Exception as e:
