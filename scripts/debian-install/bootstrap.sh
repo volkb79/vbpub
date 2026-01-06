@@ -104,6 +104,7 @@ check_and_expand_root_early() {
     # Get available space
     local avail_kb=$(df -k / | tail -1 | awk '{print $4}')
     local avail_gb=$((avail_kb / 1024 / 1024))
+    local original_avail_gb=$avail_gb  # Save original value for reporting
     
     log_info "Available disk space: ${avail_gb}GB"
     
@@ -232,7 +233,7 @@ Expanding root partition before continuing to prevent space issues..."
                 tg_send "✅ <b>Root Expansion Complete</b>
 
 Root partition expanded successfully.
-Available space: ${avail_gb}GB (was ${avail_gb}GB before expansion)"
+Available space: ${avail_gb}GB (was ${original_avail_gb}GB before expansion)"
             else
                 log_warn "Not enough unallocated space (${free_gb}GB) to expand - will proceed carefully"
             fi
