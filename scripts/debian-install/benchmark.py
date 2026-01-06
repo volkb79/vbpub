@@ -479,17 +479,19 @@ def ensure_zram_loaded():
             # First, disable swap if active
             run_command('swapoff /dev/zram0 2>/dev/null || true', check=False)
             
-            # Try to read current disksize
+            # Always reset the device to ensure clean state
+            # This is critical - without reset, disksize writes fail with "Device or resource busy"
             try:
-                with open('/sys/block/zram0/disksize', 'r') as f:
-                    current_size = f.read().strip()
-                    if current_size != '0':
-                        # Device is configured, need to reset using direct file I/O
-                        with open('/sys/block/zram0/reset', 'w') as reset_f:
-                            reset_f.write('1\n')
-                        time.sleep(0.5)
-            except:
-                pass
+                if os.path.exists('/sys/block/zram0/reset'):
+                    log_debug("Resetting ZRAM device...")
+                    with open('/sys/block/zram0/reset', 'w') as reset_f:
+                        reset_f.write('1\n')
+                    # Give kernel time to complete reset
+                    time.sleep(0.5)
+                    log_debug("ZRAM device reset complete")
+            except Exception as e:
+                log_error(f"Failed to reset ZRAM device: {e}")
+                # Don't return False here, try to continue
         
         return True
     except Exception as e:
