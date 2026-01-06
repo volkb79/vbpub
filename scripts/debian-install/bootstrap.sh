@@ -398,11 +398,17 @@ main() {
     if [ "$RUN_GEEKBENCH" = "yes" ]; then
         log_info "==> Running Geekbench (5-10 min)"
         GEEKBENCH_START=$(date +%s)
-        if ./sysinfo-notify.py --geekbench-only 2>&1 | tee -a "$LOG_FILE"; then
+        
+        # Add --notify flag if Telegram is configured
+        GEEKBENCH_ARGS="--geekbench-only"
+        if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            GEEKBENCH_ARGS="--geekbench --notify"
+        fi
+        
+        if ./sysinfo-notify.py $GEEKBENCH_ARGS 2>&1 | tee -a "$LOG_FILE"; then
             GEEKBENCH_END=$(date +%s)
             GEEKBENCH_DURATION=$((GEEKBENCH_END - GEEKBENCH_START))
             log_info "✓ Geekbench complete (took ${GEEKBENCH_DURATION}s)"
-            # Geekbench results are automatically sent via telegram by sysinfo-notify.py
         else
             GEEKBENCH_EXIT_CODE=$?
             GEEKBENCH_END=$(date +%s)

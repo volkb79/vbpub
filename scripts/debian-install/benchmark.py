@@ -3263,21 +3263,29 @@ def format_benchmark_html(results):
             zram_lat = comp['zram'].get('avg_latency_us', 0)
             zswap_lat = comp['zswap'].get('avg_latency_us', 0)
             
-            html += f"  ZRAM:  {zram_ratio:.1f}x ratio, {zram_lat:.1f}µs latency\n"
-            html += f"  ZSWAP: {zswap_ratio:.1f}x ratio, {zswap_lat:.1f}µs latency\n"
-            
-            # Determine winner (avoid division by zero)
-            if zram_lat > 0 and zswap_lat > 0:
-                if zram_lat < zswap_lat:
-                    winner = "ZRAM"
-                    diff_pct = ((zswap_lat - zram_lat) / zram_lat) * 100
-                    html += f"  ⭐ {winner} is {diff_pct:.0f}% faster\n"
-                elif zswap_lat < zram_lat:
-                    winner = "ZSWAP"
-                    diff_pct = ((zram_lat - zswap_lat) / zswap_lat) * 100
-                    html += f"  ⭐ {winner} is {diff_pct:.0f}% faster\n"
-                # If equal latency, don't show a winner
+            # Check for suspicious low ratios (likely failed tests)
+            if zram_ratio < 1.1 or zswap_ratio < 1.1:
+                html += "  ⚠️ <i>Test results appear invalid (compression ratio &lt; 1.1x)</i>\n"
+                html += "  <i>This may indicate test failure or insufficient memory pressure</i>\n"
+            else:
+                html += f"  ZRAM:  {zram_ratio:.1f}x ratio, {zram_lat:.1f}µs latency\n"
+                html += f"  ZSWAP: {zswap_ratio:.1f}x ratio, {zswap_lat:.1f}µs latency\n"
+                
+                # Determine winner (avoid division by zero)
+                if zram_lat > 0 and zswap_lat > 0:
+                    if zram_lat < zswap_lat:
+                        winner = "ZRAM"
+                        diff_pct = ((zswap_lat - zram_lat) / zram_lat) * 100
+                        html += f"  ⭐ {winner} is {diff_pct:.0f}% faster\n"
+                    elif zswap_lat < zram_lat:
+                        winner = "ZSWAP"
+                        diff_pct = ((zram_lat - zswap_lat) / zswap_lat) * 100
+                        html += f"  ⭐ {winner} is {diff_pct:.0f}% faster\n"
+                    # If equal latency, don't show a winner
         html += "\n"
+    elif 'zswap_vs_zram' in results and 'error' in results['zswap_vs_zram']:
+        html += "<b>⚔️ ZSWAP vs ZRAM:</b>\n"
+        html += f"  ⚠️ <i>Test failed: {results['zswap_vs_zram']['error']}</i>\n\n"
     
     # Latency comparison results
     if 'latency_comparison' in results:
@@ -3384,6 +3392,28 @@ def format_benchmark_html(results):
                 html += f"  RAM:   {ram_write:8.0f} ns (baseline)\n"
                 html += f"  ZRAM:  {best_zram_write:8.0f} ns ({best_zram_write/ram_write:4.0f}× slower)\n"
                 html += f"  Disk:  {disk_write_ns/1000:8.0f} µs ({disk_write_ns/ram_write:4.0f}× slower)\n"
+                html += "\n"
+    
+    # Calculate and display overall space efficiency
+    if 'compressors' in results and results['compressors'] and 'system_info' in results:
+        # Find the best compressor (highest compression ratio)
+        best_comp = max(results['compressors'], key=lambda x: x.get('compression_ratio', 0))
+        compression_ratio = best_comp.get('compression_ratio', 0)
+        compressor_name = best_comp.get('compressor', 'N/A')
+        
+        if compression_ratio > 1.0:
+            ram_gb = results['system_info'].get('ram_gb', 0)
+            if ram_gb > 0:
+                # Calculate effective capacity (assuming swap uses all RAM for compression)
+                effective_capacity_gb = ram_gb * compression_ratio
+                space_saved_gb = effective_capacity_gb - ram_gb
+                efficiency_pct = ((compression_ratio - 1.0) / 1.0) * 100
+                
+                html += "<b>💾 Space Efficiency (Optimal Config):</b>\n"
+                html += f"  Physical RAM: {ram_gb:.1f}GB\n"
+                html += f"  Best Compressor: {compressor_name} ({compression_ratio:.1f}x)\n"
+                html += f"  Effective Capacity: {effective_capacity_gb:.1f}GB\n"
+                html += f"  Space Saved: {space_saved_gb:.1f}GB ({efficiency_pct:.0f}% more capacity)\n"
                 html += "\n"
     
     # Memory-only comparison
@@ -3815,12 +3845,17 @@ Examples:
                 log_info("Generating performance charts...")
                 chart_files = generate_charts(results, webp=args.webp)
                 
+                # Filter out non-existent charts
+                chart_files = [f for f in chart_files if os.path.exists(f)]
+                if not chart_files:
+                    log_warn("No charts were generated")
+                
                 # Generate matrix heatmaps if matrix tests were run
                 if 'matrix' in results and isinstance(results['matrix'], dict) and 'matrix' in results['matrix']:
                     try:
                         output_prefix = f"/var/log/debian-install/benchmark-{timestamp_str}"
                         matrix_chart = generate_matrix_heatmaps(results['matrix'], output_prefix)
-                        if matrix_chart:
+                        if matrix_chart and os.path.exists(matrix_chart):
                             chart_files.append(matrix_chart)
                     except Exception as e:
                         log_warn(f"Failed to generate matrix heatmaps: {e}")
