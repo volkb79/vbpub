@@ -709,7 +709,6 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         
         # Optional: Start mem_locker to lock free RAM (prevents non-test memory from swapping)
         # This is optional but makes tests more reliable and predictable
-        mem_locker_proc = None
         script_dir = Path(__file__).parent
         mem_locker_path = script_dir / 'mem_locker'
         

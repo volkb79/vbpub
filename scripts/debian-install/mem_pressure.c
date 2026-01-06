@@ -130,8 +130,30 @@ int main(int argc, char *argv[]) {
     }
     
     size_t size_mb = (size_t)size_mb_ull;
-    int pattern_type = (argc >= 3) ? atoi(argv[2]) : 0;
-    int hold_seconds = (argc >= 4) ? atoi(argv[3]) : 15;
+    
+    // Parse pattern_type with validation
+    int pattern_type = 0;
+    if (argc >= 3) {
+        char *endptr2;
+        long pattern_long = strtol(argv[2], &endptr2, 10);
+        if (*endptr2 != '\0' || pattern_long < 0 || pattern_long > 3) {
+            fprintf(stderr, "[mem_pressure] Error: Invalid pattern_type (must be 0-3)\n");
+            return 1;
+        }
+        pattern_type = (int)pattern_long;
+    }
+    
+    // Parse hold_seconds with validation
+    int hold_seconds = 15;
+    if (argc >= 4) {
+        char *endptr3;
+        long hold_long = strtol(argv[3], &endptr3, 10);
+        if (*endptr3 != '\0' || hold_long < 0 || hold_long > 3600) {
+            fprintf(stderr, "[mem_pressure] Error: Invalid hold_seconds (must be 0-3600)\n");
+            return 1;
+        }
+        hold_seconds = (int)hold_long;
+    }
 
     size_t total_size = MB_TO_BYTES(size_mb);
 
