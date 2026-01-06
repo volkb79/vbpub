@@ -73,7 +73,7 @@ SWAP_DISK_TOTAL_GB="${SWAP_DISK_TOTAL_GB:-auto}"  # Total disk-based swap (auto 
 SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE:-auto}"  # files_in_root, partitions_swap, partitions_zvol, files_in_partitions, none (auto = auto-detect)
 SWAP_STRIPE_WIDTH="${SWAP_STRIPE_WIDTH:-8}"  # Number of parallel swap devices (for I/O striping)
 SWAP_PRIORITY="${SWAP_PRIORITY:-10}"  # Priority for disk swap (lower than RAM)
-EXTEND_ROOT="${EXTEND_ROOT:-no}"  # Extend root partition when creating swap partitions at end of disk
+EXTEND_ROOT="${EXTEND_ROOT:-yes}"  # Extend root partition when creating swap partitions at end of disk
 
 # ZFS-specific
 ZFS_POOL="${ZFS_POOL:-tank}"  # ZFS pool name for zvol-based swap
@@ -1216,7 +1216,6 @@ create_swap_partition() {
     
     # Inform kernel of partition table changes
     update_kernel_partition_table "$ROOT_DISK" "$LOG_FILE"
-    fi
     
     # Additional wait for device node creation
     sleep 2
