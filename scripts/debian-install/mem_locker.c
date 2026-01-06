@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <time.h>
+#include <stdint.h>
 
 #define MB_TO_BYTES(mb) ((size_t)(mb) * 1024 * 1024)
 #define CHUNK_SIZE (64 * 1024 * 1024)  // 64MB chunks for progress reporting
@@ -55,12 +56,22 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    size_t size_mb = atol(argv[1]);
-    if (size_mb == 0) {
+    char *endptr;
+    unsigned long long size_mb_ull = strtoull(argv[1], &endptr, 10);
+    
+    // Check for conversion errors
+    if (*endptr != '\0' || size_mb_ull == 0) {
         fprintf(stderr, "[mem_locker] Error: Invalid size specified\n");
         return 1;
     }
-
+    
+    // Check for overflow when converting to size_t
+    if (size_mb_ull > (SIZE_MAX / (1024 * 1024))) {
+        fprintf(stderr, "[mem_locker] Error: Size too large (would overflow)\n");
+        return 1;
+    }
+    
+    size_t size_mb = (size_t)size_mb_ull;
     total_size = MB_TO_BYTES(size_mb);
 
     fprintf(stderr, "[mem_locker] "); print_timestamp(); 

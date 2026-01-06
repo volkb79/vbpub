@@ -663,6 +663,9 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         'timestamp': datetime.now().isoformat()
     }
     
+    # Initialize mem_locker_proc to None so it's in scope for cleanup
+    mem_locker_proc = None
+    
     try:
         # Ensure ZRAM is loaded and clean
         log_info("Ensuring ZRAM device is clean...")
@@ -874,7 +877,7 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         log_error(f"Test failed after {elapsed:.1f}s")
     finally:
         # Cleanup mem_locker if it was started
-        if 'mem_locker_proc' in locals() and mem_locker_proc is not None:
+        if mem_locker_proc is not None:
             try:
                 log_info("Stopping mem_locker...")
                 mem_locker_proc.terminate()

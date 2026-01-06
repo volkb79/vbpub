@@ -23,6 +23,7 @@
 #include <time.h>
 #include <errno.h>
 #include <signal.h>
+#include <stdint.h>
 
 #define MB_TO_BYTES(mb) ((size_t)(mb) * 1024 * 1024)
 #define CHUNK_SIZE (64 * 1024 * 1024)  // 64MB chunks
@@ -113,14 +114,24 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    size_t size_mb = atol(argv[1]);
-    int pattern_type = (argc >= 3) ? atoi(argv[2]) : 0;
-    int hold_seconds = (argc >= 4) ? atoi(argv[3]) : 15;
-
-    if (size_mb == 0) {
+    char *endptr;
+    unsigned long long size_mb_ull = strtoull(argv[1], &endptr, 10);
+    
+    // Check for conversion errors
+    if (*endptr != '\0' || size_mb_ull == 0) {
         fprintf(stderr, "[mem_pressure] Error: Invalid size specified\n");
         return 1;
     }
+    
+    // Check for overflow when converting to size_t
+    if (size_mb_ull > (SIZE_MAX / (1024 * 1024))) {
+        fprintf(stderr, "[mem_pressure] Error: Size too large (would overflow)\n");
+        return 1;
+    }
+    
+    size_t size_mb = (size_t)size_mb_ull;
+    int pattern_type = (argc >= 3) ? atoi(argv[2]) : 0;
+    int hold_seconds = (argc >= 4) ? atoi(argv[3]) : 15;
 
     size_t total_size = MB_TO_BYTES(size_mb);
 
