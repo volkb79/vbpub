@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Netcup Server Control Panel - Automated Debian Installation
+Consume the netcup SCP API to automate the installation of Debian on a server.
 
-consume the netcup SCP API to automate the installation of Debian on a server.
+netcup SCP API docs (see `netcup-scp-openapi.json`): 
+``` 
+curl 'https://www.servercontrolpanel.de/scp-core/api/v1/openapi' -H "Authorization: Bearer ${ACCESS_TOKEN}"
+```
 
-Get API access / authentication:
+Get API access / Authentication:
 
 1. Get a device_code and activate it 
 curl -X POST 'https://www.servercontrolpanel.de/realms/scp/protocol/openid-connect/auth/device' \
@@ -48,6 +51,7 @@ curl 'https://www.servercontrolpanel.de/realms/scp/protocol/openid-connect/token
 import os
 import sys
 import json
+import socket
 import argparse
 import requests
 from typing import Optional, Dict, Any
@@ -73,11 +77,9 @@ load_env_file()
 # Configuration
 BASE_URL = "https://www.servercontrolpanel.de/scp-core"
 KEYCLOAK_URL = "https://www.servercontrolpanel.de/realms/scp/protocol/openid-connect"
-KEYCLOAK_TOKEN_URL = f"{KEYCLOAK_URL}/token"
-KEYCLOAK_USERINFO_URL = f"{KEYCLOAK_URL}/userinfo"
 
 # Server configuration
-# Example server info:
+# Example server info from `/servers` API:
 #  {
 #    "id": 799611,
 #    "name": "v2202511209318402047",
@@ -89,13 +91,14 @@ KEYCLOAK_USERINFO_URL = f"{KEYCLOAK_URL}/userinfo"
 #      "name": "RS 1000 G12 Pro"
 #    }
 #  }
-SERVER_NAME = os.environ.get("SERVER_NAME", "v2202511209318402047")
+
+#SERVER_NAME = os.environ.get("SERVER_NAME", "v2202511209318402047")   # r1002.vxxu.de
+SERVER_NAME = os.environ.get("SERVER_NAME", "v2202511209318406253")    # v1001.vxxu.de
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Installation settings
+# Installation settings (hostname will be set dynamically from server info)
 INSTALLATION_CONFIG = {
-    "hostname": SERVER_NAME,
     "locale": "en_US.UTF-8",
     "timezone": "Europe/Berlin",
     "customScript":  f"curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | DEBUG_MODE=yes TELEGRAM_BOT_TOKEN={TELEGRAM_BOT_TOKEN} TELEGRAM_CHAT_ID={TELEGRAM_CHAT_ID} bash",
@@ -120,7 +123,7 @@ def get_access_token(refresh_token: str) -> str:
     log_debug("Refreshing access token...")
 
     response = requests.post(
-        KEYCLOAK_TOKEN_URL,
+        f"{KEYCLOAK_URL}/token",
         data={
             "client_id": "scp",
             "refresh_token": refresh_token,
@@ -170,7 +173,7 @@ These can be set in a .env file in the current directory.
     return parser.parse_args()
 
 
-def save_payload_with_comments(payload: Dict, filepath: str, server_name: str, image_name: str, user_id: int):
+def save_payload_with_comments(payload: Dict, filepath: str, server_name: str, image_name: str, user_id: int, ssh_key_names: list = None, hostname_method: str = None):
     """Save installation payload to JSONC file with helpful comments"""
     with open(filepath, "w") as f:
         f.write("{\n")
@@ -178,10 +181,16 @@ def save_payload_with_comments(payload: Dict, filepath: str, server_name: str, i
             # Add comments for IDs to make them more understandable
             if key == "serverId":
                 f.write(f'  // Server ID for: {server_name}\n')
+            elif key == "hostname":
+                if hostname_method:
+                    f.write(f'  // Hostname determined by: {hostname_method}\n')
             elif key == "imageFlavourId":
                 f.write(f'  // Image: {image_name}\n')
             elif key == "sshKeyIds":
                 f.write(f'  // SSH key IDs for user {user_id}\n')
+                if ssh_key_names:
+                    for key_name in ssh_key_names:
+                        f.write(f'  //   - {key_name}\n')
             
             # Write the actual key-value pair
             if isinstance(value, str):
@@ -231,8 +240,8 @@ class NetcupSCPClient:
 
     def get_user_info(self) -> Dict:
         """Get user information from OIDC userinfo endpoint"""
-        log_debug(f"GET {KEYCLOAK_USERINFO_URL}")
-        response = self.session.get(KEYCLOAK_USERINFO_URL)
+        log_debug(f"GET {KEYCLOAK_URL}/userinfo")
+        response = self.session.get(f"{KEYCLOAK_URL}/userinfo")
         response.raise_for_status()
         result = response.json()
         log_debug(f"Response: {json.dumps(result, indent=2)}")
@@ -371,12 +380,140 @@ def main():
         print(f"   ✓ Server ID: {server_id}")
         print()
 
-        # 2. Get server details (for disk info)
+        # 2. Get server details (for disk info and hostname)
         print("2. Getting server details...")
         server_details = client.get(f"/api/v1/servers/{server_id}")
+        # Example response:
+        # {
+        #   "id": 804027,
+        #   "name": "v2202511209318406253",
+        #   "disabled": false,
+        #   "hostname": "v1001.vxxu.de",
+        #   "nickname": "v1001.vxxu.de",
+        #   "template": {
+        #     "id": 1538,
+        #     "name": "VPS 1000 G12 Pro"
+        #   },
+        #   "architecture": "AMD64",
+        #   "disksAvailableSpaceInMiB": 7864320,
+        #   "firewallFeatureActive": true,
+        #   "ipv4Addresses": [
+        #     {
+        #       "broadcast": "152.53.167.255",
+        #       "gateway": "152.53.164.1",
+        #       "id": 227115,
+        #       "ip": "152.53.166.181",
+        #       "netmask": "255.255.252.0"
+        #     }
+        #   ],
+        #   "ipv6Addresses": [
+        #     {
+        #       "gateway": "fe80::1",
+        #       "id": 990975,
+        #       "networkPrefix": "2a0a:4cc0:2000:9798::",
+        #       "networkPrefixLength": 64
+        #     }
+        #   ],
+        #   "maxCpuCount": 4,
+        #   "rescueSystemActive": false,
+        #   "serverLiveInfo": {
+        #     "autostart": true,
+        #     "bootorder": [
+        #       "HDD",
+        #       "CDROM",
+        #       "NETWORK"
+        #     ],
+        #     "cloudinitAttached": false,
+        #     "configChanged": false,
+        #     "coresPerSocket": 1,
+        #     "cpuCount": 4,
+        #     "cpuMaxCount": 4,
+        #     "currentServerMemoryInMiB": 8192,
+        #     "disks": [
+        #       {
+        #         "allocationInMiB": 1275,
+        #         "capacityInMiB": 524288,
+        #         "dev": "vda",
+        #         "driver": "virtio"
+        #       }
+        #     ],
+        #     "interfaces": [
+        #       {
+        #         "driver": "virtio",
+        #         "ipv4Addresses": [
+        #           "152.53.166.181"
+        #         ],
+        #         "ipv6LinkLocalAddresses": [
+        #           "fe80::6820:60ff:fee8:068f"
+        #         ],
+        #         "ipv6NetworkPrefixes": [
+        #           "2a0a:4cc0:2000:9798::/64"
+        #         ],
+        #         "mac": "6a:20:60:e8:06:8f",
+        #         "mtu": 1500,
+        #         "rxMonthlyInMiB": 1838,
+        #         "speedInMBits": 2500,
+        #         "trafficThrottled": false,
+        #         "txMonthlyInMiB": 443,
+        #         "vlanId": null,
+        #         "vlanInterface": false
+        #       }
+        #     ],
+        #     "keyboardLayout": "en-us",
+        #     "latestQemu": true,
+        #     "machineType": "pc-i440fx-9.2",
+        #     "maxServerMemoryInMiB": 8192,
+        #     "nestedGuest": false,
+        #     "osOptimization": "LINUX",
+        #     "requiredStorageOptimization": "NO",
+        #     "sockets": 4,
+        #     "state": "RUNNING",
+        #     "template": "VPS 1000 G12 Pro",
+        #     "uefi": true,
+        #     "uptimeInSeconds": 235018
+        #   },
+        #   "site": {
+        #     "city": "Manassas",
+        #     "id": 6
+        #   },
+        #   "snapshotAllowed": true,
+        #   "snapshotCount": 1
+        # }        
 
         disk_dev = server_details["serverLiveInfo"]["disks"][0]["dev"]
         disk_capacity_gib = server_details["serverLiveInfo"]["disks"][0]["capacityInMiB"] / 1024
+        
+        # Get IP address and perform reverse DNS lookup
+        # Try to get IPv4 address from either ipv4Addresses or interfaces
+        ip_address = None
+        hostname_method = None
+        if "ipv4Addresses" in server_details and server_details["ipv4Addresses"]:
+            ip_address = server_details["ipv4Addresses"][0]["ip"]
+        elif "serverLiveInfo" in server_details and "interfaces" in server_details["serverLiveInfo"]:
+            interfaces = server_details["serverLiveInfo"]["interfaces"]
+            if interfaces and "ipv4Addresses" in interfaces[0] and interfaces[0]["ipv4Addresses"]:
+                ip_address = interfaces[0]["ipv4Addresses"][0]
+        
+        if ip_address:
+            try:
+                hostname_result = socket.gethostbyaddr(ip_address)
+                hostname = hostname_result[0]  # FQDN from reverse DNS
+                hostname_method = f"reverse DNS lookup on {ip_address}"
+                print(f"   ✓ IP Address: {ip_address}")
+                print(f"   ✓ Hostname (reverse DNS): {hostname}")
+            except (socket.herror, socket.gaierror) as e:
+                # Fallback to configured hostname if reverse DNS fails
+                hostname = server_details.get("hostname", SERVER_NAME)
+                hostname_method = f"configured hostname (reverse DNS failed for {ip_address})"
+                print(f"   ⚠ Reverse DNS failed for {ip_address}: {e}")
+                print(f"   ✓ Using configured hostname: {hostname}")
+        else:
+            # No IP found, use configured hostname
+            hostname = server_details.get("hostname", SERVER_NAME)
+            hostname_method = "configured hostname (no IP address found)"
+            print(f"   ⚠ No IP address found in server details")
+            print(f"   ✓ Using configured hostname: {hostname}")
+        
         print(f"   ✓ Primary Disk: {disk_dev} ({disk_capacity_gib:.0f} GiB)")
         print()
 
@@ -423,12 +560,14 @@ def main():
         print("5. Getting SSH keys...")
         ssh_keys = client.get(f"/api/v1/users/{user_id}/ssh-keys")
 
+        ssh_key_names = []
         if not ssh_keys:
             print("   ⚠ WARNING: No SSH keys found!")
             ssh_key_ids = None
         else:
             for key in ssh_keys:
                 print(f"   - ID: {key['id']:3d} | {key['name']}")
+                ssh_key_names.append(key['name'])
             ssh_key_ids = [ssh_keys[0]["id"]]
             print(f"   ✓ Using SSH Key ID: {ssh_key_ids[0]}")
         print()
@@ -436,6 +575,7 @@ def main():
         # 6. Prepare installation payload
         installation_payload = {
             "serverId": server_id,  # Include for --payload mode
+            "hostname": hostname,  # Use reverse DNS hostname from server info
             "imageFlavourId": image_flavour_id,
             "diskName": disk_dev,
             "sshKeyIds": ssh_key_ids,
@@ -455,7 +595,9 @@ def main():
             "install-debian.json",
             SERVER_NAME,
             newest_debian['image']['name'],
-            user_id
+            user_id,
+            ssh_key_names=[ssh_key_names[0]] if ssh_key_names else None,
+            hostname_method=hostname_method
         )
         print("✓ Installation payload saved to:  install-debian.json")
         print()
