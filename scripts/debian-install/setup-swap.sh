@@ -912,7 +912,8 @@ setup_zswap() {
         }
         
         # Set zpool (allocator)
-        echo "z3fold" > /sys/module/zswap/parameters/zpool 2>/dev/null || {
+        log_info "Setting ZSWAP zpool: $ZSWAP_ZPOOL"
+        echo "$ZSWAP_ZPOOL" > /sys/module/zswap/parameters/zpool 2>/dev/null || {
             log_warn "Failed to set zpool, using default"
         }
         
@@ -928,6 +929,36 @@ setup_zswap() {
         sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="zswap.enabled=1 zswap.compressor='$ZSWAP_COMPRESSOR' zswap.max_pool_percent='$ZSWAP_POOL_PERCENT' /' /etc/default/grub
         update-grub || log_warn "Failed to update GRUB"
     fi
+    
+    # Create systemd service to persist ZSWAP configuration after reboot
+    log_info "Creating ZSWAP systemd service for persistence"
+    
+    # Use actual values at service creation time
+    local comp="$ZSWAP_COMPRESSOR"
+    local zpool="$ZSWAP_ZPOOL"
+    local pool_pct="$ZSWAP_POOL_PERCENT"
+    
+    cat > /etc/systemd/system/zswap-config.service <<EOF
+[Unit]
+Description=Configure ZSWAP Parameters
+After=local-fs.target
+Before=swap.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'echo 1 > /sys/module/zswap/parameters/enabled && \
+    echo $comp > /sys/module/zswap/parameters/compressor && \
+    echo $zpool > /sys/module/zswap/parameters/zpool && \
+    echo $pool_pct > /sys/module/zswap/parameters/max_pool_percent'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    systemctl daemon-reload
+    systemctl enable zswap-config.service
+    log_info "ZSWAP systemd service created and enabled"
 }
 
 # Create swap files
