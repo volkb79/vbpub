@@ -2663,7 +2663,7 @@ def generate_matrix_heatmaps(matrix_results, output_prefix):
     log_info(f"Generated matrix throughput heatmap: {output_file}")
     return output_file
 
-def generate_charts(results, output_dir='/var/log/debian-install', webp=False):
+def generate_charts(results, output_dir='/var/log/debian-install', webp=True):
     """
     Generate matplotlib charts for benchmark results
     
@@ -3079,9 +3079,6 @@ def format_benchmark_html(results):
     if 'block_sizes' in results and results['block_sizes']:
         html += "<b>📦 Block Size Performance:</b>\n"
         
-        # DEBUG: Log what we're working with
-        log_debug(f"Block sizes data: {results['block_sizes']}")
-        
         # Check if we have random I/O data
         has_random = any(b.get('rand_write_mb_per_sec', 0) > 0 or b.get('rand_read_mb_per_sec', 0) > 0 for b in results['block_sizes'])
         
@@ -3138,9 +3135,6 @@ def format_benchmark_html(results):
     # Compressor comparison with visual indicators
     if 'compressors' in results and results['compressors']:
         html += "<b>🗜️ Compressor Performance:</b>\n"
-        
-        # DEBUG: Log compressor data
-        log_debug(f"Compressor data: {results['compressors']}")
         
         max_ratio = max(c.get('compression_ratio', 0) for c in results['compressors'])
         

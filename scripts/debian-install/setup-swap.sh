@@ -2007,8 +2007,6 @@ main() {
     log_info "  1. Monitor swap: ./swap-monitor.sh"
     log_info "  2. Check performance: ./benchmark.py"
     log_info "  3. Analyze memory: ./analyze-memory.sh"
-    
-    telegram_send "✅ Swap configuration completed"
 }
 
 # Run main function
