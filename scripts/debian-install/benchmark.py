@@ -1100,10 +1100,31 @@ stonewall
         results['write_mb_per_sec'] = 0
         results['read_mb_per_sec'] = 0
     except subprocess.CalledProcessError as e:
-        log_error(f"Concurrency test failed with return code {e.returncode}")
+        error_msg = f"Concurrency test failed with return code {e.returncode}"
+        log_error(error_msg)
         log_debug(f"Command: {e.cmd}")
-        log_debug(f"Stderr: {e.stderr}")
-        results['error'] = f'Exit code {e.returncode}'
+        
+        # Capture and log stderr for better diagnostics
+        stderr_output = e.stderr if e.stderr else result.stderr if 'result' in locals() else ''
+        if stderr_output:
+            log_error(f"Error output: {stderr_output[:500]}")  # Limit to 500 chars
+            
+            # Check for common errors and provide helpful messages
+            if 'Too many open files' in stderr_output or 'EMFILE' in stderr_output:
+                log_warn(f"System limit reached at {num_files} concurrent files")
+                log_info("Hint: Check 'ulimit -n' and increase if needed")
+                results['error'] = f'System limit: Too many open files (max concurrent: {num_files-1})'
+            elif 'No space left on device' in stderr_output or 'ENOSPC' in stderr_output:
+                log_warn("Insufficient disk space for test")
+                results['error'] = 'Insufficient disk space'
+            elif 'Cannot allocate memory' in stderr_output or 'ENOMEM' in stderr_output:
+                log_warn("Insufficient memory for test")
+                results['error'] = 'Insufficient memory'
+            else:
+                results['error'] = f'Exit code {e.returncode}: {stderr_output[:100]}'
+        else:
+            results['error'] = f'Exit code {e.returncode}'
+        
         results['write_mb_per_sec'] = 0
         results['read_mb_per_sec'] = 0
     except Exception as e:
@@ -1238,11 +1259,41 @@ stonewall
                     raise subprocess.CalledProcessError(result.returncode, 'fio', result.stderr)
             
             except subprocess.TimeoutExpired as e:
-                log_error(f"Matrix test {block_size}KB × {concurrency} timed out")
+                log_error(f"Matrix test {block_size}KB × {concurrency} timed out after 5 minutes")
                 results['matrix'].append({
                     'block_size_kb': block_size,
                     'concurrency': concurrency,
-                    'error': 'Timeout',
+                    'error': 'Timeout after 300s',
+                    'write_mb_per_sec': 0,
+                    'read_mb_per_sec': 0
+                })
+            except subprocess.CalledProcessError as e:
+                error_msg = f"Matrix test {block_size}KB × {concurrency} failed with exit code {e.returncode}"
+                log_error(error_msg)
+                
+                # Capture stderr for diagnostics
+                stderr_output = e.stderr if e.stderr else result.stderr if 'result' in locals() else ''
+                error_detail = f'Exit code {e.returncode}'
+                
+                if stderr_output:
+                    log_debug(f"Error output: {stderr_output[:500]}")
+                    
+                    # Check for common errors
+                    if 'Too many open files' in stderr_output or 'EMFILE' in stderr_output:
+                        log_warn(f"System limit reached at concurrency={concurrency}")
+                        log_info("Hint: Check 'ulimit -n' and increase if needed")
+                        error_detail = f'System limit reached (max concurrency: {concurrency-1})'
+                    elif 'No space left on device' in stderr_output:
+                        error_detail = 'Insufficient disk space'
+                    elif 'Cannot allocate memory' in stderr_output:
+                        error_detail = 'Insufficient memory'
+                    else:
+                        error_detail = f'Exit code {e.returncode}: {stderr_output[:100]}'
+                
+                results['matrix'].append({
+                    'block_size_kb': block_size,
+                    'concurrency': concurrency,
+                    'error': error_detail,
                     'write_mb_per_sec': 0,
                     'read_mb_per_sec': 0
                 })
@@ -1251,7 +1302,7 @@ stonewall
                 results['matrix'].append({
                     'block_size_kb': block_size,
                     'concurrency': concurrency,
-                    'error': str(e),
+                    'error': str(e)[:100],
                     'write_mb_per_sec': 0,
                     'read_mb_per_sec': 0
                 })
@@ -3167,10 +3218,13 @@ def format_benchmark_html(results):
         # Higher efficiency = better (less overhead)
         # Note: Negative efficiency indicates overhead (uses more memory than original)
         max_eff = max(a.get('efficiency_pct', 0) for a in results['allocators'])
+        min_eff = min(a.get('efficiency_pct', 0) for a in results['allocators'])
+        
         for alloc in results['allocators']:
             name = alloc.get('allocator', 'N/A')
             ratio = alloc.get('compression_ratio', 0)
             eff = alloc.get('efficiency_pct', 0)
+            
             # Bar shows efficiency: higher is better
             # For negative efficiency (overhead), show no bar
             # For zero max_eff, show no bar (avoid division by zero)
@@ -3179,9 +3233,19 @@ def format_benchmark_html(results):
             else:
                 bar_length = 0  # No bar for negative efficiency or zero max_eff
             bar = '▓' * bar_length + '░' * (10 - bar_length)
+            
+            # Add performance indicators
             is_best = eff == max_eff and eff > 0
-            marker = " ⭐" if is_best else ""
-            html += f"  {name:8s}: {bar} {ratio:.1f}x ratio, {eff:+.0f}% eff{marker}\n"
+            is_worst = eff == min_eff
+            marker = " ⭐" if is_best else (" ⚠️" if is_worst and eff < 0 else "")
+            
+            # Calculate percentage difference from best
+            diff_str = ""
+            if not is_best and max_eff > 0:
+                diff_pct = eff - max_eff
+                diff_str = f" ({diff_pct:+.0f}% vs best)"
+            
+            html += f"  {name:8s}: {bar} {ratio:.1f}x ratio, {eff:+.0f}% eff{diff_str}{marker}\n"
         html += "\n"
     
     # Concurrency tests with scaling chart
