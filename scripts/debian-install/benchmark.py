@@ -35,7 +35,7 @@ TEST TYPES
    
 4. **Concurrency Tests** (REALISTIC)
    - Tests multiple swap files with parallel I/O
-   - Measures throughput scaling with 1-16 files
+   - Measures throughput scaling with 1-8 files
    - Identifies optimal number of concurrent swap devices
    
 5. **Memory-Only Comparison** (REALISTIC)
@@ -3748,7 +3748,7 @@ Examples:
         total_tests += len(allocators)
     
     if args.test_all or args.test_concurrency:
-        file_counts = [1, 2, 4, 8, 16] if args.test_all else [args.test_concurrency]
+        file_counts = [1, 2, 4, 8] if args.test_all else [args.test_concurrency]
         total_tests += len(file_counts)
     
     if args.test_matrix or args.test_all:
@@ -3849,7 +3849,7 @@ Examples:
                 log_error(f"Allocator {alloc} failed: {e}")
     
     if args.test_all or args.test_concurrency:
-        file_counts = [1, 2, 4, 8, 16] if args.test_all else [args.test_concurrency]
+        file_counts = [1, 2, 4, 8] if args.test_all else [args.test_concurrency]
         results['concurrency'] = []
         for count in file_counts:
             try:
