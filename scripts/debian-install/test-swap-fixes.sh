@@ -66,11 +66,11 @@ test_zswap_systemd_service() {
         log_fail "ZSWAP_ZPOOL variable not used in runtime setup"
     fi
     
-    # Check that ZSWAP_ZPOOL is also in systemd service
-    if grep -A 20 "zswap-config.service" "$SCRIPT_DIR/setup-swap.sh" | grep 'ZSWAP_ZPOOL' > /dev/null 2>&1; then
-        log_pass "ZSWAP_ZPOOL variable found in systemd service"
+    # Check that ZSWAP_ZPOOL is used via local variable in systemd service (like ZRAM pattern)
+    if grep -B 5 "zswap-config.service" "$SCRIPT_DIR/setup-swap.sh" | grep 'local zpool="\$ZSWAP_ZPOOL"' > /dev/null 2>&1; then
+        log_pass "ZSWAP_ZPOOL variable used via local variable in systemd service"
     else
-        log_fail "ZSWAP_ZPOOL variable not in systemd service"
+        log_fail "ZSWAP_ZPOOL variable not properly used in systemd service"
     fi
 }
 

@@ -932,6 +932,12 @@ setup_zswap() {
     
     # Create systemd service to persist ZSWAP configuration after reboot
     log_info "Creating ZSWAP systemd service for persistence"
+    
+    # Use actual values at service creation time
+    local comp="$ZSWAP_COMPRESSOR"
+    local zpool="$ZSWAP_ZPOOL"
+    local pool_pct="$ZSWAP_POOL_PERCENT"
+    
     cat > /etc/systemd/system/zswap-config.service <<EOF
 [Unit]
 Description=Configure ZSWAP Parameters
@@ -942,9 +948,9 @@ Before=swap.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/bash -c 'echo 1 > /sys/module/zswap/parameters/enabled && \
-    echo $ZSWAP_COMPRESSOR > /sys/module/zswap/parameters/compressor && \
-    echo $ZSWAP_ZPOOL > /sys/module/zswap/parameters/zpool && \
-    echo $ZSWAP_POOL_PERCENT > /sys/module/zswap/parameters/max_pool_percent'
+    echo $comp > /sys/module/zswap/parameters/compressor && \
+    echo $zpool > /sys/module/zswap/parameters/zpool && \
+    echo $pool_pct > /sys/module/zswap/parameters/max_pool_percent'
 
 [Install]
 WantedBy=multi-user.target
