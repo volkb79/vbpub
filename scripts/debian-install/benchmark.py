@@ -1242,13 +1242,21 @@ stonewall
                     write_iops = int(round(data['jobs'][0]['write']['iops'], 0))
                     read_iops = int(round(data['jobs'][1]['read']['iops'], 0))
                     
+                    # Extract latency metrics (in microseconds)
+                    write_lat_ns = data['jobs'][0]['write'].get('lat_ns', {})
+                    read_lat_ns = data['jobs'][1]['read'].get('lat_ns', {})
+                    write_lat_us = write_lat_ns.get('mean', 0) / 1000 if write_lat_ns else 0  # Convert ns to us
+                    read_lat_us = read_lat_ns.get('mean', 0) / 1000 if read_lat_ns else 0
+                    
                     matrix_result = {
                         'block_size_kb': block_size,
                         'concurrency': concurrency,
                         'write_mb_per_sec': round(write_bw, 2),
                         'read_mb_per_sec': round(read_bw, 2),
                         'write_iops': write_iops,
-                        'read_iops': read_iops
+                        'read_iops': read_iops,
+                        'write_latency_us': round(write_lat_us, 2),
+                        'read_latency_us': round(read_lat_us, 2)
                     }
                     
                     results['matrix'].append(matrix_result)
@@ -2644,75 +2652,201 @@ def generate_swap_config_report(results, output_file):
     log_info(f"✓ Swap configuration report saved to {output_file}")
 
 def generate_matrix_heatmaps(matrix_results, output_prefix):
-    """Generate heatmaps for matrix test results"""
+    """
+    Generate comprehensive visualizations for matrix test results:
+    1. Throughput heatmap (write + read in 2 subplots)
+    2. Line charts: Throughput vs Block Size (for each concurrency)
+    3. Line charts: Throughput vs Concurrency (for each block size)
+    4. Latency heatmaps (write + read in 2 subplots)
+    """
     if not MATPLOTLIB_AVAILABLE:
-        log_warn("matplotlib not available - skipping matrix heatmap generation")
+        log_warn("matplotlib not available - skipping matrix chart generation")
         return None
     
     try:
         import numpy as np
     except ImportError:
-        log_warn("numpy not available - skipping matrix heatmap generation")
+        log_warn("numpy not available - skipping matrix chart generation")
         return None
+    
+    chart_files = []
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
     
     # Use globally imported plt (already checked via MATPLOTLIB_AVAILABLE)
     block_sizes = matrix_results['block_sizes']
     concurrency_levels = matrix_results['concurrency_levels'] 
     
-    # Extract throughput data into 2D array
+    # Extract data into 2D arrays
     write_data = np.zeros((len(concurrency_levels), len(block_sizes)))
     read_data = np.zeros((len(concurrency_levels), len(block_sizes)))
+    write_lat_data = np.zeros((len(concurrency_levels), len(block_sizes)))
+    read_lat_data = np.zeros((len(concurrency_levels), len(block_sizes)))
     
     for result in matrix_results['matrix']:
         if 'error' in result:
             continue
         bi = block_sizes.index(result['block_size_kb'])
         ci = concurrency_levels.index(result['concurrency'])
-        write_data[ci, bi] = result['write_mb_per_sec']
-        read_data[ci, bi] = result['read_mb_per_sec']
+        write_data[ci, bi] = result.get('write_mb_per_sec', 0)
+        read_data[ci, bi] = result.get('read_mb_per_sec', 0)
+        write_lat_data[ci, bi] = result.get('write_latency_us', 0)
+        read_lat_data[ci, bi] = result.get('read_latency_us', 0)
     
-    # Create throughput heatmap
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-    
-    im1 = ax1.imshow(write_data, cmap='YlOrRd', aspect='auto')
-    ax1.set_title('Write Throughput (MB/s)', fontsize=14, fontweight='bold')
-    ax1.set_xlabel('Block Size (KB)')
-    ax1.set_ylabel('Concurrency Level')
-    ax1.set_xticks(range(len(block_sizes)))
-    ax1.set_xticklabels(block_sizes)
-    ax1.set_yticks(range(len(concurrency_levels)))
-    ax1.set_yticklabels(concurrency_levels)
-    plt.colorbar(im1, ax=ax1)
-    
-    # Annotate cells with values
-    for i in range(len(concurrency_levels)):
-        for j in range(len(block_sizes)):
-            if write_data[i, j] > 0:
-                text = ax1.text(j, i, f'{write_data[i, j]:.0f}',
-                              ha="center", va="center", color="black", fontsize=8)
-    
-    im2 = ax2.imshow(read_data, cmap='YlGnBu', aspect='auto')
-    ax2.set_title('Read Throughput (MB/s)', fontsize=14, fontweight='bold')
-    ax2.set_xlabel('Block Size (KB)')
-    ax2.set_ylabel('Concurrency Level')
-    ax2.set_xticks(range(len(block_sizes)))
-    ax2.set_xticklabels(block_sizes)
-    ax2.set_yticks(range(len(concurrency_levels)))
-    ax2.set_yticklabels(concurrency_levels)
-    plt.colorbar(im2, ax=ax2)
-    
-    for i in range(len(concurrency_levels)):
-        for j in range(len(block_sizes)):
-            if read_data[i, j] > 0:
-                text = ax2.text(j, i, f'{read_data[i, j]:.0f}',
-                              ha="center", va="center", color="black", fontsize=8)
-    
-    plt.tight_layout()
-    output_file = f'{output_prefix}-matrix-throughput.png'
-    plt.savefig(output_file, dpi=150, bbox_inches='tight')
-    plt.close()
-    log_info(f"Generated matrix throughput heatmap: {output_file}")
-    return output_file
+    try:
+        # Chart 1: Throughput heatmap (existing)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        
+        im1 = ax1.imshow(write_data, cmap='YlOrRd', aspect='auto')
+        ax1.set_title('Write Throughput (MB/s)', fontsize=14, fontweight='bold')
+        ax1.set_xlabel('Block Size (KB)')
+        ax1.set_ylabel('Concurrency Level')
+        ax1.set_xticks(range(len(block_sizes)))
+        ax1.set_xticklabels(block_sizes)
+        ax1.set_yticks(range(len(concurrency_levels)))
+        ax1.set_yticklabels(concurrency_levels)
+        plt.colorbar(im1, ax=ax1)
+        
+        # Annotate cells with values
+        for i in range(len(concurrency_levels)):
+            for j in range(len(block_sizes)):
+                if write_data[i, j] > 0:
+                    text = ax1.text(j, i, f'{write_data[i, j]:.0f}',
+                                  ha="center", va="center", color="black", fontsize=8)
+        
+        im2 = ax2.imshow(read_data, cmap='YlGnBu', aspect='auto')
+        ax2.set_title('Read Throughput (MB/s)', fontsize=14, fontweight='bold')
+        ax2.set_xlabel('Block Size (KB)')
+        ax2.set_ylabel('Concurrency Level')
+        ax2.set_xticks(range(len(block_sizes)))
+        ax2.set_xticklabels(block_sizes)
+        ax2.set_yticks(range(len(concurrency_levels)))
+        ax2.set_yticklabels(concurrency_levels)
+        plt.colorbar(im2, ax=ax2)
+        
+        for i in range(len(concurrency_levels)):
+            for j in range(len(block_sizes)):
+                if read_data[i, j] > 0:
+                    text = ax2.text(j, i, f'{read_data[i, j]:.0f}',
+                                  ha="center", va="center", color="black", fontsize=8)
+        
+        plt.tight_layout()
+        output_file = f'{output_prefix}-matrix-throughput-{timestamp}.png'
+        plt.savefig(output_file, dpi=150, bbox_inches='tight')
+        plt.close()
+        chart_files.append(output_file)
+        log_info(f"Generated matrix throughput heatmap: {output_file}")
+        
+        # Chart 2: Line chart - Throughput vs Block Size (for each concurrency level)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        
+        for ci, concurrency in enumerate(concurrency_levels):
+            write_vals = write_data[ci, :]
+            read_vals = read_data[ci, :]
+            ax1.plot(block_sizes, write_vals, 'o-', label=f'Concurrency {concurrency}', linewidth=2, markersize=6)
+            ax2.plot(block_sizes, read_vals, 's-', label=f'Concurrency {concurrency}', linewidth=2, markersize=6)
+        
+        ax1.set_xlabel('Block Size (KB)', fontsize=12)
+        ax1.set_ylabel('Write Throughput (MB/s)', fontsize=12)
+        ax1.set_title('Write Throughput vs Block Size', fontsize=14, fontweight='bold')
+        ax1.legend(fontsize=10)
+        ax1.grid(True, alpha=0.3)
+        ax1.set_xscale('log', base=2)
+        
+        ax2.set_xlabel('Block Size (KB)', fontsize=12)
+        ax2.set_ylabel('Read Throughput (MB/s)', fontsize=12)
+        ax2.set_title('Read Throughput vs Block Size', fontsize=14, fontweight='bold')
+        ax2.legend(fontsize=10)
+        ax2.grid(True, alpha=0.3)
+        ax2.set_xscale('log', base=2)
+        
+        plt.tight_layout()
+        output_file = f'{output_prefix}-matrix-throughput-vs-blocksize-{timestamp}.png'
+        plt.savefig(output_file, dpi=150, bbox_inches='tight')
+        plt.close()
+        chart_files.append(output_file)
+        log_info(f"Generated throughput vs block size chart: {output_file}")
+        
+        # Chart 3: Line chart - Throughput vs Concurrency (for each block size)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        
+        for bi, block_size in enumerate(block_sizes):
+            write_vals = write_data[:, bi]
+            read_vals = read_data[:, bi]
+            ax1.plot(concurrency_levels, write_vals, 'o-', label=f'{block_size} KB', linewidth=2, markersize=6)
+            ax2.plot(concurrency_levels, read_vals, 's-', label=f'{block_size} KB', linewidth=2, markersize=6)
+        
+        ax1.set_xlabel('Concurrency Level', fontsize=12)
+        ax1.set_ylabel('Write Throughput (MB/s)', fontsize=12)
+        ax1.set_title('Write Throughput vs Concurrency', fontsize=14, fontweight='bold')
+        ax1.legend(fontsize=10)
+        ax1.grid(True, alpha=0.3)
+        
+        ax2.set_xlabel('Concurrency Level', fontsize=12)
+        ax2.set_ylabel('Read Throughput (MB/s)', fontsize=12)
+        ax2.set_title('Read Throughput vs Concurrency', fontsize=14, fontweight='bold')
+        ax2.legend(fontsize=10)
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        output_file = f'{output_prefix}-matrix-throughput-vs-concurrency-{timestamp}.png'
+        plt.savefig(output_file, dpi=150, bbox_inches='tight')
+        plt.close()
+        chart_files.append(output_file)
+        log_info(f"Generated throughput vs concurrency chart: {output_file}")
+        
+        # Chart 4: Latency heatmaps (if latency data available)
+        has_latency = np.any(write_lat_data > 0) or np.any(read_lat_data > 0)
+        if has_latency:
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+            
+            im1 = ax1.imshow(write_lat_data, cmap='RdYlGn_r', aspect='auto')
+            ax1.set_title('Write Latency (µs)', fontsize=14, fontweight='bold')
+            ax1.set_xlabel('Block Size (KB)')
+            ax1.set_ylabel('Concurrency Level')
+            ax1.set_xticks(range(len(block_sizes)))
+            ax1.set_xticklabels(block_sizes)
+            ax1.set_yticks(range(len(concurrency_levels)))
+            ax1.set_yticklabels(concurrency_levels)
+            plt.colorbar(im1, ax=ax1, label='Latency (µs)')
+            
+            # Annotate cells with values
+            for i in range(len(concurrency_levels)):
+                for j in range(len(block_sizes)):
+                    if write_lat_data[i, j] > 0:
+                        text = ax1.text(j, i, f'{write_lat_data[i, j]:.1f}',
+                                      ha="center", va="center", color="black", fontsize=8)
+            
+            im2 = ax2.imshow(read_lat_data, cmap='RdYlGn_r', aspect='auto')
+            ax2.set_title('Read Latency (µs)', fontsize=14, fontweight='bold')
+            ax2.set_xlabel('Block Size (KB)')
+            ax2.set_ylabel('Concurrency Level')
+            ax2.set_xticks(range(len(block_sizes)))
+            ax2.set_xticklabels(block_sizes)
+            ax2.set_yticks(range(len(concurrency_levels)))
+            ax2.set_yticklabels(concurrency_levels)
+            plt.colorbar(im2, ax=ax2, label='Latency (µs)')
+            
+            for i in range(len(concurrency_levels)):
+                for j in range(len(block_sizes)):
+                    if read_lat_data[i, j] > 0:
+                        text = ax2.text(j, i, f'{read_lat_data[i, j]:.1f}',
+                                      ha="center", va="center", color="black", fontsize=8)
+            
+            plt.tight_layout()
+            output_file = f'{output_prefix}-matrix-latency-{timestamp}.png'
+            plt.savefig(output_file, dpi=150, bbox_inches='tight')
+            plt.close()
+            chart_files.append(output_file)
+            log_info(f"Generated matrix latency heatmap: {output_file}")
+        
+        # Return list of all generated chart files
+        return chart_files
+        
+    except Exception as e:
+        log_error(f"Failed to generate matrix charts: {e}")
+        import traceback
+        log_debug(traceback.format_exc())
+        return chart_files if chart_files else None
 
 def generate_charts(results, output_dir='/var/log/debian-install', webp=True):
     """
@@ -3913,11 +4047,13 @@ Examples:
                 if 'matrix' in results and isinstance(results['matrix'], dict) and 'matrix' in results['matrix']:
                     try:
                         output_prefix = f"/var/log/debian-install/benchmark-{timestamp_str}"
-                        matrix_chart = generate_matrix_heatmaps(results['matrix'], output_prefix)
-                        if matrix_chart and os.path.exists(matrix_chart):
-                            chart_files.append(matrix_chart)
-                        elif matrix_chart:
-                            log_debug(f"Matrix chart file not found: {matrix_chart}")
+                        matrix_charts = generate_matrix_heatmaps(results['matrix'], output_prefix)
+                        if matrix_charts:
+                            for chart_file in matrix_charts:
+                                if os.path.exists(chart_file):
+                                    chart_files.append(chart_file)
+                                else:
+                                    log_debug(f"Matrix chart file not found: {chart_file}")
                     except Exception as e:
                         log_warn(f"Failed to generate matrix heatmaps: {e}")
                 
