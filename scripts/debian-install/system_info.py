@@ -242,7 +242,7 @@ class SystemInfo:
                 )
                 if result.returncode == 0:
                     params[param] = result.stdout.strip()
-            except:
+            except Exception:
                 params[param] = 'N/A'
         
         return params
@@ -387,7 +387,6 @@ class SystemInfo:
             html += f"<b>⚙️ Kernel Parameters</b>\n"
             html += f"  <i>(Applied values, persist after reboot)</i>\n"
             for param, value in self.info['kernel_params'].items():
-                param_short = param.split('.')[-1]  # e.g., vm.swappiness -> swappiness
                 html += f"  {param} = {value}\n"
             html += "\n"
         

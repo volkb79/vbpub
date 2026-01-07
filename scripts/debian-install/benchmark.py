@@ -1104,8 +1104,8 @@ stonewall
         log_error(error_msg)
         log_debug(f"Command: {e.cmd}")
         
-        # Capture and log stderr for better diagnostics
-        stderr_output = e.stderr if e.stderr else result.stderr if 'result' in locals() else ''
+        # Capture stderr for better diagnostics
+        stderr_output = e.stderr if hasattr(e, 'stderr') and e.stderr else ''
         if stderr_output:
             log_error(f"Error output: {stderr_output[:500]}")  # Limit to 500 chars
             
@@ -1280,7 +1280,7 @@ stonewall
                 log_error(error_msg)
                 
                 # Capture stderr for diagnostics
-                stderr_output = e.stderr if e.stderr else result.stderr if 'result' in locals() else ''
+                stderr_output = e.stderr if hasattr(e, 'stderr') and e.stderr else ''
                 error_detail = f'Exit code {e.returncode}'
                 
                 if stderr_output:
