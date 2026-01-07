@@ -912,7 +912,8 @@ setup_zswap() {
         }
         
         # Set zpool (allocator)
-        echo "z3fold" > /sys/module/zswap/parameters/zpool 2>/dev/null || {
+        log_info "Setting ZSWAP zpool: $ZSWAP_ZPOOL"
+        echo "$ZSWAP_ZPOOL" > /sys/module/zswap/parameters/zpool 2>/dev/null || {
             log_warn "Failed to set zpool, using default"
         }
         
