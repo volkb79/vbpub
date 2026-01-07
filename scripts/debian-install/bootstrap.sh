@@ -394,7 +394,7 @@ main() {
         log_info "==> Docker installation skipped (RUN_DOCKER_INSTALL=$RUN_DOCKER_INSTALL)"
     fi
     
-    # Geekbench
+    # Geekbench (MOVED HERE - after swap configuration to avoid influencing benchmark results)
     if [ "$RUN_GEEKBENCH" = "yes" ]; then
         log_info "==> Running Geekbench (5-10 min)"
         GEEKBENCH_START=$(date +%s)

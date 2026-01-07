@@ -1168,7 +1168,7 @@ def test_blocksize_concurrency_matrix(block_sizes=None, concurrency_levels=None,
     if block_sizes is None:
         block_sizes = [4, 8, 16, 32, 64]  # Remove 128KB - diminishing returns
     if concurrency_levels is None:
-        concurrency_levels = [1, 2, 4]  # Remove 8 jobs - diminishing returns
+        concurrency_levels = [1, 2, 4, 8]  # Test up to 8 for optimal detection
     
     total_combinations = len(block_sizes) * len(concurrency_levels)
     log_step_ts(f"Block Size × Concurrency Matrix Test ({total_combinations} combinations)")
@@ -3835,6 +3835,14 @@ Examples:
                 log_debug(f"Cleaning up ZRAM before testing allocator: {alloc}")
                 cleanup_zram_aggressive()
                 time.sleep(ZRAM_STABILIZATION_DELAY_SEC)  # Let system stabilize
+                
+                # Drop caches to ensure fresh memory
+                try:
+                    with open('/proc/sys/vm/drop_caches', 'w') as f:
+                        f.write('3')
+                    log_debug("Dropped caches for fresh memory state")
+                except Exception as e:
+                    log_debug(f"Could not drop caches: {e}")
                 
                 current_test += 1
                 result = benchmark_compression(

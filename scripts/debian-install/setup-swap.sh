@@ -928,6 +928,30 @@ setup_zswap() {
         sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="zswap.enabled=1 zswap.compressor='$ZSWAP_COMPRESSOR' zswap.max_pool_percent='$ZSWAP_POOL_PERCENT' /' /etc/default/grub
         update-grub || log_warn "Failed to update GRUB"
     fi
+    
+    # Create systemd service to persist ZSWAP configuration after reboot
+    log_info "Creating ZSWAP systemd service for persistence"
+    cat > /etc/systemd/system/zswap-config.service <<EOF
+[Unit]
+Description=Configure ZSWAP Parameters
+After=local-fs.target
+Before=swap.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'echo 1 > /sys/module/zswap/parameters/enabled && \
+    echo $ZSWAP_COMPRESSOR > /sys/module/zswap/parameters/compressor && \
+    echo $ZSWAP_ZPOOL > /sys/module/zswap/parameters/zpool && \
+    echo $ZSWAP_POOL_PERCENT > /sys/module/zswap/parameters/max_pool_percent'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    systemctl daemon-reload
+    systemctl enable zswap-config.service
+    log_info "ZSWAP systemd service created and enabled"
 }
 
 # Create swap files
