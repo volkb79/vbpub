@@ -439,17 +439,8 @@ Check the log file for detailed error messages."
     fi
     
     # System info (AFTER all modifications)
+    # Skipping duplicate AFTER system info - full log will be sent at the end instead
     if [ "$SEND_SYSINFO" = "yes" ] && [ -n "$TELEGRAM_BOT_TOKEN" ]; then
-        log_info "==> Sending system info (AFTER setup)"
-        # System information is collected using the unified system_info.py module.
-        # This module is shared between:
-        # - get_system_summary(): Uses system_info.py with --format text for bootstrap summary
-        # - sysinfo-notify.py: Uses system_info.py with HTML formatting for telegram notifications
-        # This ensures DRY (Don't Repeat Yourself) - single source of truth for system info collection.
-        
-        # Send formatted notification via telegram with AFTER caption
-        ./sysinfo-notify.py --notify --caption "📊 System Info (AFTER setup - root partition still shows original size before reboot)" 2>&1 | tee -a "$LOG_FILE" || true
-        
         # Optionally save detailed info to file and send as attachment
         SYSINFO_FILE="/tmp/system-info-$(date +%Y%m%d-%H%M%S).json"
         ./system_info.py --output "$SYSINFO_FILE" 2>&1 || true
