@@ -26,6 +26,7 @@ class SystemInfo:
         self.info['memory'] = self.get_memory_info()
         self.info['disk'] = self.get_disk_info()
         self.info['swap'] = self.get_swap_info()
+        self.info['kernel_params'] = self.get_kernel_params()
         self.info['network'] = self.get_network_info()
         
         return self.info
@@ -218,6 +219,34 @@ class SystemInfo:
         
         return info
     
+    def get_kernel_params(self):
+        """Get kernel parameters related to swap and memory"""
+        params = {}
+        
+        # List of kernel parameters to collect
+        param_names = [
+            'vm.swappiness',
+            'vm.page-cluster',
+            'vm.vfs_cache_pressure',
+            'vm.watermark_scale_factor',
+            'vm.min_free_kbytes'
+        ]
+        
+        for param in param_names:
+            try:
+                result = subprocess.run(
+                    ['sysctl', '-n', param],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    params[param] = result.stdout.strip()
+            except:
+                params[param] = 'N/A'
+        
+        return params
+    
     def get_network_info(self):
         """Get network information including interface and DNS"""
         info = {}
@@ -349,8 +378,18 @@ class SystemInfo:
             html += f"  Devices: {self.info['swap']['count']}\n"
             for dev in self.info['swap']['devices']:
                 html += f"    • {dev['device']} ({dev['size']}, pri: {dev['priority']})\n"
+            html += "\n"
         elif 'swap' in self.info:
-            html += f"<b>💱 Swap</b>\n  Not configured\n"
+            html += f"<b>💱 Swap</b>\n  Not configured\n\n"
+        
+        # Kernel Parameters (if available)
+        if 'kernel_params' in self.info and self.info['kernel_params']:
+            html += f"<b>⚙️ Kernel Parameters</b>\n"
+            html += f"  <i>(Applied values, persist after reboot)</i>\n"
+            for param, value in self.info['kernel_params'].items():
+                param_short = param.split('.')[-1]  # e.g., vm.swappiness -> swappiness
+                html += f"  {param} = {value}\n"
+            html += "\n"
         
         # Network
         if 'network' in self.info:
