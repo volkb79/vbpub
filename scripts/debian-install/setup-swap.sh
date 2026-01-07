@@ -1986,9 +1986,6 @@ main() {
     # NEW: Show analysis and plan
     print_system_analysis_and_plan
     
-    # Send telegram notification AFTER showing the plan
-    telegram_send "🔧 Starting swap configuration"
-    
     # Install dependencies
     install_dependencies
     

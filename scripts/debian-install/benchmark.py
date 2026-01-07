@@ -172,13 +172,15 @@ class Colors:
     NC = '\033[0m'
 
 # Benchmark configuration constants
-COMPRESSION_TEST_SIZE_MB = 256  # Default compression test size
+COMPRESSION_TEST_SIZE_MB = 64  # Default compression test size (reduced for faster benchmarks)
 COMPRESSION_MEMORY_PERCENT = 90  # Percentage of test size to allocate (90%)
 COMPRESSION_MEMORY_PASSES = 3  # Number of passes over memory to ensure swapping
 COMPRESSION_MIN_SWAP_PERCENT = 50  # Minimum expected swap activity (50% of test size)
 COMPRESSION_RATIO_MIN = 1.5  # Minimum expected compression ratio
 COMPRESSION_RATIO_MAX = 4.0  # Maximum typical compression ratio
 COMPRESSION_RATIO_SUSPICIOUS = 10.0  # Ratio above this is suspicious
+MIN_VALID_COMPRESSION_RATIO = 1.1  # Minimum ratio to consider valid (below this indicates test failure)
+ZRAM_STABILIZATION_DELAY_SEC = 2  # Time to wait after ZRAM cleanup for system stabilization
 
 # Memory pressure test constants
 STRESS_NG_TIMEOUT_SEC = 15  # Timeout for stress-ng memory allocation
@@ -1131,8 +1133,8 @@ def test_blocksize_concurrency_matrix(block_sizes=None, concurrency_levels=None,
     which configuration provides the best throughput for the specific hardware.
     
     Args:
-        block_sizes: List of block sizes in KB (default: [4, 8, 16, 32, 64, 128])
-        concurrency_levels: List of concurrency levels (default: [1, 2, 4, 8])
+        block_sizes: List of block sizes in KB (default: [4, 8, 16, 32, 64])
+        concurrency_levels: List of concurrency levels (default: [1, 2, 4])
         file_size_mb: Size of each file in MB
         test_dir: Directory for test files
         runtime_sec: Test runtime in seconds
@@ -1143,9 +1145,9 @@ def test_blocksize_concurrency_matrix(block_sizes=None, concurrency_levels=None,
     start_time = time.time()
     
     if block_sizes is None:
-        block_sizes = [4, 8, 16, 32, 64, 128]
+        block_sizes = [4, 8, 16, 32, 64]  # Remove 128KB - diminishing returns
     if concurrency_levels is None:
-        concurrency_levels = [1, 2, 4, 8]
+        concurrency_levels = [1, 2, 4]  # Remove 8 jobs - diminishing returns
     
     total_combinations = len(block_sizes) * len(concurrency_levels)
     log_step_ts(f"Block Size × Concurrency Matrix Test ({total_combinations} combinations)")
@@ -1296,7 +1298,9 @@ stonewall
         results['optimal']['recommended_page_cluster'] = recommended_cluster
         
         # Use max successfully tested concurrency (not 16 if it failed)
-        max_successful = max([r['concurrency'] for r in valid_results])
+        # Filter out results with errors
+        valid_results = [r for r in results['matrix'] if 'error' not in r]
+        max_successful = max([r['concurrency'] for r in valid_results]) if valid_results else 1
         results['optimal']['recommended_swap_stripe_width'] = max_successful
         
         log_info(f"Recommended settings:")
@@ -2230,15 +2234,13 @@ def benchmark_latency_comparison(test_size_mb=100):
     log_info("\n=== Phase 1: Native RAM Baseline ===")
     results['baseline'] = benchmark_native_ram_baseline(test_size_mb)
     
-    # 2. Write latency tests
-    log_info("\n=== Phase 2: Write Latency Tests ===")
+    # 2. Write latency tests - reduced to top performers only
+    # Test best speed (lz4) and best compression (zstd) with most common allocators
+    log_info("\n=== Phase 2: Write Latency Tests (Top Performers) ===")
     write_configs = [
-        ('lz4', 'zsmalloc'),
-        ('lz4', 'z3fold'),
-        ('lz4', 'zbud'),
-        ('zstd', 'zsmalloc'),
-        ('zstd', 'z3fold'),
-        ('zstd', 'zbud')
+        ('lz4', 'zsmalloc'),   # Fast compressor, best allocator
+        ('zstd', 'zsmalloc'),  # Best compression, best allocator
+        ('lz4', 'z3fold'),     # Fast compressor, alternative allocator
     ]
     
     for i, (comp, alloc) in enumerate(write_configs, 1):
@@ -2246,17 +2248,12 @@ def benchmark_latency_comparison(test_size_mb=100):
                                         test_num=i, total_tests=len(write_configs))
         results['write_latency'].append(result)
     
-    # 3. Read latency tests (sequential and random)
-    log_info("\n=== Phase 3: Read Latency Tests ===")
+    # 3. Read latency tests - reduced to top performers only
+    log_info("\n=== Phase 3: Read Latency Tests (Top Performers) ===")
     read_configs = [
-        ('lz4', 'zsmalloc', 0),   # sequential
-        ('lz4', 'z3fold', 0),     # sequential
-        ('lz4', 'zbud', 0),       # sequential
-        ('lz4', 'zsmalloc', 1),   # random
-        ('zstd', 'zsmalloc', 0),  # sequential
-        ('zstd', 'z3fold', 0),    # sequential
-        ('zstd', 'zbud', 0),      # sequential
-        ('zstd', 'zsmalloc', 1),  # random
+        ('lz4', 'zsmalloc', 0),   # Fast, sequential
+        ('zstd', 'zsmalloc', 0),  # Best compression, sequential
+        ('lz4', 'zsmalloc', 1),   # Fast, random
     ]
     
     for i, (comp, alloc, pattern) in enumerate(read_configs, 1):
@@ -3261,21 +3258,29 @@ def format_benchmark_html(results):
             zram_lat = comp['zram'].get('avg_latency_us', 0)
             zswap_lat = comp['zswap'].get('avg_latency_us', 0)
             
-            html += f"  ZRAM:  {zram_ratio:.1f}x ratio, {zram_lat:.1f}µs latency\n"
-            html += f"  ZSWAP: {zswap_ratio:.1f}x ratio, {zswap_lat:.1f}µs latency\n"
-            
-            # Determine winner (avoid division by zero)
-            if zram_lat > 0 and zswap_lat > 0:
-                if zram_lat < zswap_lat:
-                    winner = "ZRAM"
-                    diff_pct = ((zswap_lat - zram_lat) / zram_lat) * 100
-                    html += f"  ⭐ {winner} is {diff_pct:.0f}% faster\n"
-                elif zswap_lat < zram_lat:
-                    winner = "ZSWAP"
-                    diff_pct = ((zram_lat - zswap_lat) / zswap_lat) * 100
-                    html += f"  ⭐ {winner} is {diff_pct:.0f}% faster\n"
-                # If equal latency, don't show a winner
+            # Check for suspicious low ratios (likely failed tests)
+            if zram_ratio < MIN_VALID_COMPRESSION_RATIO or zswap_ratio < MIN_VALID_COMPRESSION_RATIO:
+                html += f"  ⚠️ <i>Test results appear invalid (compression ratio &lt; {MIN_VALID_COMPRESSION_RATIO:.1f}x)</i>\n"
+                html += "  <i>This may indicate test failure or insufficient memory pressure</i>\n"
+            else:
+                html += f"  ZRAM:  {zram_ratio:.1f}x ratio, {zram_lat:.1f}µs latency\n"
+                html += f"  ZSWAP: {zswap_ratio:.1f}x ratio, {zswap_lat:.1f}µs latency\n"
+                
+                # Determine winner (avoid division by zero)
+                if zram_lat > 0 and zswap_lat > 0:
+                    if zram_lat < zswap_lat:
+                        winner = "ZRAM"
+                        diff_pct = ((zswap_lat - zram_lat) / zram_lat) * 100
+                        html += f"  ⭐ {winner} is {diff_pct:.0f}% faster\n"
+                    elif zswap_lat < zram_lat:
+                        winner = "ZSWAP"
+                        diff_pct = ((zram_lat - zswap_lat) / zswap_lat) * 100
+                        html += f"  ⭐ {winner} is {diff_pct:.0f}% faster\n"
+                    # If equal latency, don't show a winner
         html += "\n"
+    elif 'zswap_vs_zram' in results and 'error' in results['zswap_vs_zram']:
+        html += "<b>⚔️ ZSWAP vs ZRAM:</b>\n"
+        html += f"  ⚠️ <i>Test failed: {results['zswap_vs_zram']['error']}</i>\n\n"
     
     # Latency comparison results
     if 'latency_comparison' in results:
@@ -3382,6 +3387,28 @@ def format_benchmark_html(results):
                 html += f"  RAM:   {ram_write:8.0f} ns (baseline)\n"
                 html += f"  ZRAM:  {best_zram_write:8.0f} ns ({best_zram_write/ram_write:4.0f}× slower)\n"
                 html += f"  Disk:  {disk_write_ns/1000:8.0f} µs ({disk_write_ns/ram_write:4.0f}× slower)\n"
+                html += "\n"
+    
+    # Calculate and display overall space efficiency
+    if 'compressors' in results and results['compressors'] and 'system_info' in results:
+        # Find the best compressor (highest compression ratio)
+        best_comp = max(results['compressors'], key=lambda x: x.get('compression_ratio', 0))
+        compression_ratio = best_comp.get('compression_ratio', 0)
+        compressor_name = best_comp.get('compressor', 'N/A')
+        
+        if compression_ratio > 1.0:
+            ram_gb = results['system_info'].get('ram_gb', 0)
+            if ram_gb > 0:
+                # Calculate effective capacity (assuming swap uses all RAM for compression)
+                effective_capacity_gb = ram_gb * compression_ratio
+                space_saved_gb = effective_capacity_gb - ram_gb
+                efficiency_pct = ((compression_ratio - 1.0) / 1.0) * 100
+                
+                html += "<b>💾 Space Efficiency (Optimal Config):</b>\n"
+                html += f"  Physical RAM: {ram_gb:.1f}GB\n"
+                html += f"  Best Compressor: {compressor_name} ({compression_ratio:.1f}x)\n"
+                html += f"  Effective Capacity: {effective_capacity_gb:.1f}GB\n"
+                html += f"  Space Saved: {space_saved_gb:.1f}GB ({efficiency_pct:.0f}% more capacity)\n"
                 html += "\n"
     
     # Memory-only comparison
@@ -3612,6 +3639,11 @@ Examples:
         results['allocators'] = []
         for alloc in allocators:
             try:
+                # Force memory refresh before each test to get accurate compression ratios
+                log_debug(f"Cleaning up ZRAM before testing allocator: {alloc}")
+                cleanup_zram_aggressive()
+                time.sleep(ZRAM_STABILIZATION_DELAY_SEC)  # Let system stabilize
+                
                 current_test += 1
                 result = benchmark_compression(
                     'lz4', 
@@ -3806,15 +3838,28 @@ Examples:
                 
                 # Generate charts (with WebP conversion if requested)
                 log_info("Generating performance charts...")
-                chart_files = generate_charts(results, webp=args.webp)
+                chart_files_generated = generate_charts(results, webp=args.webp)
+                
+                # Filter out non-existent charts and log which ones are missing
+                chart_files = []
+                for chart_file in chart_files_generated:
+                    if os.path.exists(chart_file):
+                        chart_files.append(chart_file)
+                    else:
+                        log_debug(f"Chart file not found: {chart_file}")
+                
+                if not chart_files:
+                    log_warn("No charts were generated")
                 
                 # Generate matrix heatmaps if matrix tests were run
                 if 'matrix' in results and isinstance(results['matrix'], dict) and 'matrix' in results['matrix']:
                     try:
                         output_prefix = f"/var/log/debian-install/benchmark-{timestamp_str}"
                         matrix_chart = generate_matrix_heatmaps(results['matrix'], output_prefix)
-                        if matrix_chart:
+                        if matrix_chart and os.path.exists(matrix_chart):
                             chart_files.append(matrix_chart)
+                        elif matrix_chart:
+                            log_debug(f"Matrix chart file not found: {matrix_chart}")
                     except Exception as e:
                         log_warn(f"Failed to generate matrix heatmaps: {e}")
                 
