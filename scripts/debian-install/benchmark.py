@@ -596,7 +596,13 @@ def cleanup_test_files():
 
 def benchmark_block_size_fio(size_kb, test_file='/tmp/fio_test', runtime_sec=5, pattern='sequential', test_num=None, total_tests=None):
     """
-    Benchmark I/O performance with fio (more accurate than dd)
+    [DEPRECATED] Benchmark I/O performance with fio (more accurate than dd)
+    
+    NOTE: This test is deprecated. Use test_blocksize_concurrency_matrix() instead,
+    which provides comprehensive coverage with realistic rw=randrw patterns.
+    
+    This function is maintained for backward compatibility only and uses the
+    older sequential write-then-read pattern rather than the newer randrw approach.
     
     Args:
         size_kb: Block size in KB
@@ -1037,7 +1043,13 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
 
 def test_concurrency(num_files=8, file_size_mb=128, test_dir='/tmp/swap_test', test_num=None, total_tests=None):
     """
-    Test concurrency with multiple swap files using fio
+    [DEPRECATED] Test concurrency with multiple swap files using fio
+    
+    NOTE: This test is deprecated. Use test_blocksize_concurrency_matrix() instead,
+    which provides comprehensive coverage with realistic rw=randrw patterns.
+    
+    This function is maintained for backward compatibility only and uses the
+    older sequential write-then-read pattern rather than the newer randrw approach.
     
     Args:
         num_files: Number of concurrent swap files
