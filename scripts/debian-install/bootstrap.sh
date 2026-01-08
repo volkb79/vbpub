@@ -438,31 +438,51 @@ Check the log file for detailed error messages."
         log_info "==> Geekbench skipped (RUN_GEEKBENCH=$RUN_GEEKBENCH)"
     fi
     
-    # System info (AFTER all modifications)
-    # Skipping duplicate AFTER system info - full log will be sent at the end instead
-    if [ "$SEND_SYSINFO" = "yes" ] && [ -n "$TELEGRAM_BOT_TOKEN" ]; then
-        # Optionally save detailed info to file and send as attachment
-        SYSINFO_FILE="/tmp/system-info-$(date +%Y%m%d-%H%M%S).json"
-        ./system_info.py --output "$SYSINFO_FILE" 2>&1 || true
-        
-        if [ -f "$SYSINFO_FILE" ]; then
-            log_info "Sending detailed system info as attachment..."
-            tg_send_file "$SYSINFO_FILE" "📊 Detailed System Information (JSON)"
-            rm -f "$SYSINFO_FILE"
-        fi
-    fi
-    
     # Print bootstrap summary
     print_bootstrap_summary
     
     log_info "🎉 System setup complete!"
     log_info "Log: $LOG_FILE"
     
-    # Send completion message with log file as attachment
+    # Send comprehensive completion message with log file as attachment
     if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -f "$LOG_FILE" ]; then
-        log_info "Sending final log file as attachment..."
+        log_info "Sending final summary and log file..."
         sync
-        tg_send_file "$LOG_FILE" "📋 Bootstrap Complete - Full Log"
+        
+        # Build comprehensive completion message
+        local completion_msg="🎉 <b>Bootstrap Complete</b>
+
+<b>📊 Final System Status:</b>"
+        
+        # Add system summary
+        local hostname=$(hostname -f 2>/dev/null || hostname)
+        local ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        local ram_gb=$(free -g | awk '/^Mem:/{print $2}')
+        completion_msg="${completion_msg}
+• System: ${hostname} (${ip})
+• RAM: ${ram_gb}GB"
+        
+        # Add swap configuration
+        if [ -n "${SWAP_RAM_SOLUTION:-}" ] && [ "${SWAP_RAM_SOLUTION}" != "auto" ]; then
+            completion_msg="${completion_msg}
+• Swap: ${SWAP_RAM_SOLUTION}"
+        fi
+        
+        # Add Docker if installed
+        if command -v docker >/dev/null 2>&1; then
+            local docker_version=$(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',')
+            completion_msg="${completion_msg}
+• Docker: ${docker_version}"
+        fi
+        
+        completion_msg="${completion_msg}
+
+<b>📝 Log File:</b> See attachment for full details
+<b>⏱️ Completed:</b> $(date '+%Y-%m-%d %H:%M:%S')"
+        
+        # Send message with log as attachment
+        tg_send "$completion_msg"
+        tg_send_file "$LOG_FILE" "📋 Bootstrap Complete - Full Installation Log"
     fi
 }
 

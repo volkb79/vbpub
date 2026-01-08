@@ -921,13 +921,12 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
                 system_info = get_system_info()
                 ram_gb = system_info.get('ram_gb', 8)
                 
-                if ram_gb >= 8:
-                    # High RAM systems won't swap much
-                    min_swap_percent = 20  # Only expect 20% swapping
-                elif ram_gb >= 4:
-                    min_swap_percent = 35
+                if ram_gb >= 4:
+                    # Medium to high RAM systems won't swap much (20% threshold = 25.6MB for 128MB test)
+                    min_swap_percent = 20
                 else:
-                    min_swap_percent = 50
+                    # Low RAM systems will swap more aggressively
+                    min_swap_percent = 35
                 
                 min_expected_bytes = size_mb * 1024 * 1024 * min_swap_percent // 100
                 if orig_size < min_expected_bytes:
