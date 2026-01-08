@@ -1166,9 +1166,9 @@ def test_blocksize_concurrency_matrix(block_sizes=None, concurrency_levels=None,
     start_time = time.time()
     
     if block_sizes is None:
-        block_sizes = [4, 8, 16, 32, 64]  # Remove 128KB - diminishing returns
+        block_sizes = [4, 8, 16, 32, 64, 128]  # Include 128KB - sequential tests show good performance
     if concurrency_levels is None:
-        concurrency_levels = [1, 2, 4, 8]  # Test up to 8 for optimal detection
+        concurrency_levels = [1, 2, 4, 6, 8]  # Include 6 to identify inflection point between 4 and 8
     
     total_combinations = len(block_sizes) * len(concurrency_levels)
     log_step_ts(f"Block Size × Concurrency Matrix Test ({total_combinations} combinations)")
@@ -3160,7 +3160,7 @@ def generate_charts(results, output_dir='/var/log/debian-install', webp=True):
                             r.get('max_read_us', 0)
                         ])
                     
-                    axes[0].boxplot(box_data, labels=labels, patch_artist=True)
+                    axes[0].boxplot(box_data, tick_labels=labels, patch_artist=True)
                     axes[0].set_ylabel('Latency (µs)', fontsize=12)
                     axes[0].set_title('Read Latency Distribution', fontsize=12, fontweight='bold')
                     axes[0].tick_params(axis='x', rotation=45)
@@ -3184,7 +3184,7 @@ def generate_charts(results, output_dir='/var/log/debian-install', webp=True):
                             w.get('max_write_us', 0)
                         ])
                     
-                    axes[1].boxplot(box_data, labels=labels, patch_artist=True)
+                    axes[1].boxplot(box_data, tick_labels=labels, patch_artist=True)
                     axes[1].set_ylabel('Latency (µs)', fontsize=12)
                     axes[1].set_title('Write Latency Distribution', fontsize=12, fontweight='bold')
                     axes[1].tick_params(axis='x', rotation=45)

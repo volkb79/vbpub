@@ -346,6 +346,15 @@ class GeekbenchRunner:
                     print(f"✓ Extracted scores - Single: {single_score}, Multi: {multi_score}")
                 else:
                     print("⚠ Could not extract scores from output")
+                    # Try to scrape from URL if available
+                    if result_url:
+                        print("Attempting to scrape scores from result URL...")
+                        scraped_scores = self._scrape_scores_from_url(result_url)
+                        if scraped_scores:
+                            self.results['score'] = scraped_scores
+                            print(f"✓ Scraped scores - Single: {scraped_scores.get('singlecore_score')}, Multi: {scraped_scores.get('multicore_score')}")
+                        else:
+                            print("⚠ Could not scrape scores from URL")
                 
                 if result_url:
                     self.results['result_url'] = result_url
@@ -366,6 +375,73 @@ class GeekbenchRunner:
             print(error_msg)
             self.results['error'] = str(e)
             return False
+    
+    def _scrape_scores_from_url(self, url):
+        """
+        Scrape Geekbench scores from the result URL.
+        This is a fallback when scores aren't available in the CLI output.
+        
+        Args:
+            url: The Geekbench result URL (e.g., https://browser.geekbench.com/v6/cpu/12345)
+        
+        Returns:
+            Dictionary with singlecore_score and multicore_score, or None if scraping fails
+        """
+        try:
+            # Use curl to fetch the HTML page
+            result = subprocess.run(
+                ['curl', '-sL', '--max-time', '10', url],
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+            
+            if result.returncode != 0:
+                return None
+            
+            html = result.stdout
+            
+            # Parse scores from HTML
+            # Geekbench result pages typically show scores in a format like:
+            # <div class="score">1234</div> or similar
+            # Patterns may vary, so we try multiple approaches
+            
+            single_score = None
+            multi_score = None
+            
+            # Pattern 1: Look for "Single-Core Score" followed by digits
+            single_match = re.search(r'Single-Core Score[^>]*>[\s]*(\d+)', html, re.IGNORECASE)
+            if single_match:
+                single_score = int(single_match.group(1))
+            
+            # Pattern 2: Look for "Multi-Core Score" followed by digits
+            multi_match = re.search(r'Multi-Core Score[^>]*>[\s]*(\d+)', html, re.IGNORECASE)
+            if multi_match:
+                multi_score = int(multi_match.group(1))
+            
+            # Pattern 3: Alternative - look for score values in common HTML patterns
+            if not single_score or not multi_score:
+                # Try finding scores in common div/span patterns
+                score_pattern = r'<(?:div|span)[^>]*class="[^"]*score[^"]*"[^>]*>[\s]*(\d+)'
+                all_scores = re.findall(score_pattern, html, re.IGNORECASE)
+                if len(all_scores) >= 2:
+                    # Usually first score is single-core, second is multi-core
+                    if not single_score:
+                        single_score = int(all_scores[0])
+                    if not multi_score:
+                        multi_score = int(all_scores[1])
+            
+            if single_score or multi_score:
+                return {
+                    'singlecore_score': single_score,
+                    'multicore_score': multi_score
+                }
+            
+            return None
+            
+        except Exception as e:
+            print(f"⚠ Error scraping scores from URL: {e}")
+            return None
     
     def upload_results(self):
         """Upload results to Geekbench Browser and get claim URL"""
