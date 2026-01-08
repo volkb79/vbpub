@@ -87,6 +87,76 @@ for block_size in [4, 8, 16, 32, 64, 128]:
 - **HDD systems:** Optimal at 64-128KB (amortizes seek time)
 - **NVMe systems:** May benefit from 128KB or higher
 
+**Access pattern:** Pure sequential I/O (not representative of swap's mixed pattern)
+
+### What is the Matrix Test?
+
+The **Block Size × Concurrency Matrix Test** combines two dimensions:
+
+```python
+# Tests all combinations: 6 block sizes × 5 concurrency levels = 30 tests
+block_sizes = [4, 8, 16, 32, 64, 128]  # KB
+concurrency_levels = [1, 2, 4, 6, 8]   # parallel jobs
+
+for block_size in block_sizes:
+    for concurrency in concurrency_levels:
+        test_combination(block_size, concurrency)
+```
+
+**Key differences from individual tests:**
+
+| Test Type | Block Sizes | Concurrency | Access Pattern | Purpose | Status |
+|-----------|-------------|-------------|----------------|---------|--------|
+| **Block Size Test** | All sizes | Fixed (1) | Sequential | Find optimal `vm.page-cluster` | **Redundant** - covered by matrix at concurrency=1 |
+| **Concurrency Test** | Fixed (64KB) | All levels | Parallel sequential | Find optimal stripe width | **Redundant** - covered by matrix at 64KB |
+| **Matrix Test** | All sizes | All levels | Parallel sequential | Find **best combination** | **Primary test** - comprehensive |
+
+**Individual tests are slices of the matrix:**
+- Block size test = matrix results where concurrency=1
+- Concurrency test = matrix results where block_size=64KB
+- **Recommendation:** Consider deprecating individual tests; matrix test is comprehensive
+
+**Why matrix test is critical:**
+- Individual tests don't reveal interaction effects
+- Optimal block size may differ at high concurrency
+- Example: 32KB might be best at concurrency=1, but 64KB best at concurrency=8
+- Matrix reveals the **inflection point** where performance plateaus
+
+**Access pattern in tests:**
+- **Block Size Test:** Pure sequential read/write (simplest case)
+- **Concurrency Test:** Multiple parallel sequential streams (more realistic)
+- **Matrix Test:** Multiple parallel sequential streams with varying block sizes
+
+**Real swap access pattern (not directly tested):**
+- **Write pattern:** Random writes in blocks = `vm.page-cluster` size
+  - Kernel writes pages as they're evicted (pseudo-random addresses)
+  - Clustering controlled by `vm.page-cluster` (groups adjacent pages)
+- **Read pattern:** Logical vs Physical access
+  - **Logical (application view):** Semi-sequential - applications access related memory regions
+  - **Physical (disk view):** With striped swap files, logical sequential reads become physically random
+  - Fragmentation over time: Pages scattered across multiple swap files
+  - Example: Reading 5 sequential logical pages may hit 5 different physical swap files
+  - **Real-world implication:** Pure sequential test patterns overestimate performance
+
+**Why matrix test should use mixed patterns:**
+- Current tests use pure sequential I/O (write then read)
+- Real swap has mixed random/sequential patterns simultaneously
+- **Improvement needed:** Use fio's `readwrite=randrw` for more realistic testing
+- This would better represent: concurrent eviction (writes) + page faults (reads)
+
+**Bandwidth vs. Latency tradeoffs:**
+
+| Metric | Matters For | Optimization Strategy |
+|--------|-------------|----------------------|
+| **Bandwidth** | High RAM compression (ZRAM/ZSWAP) | Larger block sizes (64-128KB), more concurrency |
+| **Latency** | Application responsiveness on swap-ins | Smaller block sizes (32-64KB), optimize for single-threaded access |
+| **Both** | Production systems | Balance via matrix test results |
+
+**Configuration recommendations:**
+- **Low-latency priority** (interactive workloads): Use matrix results at concurrency=1-2
+- **High-bandwidth priority** (batch workloads, high ZRAM): Use matrix results at concurrency=6-8
+- **Balanced** (general use): Use matrix results at concurrency=4
+
 ### 2. Compression Algorithm Tests
 
 **What we test:**
@@ -167,20 +237,63 @@ for allocator in ['zsmalloc', 'z3fold', 'zbud']:
 
 **Allocator characteristics:**
 
-1. **zsmalloc** (~90% efficiency):
+1. **zsmalloc** (~90% **theoretical** efficiency):
    - Best compression ratio
    - Higher CPU overhead
    - Suitable for: Low RAM systems, memory-critical workloads
+   - **Theoretical:** Stores up to 3+ pages per zspage (up to ~90% efficiency)
+   - **Actual:** Results vary based on data compressibility and fragmentation
 
-2. **z3fold** (~75% efficiency):
+2. **z3fold** (~75% **theoretical** efficiency):
    - Balanced approach
    - Moderate CPU overhead
    - Suitable for: General-purpose systems
+   - **Theoretical:** Stores 3 pages per zspage (75% efficiency when full)
+   - **Actual:** Efficiency depends on how many pages fit per zspage
 
-3. **zbud** (~50% efficiency):
+3. **zbud** (~50% **theoretical** efficiency):
    - Lowest CPU overhead
    - 2 pages per zspage (50% theoretical efficiency)
    - Suitable for: CPU-bottlenecked systems
+   - **Theoretical:** Maximum 2 pages per zspage = 50% efficiency
+   - **Actual:** Often matches theoretical closely (~50%)
+
+**Why actual results differ from theoretical:**
+
+The theoretical values (90%, 75%, 50%) represent **maximum possible efficiency** under ideal conditions:
+- **Assumes perfect page packing** (all zspages are completely full)
+- **Ignores metadata overhead** (page tables, allocator structures)
+- **Ignores fragmentation** (partially filled zspages reduce efficiency)
+
+**Real-world example from test output:**
+```
+💾 Allocator Performance:
+  zsmalloc: 2.6x ratio, +54% eff (-3% vs best)
+  z3fold  : 2.8x ratio, +57% eff ⭐
+  zbud    : 2.8x ratio, +57% eff (-0% vs best)
+```
+
+**Analysis:**
+- All show similar compression ratios (2.6-2.8x) - **expected** (same compressor)
+- Efficiency ~54-57% - **much lower** than theoretical 50-90%
+- Why? Compression ratio includes **both** compressor and allocator effects
+- The "efficiency" metric accounts for total memory used (compressed data + overhead)
+
+**Correct interpretation:**
+1. **Compression ratio = compressor effect + allocator packing**
+2. **Efficiency % = (orig_size - mem_used) / orig_size × 100**
+3. **mem_used = compressed_size + allocator_overhead + metadata**
+
+For 2.6x compression ratio:
+- Compressor reduces 1GB → ~385MB (2.6x)
+- Allocator adds overhead → final mem_used ~440MB
+- Efficiency: (1024 - 440) / 1024 = 57%
+
+**Testing improvements to verify allocator behavior:**
+- Add detailed logging of `mm_stat` fields per test
+- Compare same data with different allocators (isolate allocator effect)
+- Test with highly compressible data (zeros) to maximize allocator differences
+- Graph: compression_ratio vs efficiency_pct for each allocator
 
 **Performance counters:**
 Same as compression tests, but with allocator comparison focus.
@@ -188,6 +301,7 @@ Same as compression tests, but with allocator comparison focus.
 **Decision impact:**
 - Compare `efficiency_pct` across allocators
 - Choose allocator based on CPU vs. memory trade-off
+- For similar efficiency, choose allocator with lower CPU overhead
 
 ### 4. Concurrency Tests
 
@@ -249,13 +363,30 @@ results = {
 ### Why C-Based Memory Allocation?
 
 **Problem:** Python-based memory allocation for 7GB+ is extremely slow:
-- Python: ~2919 seconds (48+ minutes)
-- C: ~21 seconds (100x faster)
+- Python: ~2919 seconds (48+ minutes) for allocation + pattern generation
+- C: ~21 seconds (100x faster for allocation + pattern generation)
 
-**Root causes:**
-1. Python's bytearray allocation is slow for large sizes
-2. List comprehensions for pattern generation are inefficient
-3. Byte-by-byte operations don't leverage CPU cache
+**Performance breakdown:**
+- C allocation speed: ~330 MB/s (7GB in 21s)
+  - This includes malloc() + pattern generation + memory access
+  - Pattern generation is CPU-bound, not memory-bound
+  - Actual RAM write bandwidth is much higher (~5-10 GB/s typically)
+- The 21s includes: allocation time + filling with patterns + forcing pages into RAM
+- Pure memory bandwidth is not the bottleneck; pattern computation is
+
+**Optimization opportunity:**
+- **Current approach:** Fill entire 7GB with patterns (CPU-intensive)
+- **Alternative approach:** 
+  - Block 7GB with malloc() to prevent interference (fast)
+  - Only generate patterns for the ~300MB test area actually used for swap tests
+  - Could reduce pattern generation time from ~21s to ~1s
+  - **Trade-off:** More complex code vs faster test setup
+
+**Root causes of Python slowness:**
+1. Python's bytearray allocation is slow for large sizes (memory management overhead)
+2. List comprehensions and loops for pattern generation are extremely inefficient
+3. Byte-by-byte operations don't leverage CPU cache or SIMD instructions
+4. Python's GIL (Global Interpreter Lock) prevents parallel memory operations
 
 **Solution: `mem_pressure.c`**
 

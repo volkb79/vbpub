@@ -346,6 +346,15 @@ class GeekbenchRunner:
                     print(f"✓ Extracted scores - Single: {single_score}, Multi: {multi_score}")
                 else:
                     print("⚠ Could not extract scores from output")
+                    # Try to scrape from URL if available
+                    if result_url:
+                        print("Attempting to scrape scores from result URL...")
+                        scraped_scores = self._scrape_scores_from_url(result_url)
+                        if scraped_scores:
+                            self.results['score'] = scraped_scores
+                            print(f"✓ Scraped scores - Single: {scraped_scores.get('singlecore_score')}, Multi: {scraped_scores.get('multicore_score')}")
+                        else:
+                            print("⚠ Could not scrape scores from URL")
                 
                 if result_url:
                     self.results['result_url'] = result_url
@@ -366,6 +375,112 @@ class GeekbenchRunner:
             print(error_msg)
             self.results['error'] = str(e)
             return False
+    
+    def _scrape_scores_from_url(self, url):
+        """
+        Scrape Geekbench scores from the result URL.
+        This is a fallback when scores aren't available in the CLI output.
+        
+        Args:
+            url: The Geekbench result URL (e.g., https://browser.geekbench.com/v6/cpu/12345)
+        
+        Returns:
+            Dictionary with singlecore_score and multicore_score, or None if scraping fails
+        """
+        try:
+            # Use curl to fetch the HTML page
+            result = subprocess.run(
+                ['curl', '-sL', '--max-time', '10', url],
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+            
+            if result.returncode != 0:
+                return None
+            
+            html = result.stdout
+            
+            # Parse scores from HTML
+            # Geekbench result pages have scores in specific sections
+            # Example patterns from actual pages:
+            # <div class="score" ...>1234</div>
+            # <span class="score">1234</span>
+            # In tables with "Single-Core Score" and "Multi-Core Score" headers
+            
+            single_score = None
+            multi_score = None
+            
+            # Pattern 1: Look for score values in table rows after "Single-Core Score" text
+            # This is the most reliable pattern for Geekbench browser pages
+            single_patterns = [
+                r'Single-Core\s+Score[^>]*>[\s]*<[^>]*>[\s]*(\d+)',  # Score in next element
+                r'Single-Core\s+Score.*?<(?:div|span|td)[^>]*>[\s]*(\d+)',  # Score in div/span/td
+                r'Single-Core\s+Score.*?(\d{3,5})',  # Any 3-5 digit number after label
+            ]
+            
+            for pattern in single_patterns:
+                match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+                if match:
+                    single_score = int(match.group(1))
+                    print(f"Extracted single-core score: {single_score} (pattern: {pattern[:50]}...)")
+                    break
+            
+            # Pattern 2: Look for score values after "Multi-Core Score" text
+            multi_patterns = [
+                r'Multi-Core\s+Score[^>]*>[\s]*<[^>]*>[\s]*(\d+)',
+                r'Multi-Core\s+Score.*?<(?:div|span|td)[^>]*>[\s]*(\d+)',
+                r'Multi-Core\s+Score.*?(\d{3,5})',
+            ]
+            
+            for pattern in multi_patterns:
+                match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+                if match:
+                    multi_score = int(match.group(1))
+                    print(f"Extracted multi-core score: {multi_score} (pattern: {pattern[:50]}...)")
+                    break
+            
+            # Pattern 3: Alternative - look for scores in result summary section
+            # Geekbench pages often have a summary section with class="score" elements
+            if not single_score or not multi_score:
+                # Find all elements with class containing "score"
+                score_divs = re.findall(r'<(?:div|span|td)[^>]*class="[^"]*score[^"]*"[^>]*>[\s]*(\d{3,5})', html, re.IGNORECASE)
+                if len(score_divs) >= 2:
+                    # Usually first score is single-core, second is multi-core
+                    if not single_score and score_divs[0]:
+                        single_score = int(score_divs[0])
+                        print(f"Extracted single-core score from score divs: {single_score}")
+                    if not multi_score and len(score_divs) > 1 and score_divs[1]:
+                        multi_score = int(score_divs[1])
+                        print(f"Extracted multi-core score from score divs: {multi_score}")
+            
+            # Pattern 4: Look in meta tags (sometimes scores are in OpenGraph tags)
+            if not single_score or not multi_score:
+                # Try meta tags
+                meta_match = re.search(r'<meta[^>]*property="og:description"[^>]*content="[^"]*(\d{3,5})[^"]*(\d{3,5})', html, re.IGNORECASE)
+                if meta_match:
+                    if not single_score:
+                        single_score = int(meta_match.group(1))
+                        print(f"Extracted single-core score from meta tags: {single_score}")
+                    if not multi_score:
+                        multi_score = int(meta_match.group(2))
+                        print(f"Extracted multi-core score from meta tags: {multi_score}")
+            
+            if single_score or multi_score:
+                return {
+                    'singlecore_score': single_score,
+                    'multicore_score': multi_score
+                }
+            else:
+                print(f"⚠ Could not extract scores from {url}")
+                # Debug: save first 2000 chars of HTML to see structure
+                print(f"HTML snippet (first 500 chars): {html[:500]}")
+            
+            return None
+            
+        except Exception as e:
+            print(f"⚠ Error scraping scores from URL: {e}")
+            return None
     
     def upload_results(self):
         """Upload results to Geekbench Browser and get claim URL"""

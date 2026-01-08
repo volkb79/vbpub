@@ -186,7 +186,7 @@ ZRAM_STABILIZATION_DELAY_SEC = 2  # Time to wait after ZRAM cleanup for system s
 STRESS_NG_TIMEOUT_SEC = 15  # Timeout for stress-ng memory allocation
 STRESS_NG_WAIT_SEC = 20  # Maximum wait time for stress-ng process
 MEMORY_ACCESS_STEP_SIZE = 65536  # 64KB steps for memory access patterns
-COMPRESSION_TEST_TIMEOUT_SEC = 300  # Maximum time per compression test (5 minutes)
+COMPRESSION_TEST_TIMEOUT_SEC = 180  # Maximum time per compression test (3 minutes, optimized from 5 minutes)
 
 # FIO test configuration constants
 FIO_TEST_FILE_SIZE = '1G'  # Test file size for fio benchmarks
@@ -902,8 +902,23 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         if os.path.exists('/sys/block/zram0/mm_stat'):
             stats = run_command('cat /sys/block/zram0/mm_stat').split()
             
-            # Debug: show raw stats
+            # Enhanced debug logging with field names
             log_debug_ts(f"Raw mm_stat: {' '.join(stats)}")
+            if len(stats) >= 7:
+                log_debug_ts(f"mm_stat breakdown:")
+                log_debug_ts(f"  [0] orig_data_size:   {int(stats[0])/1024/1024:.2f} MB (uncompressed data)")
+                log_debug_ts(f"  [1] compr_data_size:  {int(stats[1])/1024/1024:.2f} MB (compressed size)")
+                log_debug_ts(f"  [2] mem_used_total:   {int(stats[2])/1024/1024:.2f} MB (memory used incl. overhead)")
+                log_debug_ts(f"  [3] mem_limit:        {int(stats[3])/1024/1024:.2f} MB (memory limit)")
+                log_debug_ts(f"  [4] mem_used_max:     {int(stats[4])/1024/1024:.2f} MB (peak memory)")
+                log_debug_ts(f"  [5] same_pages:       {stats[5]} (pages with same content)")
+                log_debug_ts(f"  [6] pages_compacted:  {stats[6]} (compaction count)")
+                
+                # Calculate overhead
+                if len(stats) >= 3:
+                    overhead_mb = (int(stats[2]) - int(stats[1])) / 1024 / 1024
+                    overhead_pct = ((int(stats[2]) - int(stats[1])) / int(stats[1]) * 100) if int(stats[1]) > 0 else 0
+                    log_debug_ts(f"  Allocator overhead:   {overhead_mb:.2f} MB ({overhead_pct:.1f}% of compressed)")
             
             if len(stats) >= 3:
                 orig_size = int(stats[0])
@@ -921,13 +936,12 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
                 system_info = get_system_info()
                 ram_gb = system_info.get('ram_gb', 8)
                 
-                if ram_gb >= 8:
-                    # High RAM systems won't swap much
-                    min_swap_percent = 20  # Only expect 20% swapping
-                elif ram_gb >= 4:
-                    min_swap_percent = 35
+                if ram_gb >= 4:
+                    # Medium to high RAM systems won't swap much (20% threshold = 25.6MB for 128MB test)
+                    min_swap_percent = 20
                 else:
-                    min_swap_percent = 50
+                    # Low RAM systems will swap more aggressively
+                    min_swap_percent = 35
                 
                 min_expected_bytes = size_mb * 1024 * 1024 * min_swap_percent // 100
                 if orig_size < min_expected_bytes:
@@ -1153,6 +1167,11 @@ def test_blocksize_concurrency_matrix(block_sizes=None, concurrency_levels=None,
     This tests all combinations of block sizes and concurrency levels to discover
     which configuration provides the best throughput for the specific hardware.
     
+    Current pattern: Sequential write, then sequential read (separate phases)
+    More realistic pattern (TODO): Use rw=randrw for mixed random read/write
+    - Would better simulate: concurrent eviction (writes) + page faults (reads)
+    - Trade-off: More complex to parse results, harder to compare write vs read
+    
     Args:
         block_sizes: List of block sizes in KB (default: [4, 8, 16, 32, 64])
         concurrency_levels: List of concurrency levels (default: [1, 2, 4])
@@ -1166,9 +1185,9 @@ def test_blocksize_concurrency_matrix(block_sizes=None, concurrency_levels=None,
     start_time = time.time()
     
     if block_sizes is None:
-        block_sizes = [4, 8, 16, 32, 64]  # Remove 128KB - diminishing returns
+        block_sizes = [4, 8, 16, 32, 64, 128]  # Include 128KB - sequential tests show good performance
     if concurrency_levels is None:
-        concurrency_levels = [1, 2, 4, 8]  # Test up to 8 for optimal detection
+        concurrency_levels = [1, 2, 4, 6, 8]  # Include 6 to identify inflection point between 4 and 8
     
     total_combinations = len(block_sizes) * len(concurrency_levels)
     log_step_ts(f"Block Size × Concurrency Matrix Test ({total_combinations} combinations)")
@@ -3160,7 +3179,7 @@ def generate_charts(results, output_dir='/var/log/debian-install', webp=True):
                             r.get('max_read_us', 0)
                         ])
                     
-                    axes[0].boxplot(box_data, labels=labels, patch_artist=True)
+                    axes[0].boxplot(box_data, tick_labels=labels, patch_artist=True)
                     axes[0].set_ylabel('Latency (µs)', fontsize=12)
                     axes[0].set_title('Read Latency Distribution', fontsize=12, fontweight='bold')
                     axes[0].tick_params(axis='x', rotation=45)
@@ -3184,7 +3203,7 @@ def generate_charts(results, output_dir='/var/log/debian-install', webp=True):
                             w.get('max_write_us', 0)
                         ])
                     
-                    axes[1].boxplot(box_data, labels=labels, patch_artist=True)
+                    axes[1].boxplot(box_data, tick_labels=labels, patch_artist=True)
                     axes[1].set_ylabel('Latency (µs)', fontsize=12)
                     axes[1].set_title('Write Latency Distribution', fontsize=12, fontweight='bold')
                     axes[1].tick_params(axis='x', rotation=45)
@@ -3209,6 +3228,90 @@ def generate_charts(results, output_dir='/var/log/debian-install', webp=True):
                 plt.close()
                 chart_files.append(chart_file)
                 log_info(f"Generated latency distribution chart: {chart_file}")
+        
+        # Chart: Allocator Comparison (compression ratio vs efficiency)
+        if 'allocators' in results and results['allocators'] and len(results['allocators']) > 1:
+            try:
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+                
+                allocator_names = [a.get('allocator', 'Unknown') for a in results['allocators']]
+                compression_ratios = [a.get('compression_ratio', 0) for a in results['allocators']]
+                efficiencies = [a.get('efficiency_pct', 0) for a in results['allocators']]
+                mem_used = [a.get('mem_used_mb', 0) for a in results['allocators']]
+                compr_size = [a.get('compr_size_mb', 0) for a in results['allocators']]
+                
+                # Calculate overhead for each allocator
+                overhead_mb = [mem_used[i] - compr_size[i] for i in range(len(mem_used))]
+                
+                # Chart 1: Compression Ratio vs Efficiency
+                x = range(len(allocator_names))
+                width = 0.35
+                
+                bars1 = ax1.bar([i - width/2 for i in x], compression_ratios, width, 
+                               label='Compression Ratio', color='steelblue', alpha=0.8)
+                ax1_twin = ax1.twinx()
+                bars2 = ax1_twin.bar([i + width/2 for i in x], efficiencies, width,
+                                    label='Efficiency %', color='coral', alpha=0.8)
+                
+                ax1.set_xlabel('Allocator', fontsize=12)
+                ax1.set_ylabel('Compression Ratio (x)', fontsize=12, color='steelblue')
+                ax1_twin.set_ylabel('Efficiency (%)', fontsize=12, color='coral')
+                ax1.set_title('Allocator Performance: Ratio vs Efficiency', fontsize=14, fontweight='bold')
+                ax1.set_xticks(x)
+                ax1.set_xticklabels(allocator_names)
+                ax1.tick_params(axis='y', labelcolor='steelblue')
+                ax1_twin.tick_params(axis='y', labelcolor='coral')
+                ax1.grid(True, alpha=0.3, axis='y')
+                
+                # Add value labels on bars
+                for i, (bar1, bar2) in enumerate(zip(bars1, bars2)):
+                    height1 = bar1.get_height()
+                    height2 = bar2.get_height()
+                    ax1.text(bar1.get_x() + bar1.get_width()/2., height1,
+                            f'{height1:.1f}x', ha='center', va='bottom', fontsize=9)
+                    ax1_twin.text(bar2.get_x() + bar2.get_width()/2., height2,
+                                 f'{height2:.0f}%', ha='center', va='bottom', fontsize=9)
+                
+                # Combined legend
+                lines1, labels1 = ax1.get_legend_handles_labels()
+                lines2, labels2 = ax1_twin.get_legend_handles_labels()
+                ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=10)
+                
+                # Chart 2: Memory Breakdown (compressed + overhead)
+                bottom = [0] * len(allocator_names)
+                bars_compr = ax2.bar(x, compr_size, label='Compressed Data', color='lightgreen', alpha=0.8)
+                bars_overhead = ax2.bar(x, overhead_mb, bottom=compr_size, 
+                                       label='Allocator Overhead', color='salmon', alpha=0.8)
+                
+                ax2.set_xlabel('Allocator', fontsize=12)
+                ax2.set_ylabel('Memory Used (MB)', fontsize=12)
+                ax2.set_title('Memory Breakdown: Compressed Data + Overhead', fontsize=14, fontweight='bold')
+                ax2.set_xticks(x)
+                ax2.set_xticklabels(allocator_names)
+                ax2.legend(fontsize=10)
+                ax2.grid(True, alpha=0.3, axis='y')
+                
+                # Add total labels on bars
+                for i in range(len(allocator_names)):
+                    total = compr_size[i] + overhead_mb[i]
+                    ax2.text(i, total, f'{total:.1f}MB', ha='center', va='bottom', fontsize=9)
+                    # Add overhead percentage
+                    if compr_size[i] > 0:
+                        overhead_pct = (overhead_mb[i] / compr_size[i]) * 100
+                        ax2.text(i, compr_size[i] + overhead_mb[i]/2, 
+                                f'+{overhead_pct:.0f}%', ha='center', va='center', 
+                                fontsize=8, color='white', weight='bold')
+                
+                plt.tight_layout()
+                chart_file = f"{output_dir}/benchmark-allocator-comparison-{timestamp}.png"
+                plt.savefig(chart_file, dpi=150, bbox_inches='tight')
+                plt.close()
+                chart_files.append(chart_file)
+                log_info(f"Generated allocator comparison chart: {chart_file}")
+                
+            except Exception as e:
+                log_warn(f"Failed to generate allocator comparison chart: {e}")
+                log_debug(traceback.format_exc())
         
     except Exception as e:
         log_error(f"Failed to generate charts: {e}")
