@@ -402,40 +402,79 @@ class GeekbenchRunner:
             html = result.stdout
             
             # Parse scores from HTML
-            # Geekbench result pages typically show scores in a format like:
-            # <div class="score">1234</div> or similar
-            # Patterns may vary, so we try multiple approaches
+            # Geekbench result pages have scores in specific sections
+            # Example patterns from actual pages:
+            # <div class="score" ...>1234</div>
+            # <span class="score">1234</span>
+            # In tables with "Single-Core Score" and "Multi-Core Score" headers
             
             single_score = None
             multi_score = None
             
-            # Pattern 1: Look for "Single-Core Score" followed by digits
-            single_match = re.search(r'Single-Core Score[^>]*>[\s]*(\d+)', html, re.IGNORECASE)
-            if single_match:
-                single_score = int(single_match.group(1))
+            # Pattern 1: Look for score values in table rows after "Single-Core Score" text
+            # This is the most reliable pattern for Geekbench browser pages
+            single_patterns = [
+                r'Single-Core\s+Score[^>]*>[\s]*<[^>]*>[\s]*(\d+)',  # Score in next element
+                r'Single-Core\s+Score.*?<(?:div|span|td)[^>]*>[\s]*(\d+)',  # Score in div/span/td
+                r'Single-Core\s+Score.*?(\d{3,5})',  # Any 3-5 digit number after label
+            ]
             
-            # Pattern 2: Look for "Multi-Core Score" followed by digits
-            multi_match = re.search(r'Multi-Core Score[^>]*>[\s]*(\d+)', html, re.IGNORECASE)
-            if multi_match:
-                multi_score = int(multi_match.group(1))
+            for pattern in single_patterns:
+                match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+                if match:
+                    single_score = int(match.group(1))
+                    print(f"Extracted single-core score: {single_score} (pattern: {pattern[:50]}...)")
+                    break
             
-            # Pattern 3: Alternative - look for score values in common HTML patterns
+            # Pattern 2: Look for score values after "Multi-Core Score" text
+            multi_patterns = [
+                r'Multi-Core\s+Score[^>]*>[\s]*<[^>]*>[\s]*(\d+)',
+                r'Multi-Core\s+Score.*?<(?:div|span|td)[^>]*>[\s]*(\d+)',
+                r'Multi-Core\s+Score.*?(\d{3,5})',
+            ]
+            
+            for pattern in multi_patterns:
+                match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+                if match:
+                    multi_score = int(match.group(1))
+                    print(f"Extracted multi-core score: {multi_score} (pattern: {pattern[:50]}...)")
+                    break
+            
+            # Pattern 3: Alternative - look for scores in result summary section
+            # Geekbench pages often have a summary section with class="score" elements
             if not single_score or not multi_score:
-                # Try finding scores in common div/span patterns
-                score_pattern = r'<(?:div|span)[^>]*class="[^"]*score[^"]*"[^>]*>[\s]*(\d+)'
-                all_scores = re.findall(score_pattern, html, re.IGNORECASE)
-                if len(all_scores) >= 2:
+                # Find all elements with class containing "score"
+                score_divs = re.findall(r'<(?:div|span|td)[^>]*class="[^"]*score[^"]*"[^>]*>[\s]*(\d{3,5})', html, re.IGNORECASE)
+                if len(score_divs) >= 2:
                     # Usually first score is single-core, second is multi-core
+                    if not single_score and score_divs[0]:
+                        single_score = int(score_divs[0])
+                        print(f"Extracted single-core score from score divs: {single_score}")
+                    if not multi_score and len(score_divs) > 1 and score_divs[1]:
+                        multi_score = int(score_divs[1])
+                        print(f"Extracted multi-core score from score divs: {multi_score}")
+            
+            # Pattern 4: Look in meta tags (sometimes scores are in OpenGraph tags)
+            if not single_score or not multi_score:
+                # Try meta tags
+                meta_match = re.search(r'<meta[^>]*property="og:description"[^>]*content="[^"]*(\d{3,5})[^"]*(\d{3,5})', html, re.IGNORECASE)
+                if meta_match:
                     if not single_score:
-                        single_score = int(all_scores[0])
+                        single_score = int(meta_match.group(1))
+                        print(f"Extracted single-core score from meta tags: {single_score}")
                     if not multi_score:
-                        multi_score = int(all_scores[1])
+                        multi_score = int(meta_match.group(2))
+                        print(f"Extracted multi-core score from meta tags: {multi_score}")
             
             if single_score or multi_score:
                 return {
                     'singlecore_score': single_score,
                     'multicore_score': multi_score
                 }
+            else:
+                print(f"⚠ Could not extract scores from {url}")
+                # Debug: save first 2000 chars of HTML to see structure
+                print(f"HTML snippet (first 500 chars): {html[:500]}")
             
             return None
             

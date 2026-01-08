@@ -105,11 +105,16 @@ for block_size in block_sizes:
 
 **Key differences from individual tests:**
 
-| Test Type | Block Sizes | Concurrency | Access Pattern | Purpose |
-|-----------|-------------|-------------|----------------|---------|
-| **Block Size Test** | All sizes | Fixed (1) | Sequential | Find optimal `vm.page-cluster` |
-| **Concurrency Test** | Fixed (64KB) | All levels | Parallel sequential | Find optimal stripe width |
-| **Matrix Test** | All sizes | All levels | Parallel sequential | Find **best combination** |
+| Test Type | Block Sizes | Concurrency | Access Pattern | Purpose | Status |
+|-----------|-------------|-------------|----------------|---------|--------|
+| **Block Size Test** | All sizes | Fixed (1) | Sequential | Find optimal `vm.page-cluster` | **Redundant** - covered by matrix at concurrency=1 |
+| **Concurrency Test** | Fixed (64KB) | All levels | Parallel sequential | Find optimal stripe width | **Redundant** - covered by matrix at 64KB |
+| **Matrix Test** | All sizes | All levels | Parallel sequential | Find **best combination** | **Primary test** - comprehensive |
+
+**Individual tests are slices of the matrix:**
+- Block size test = matrix results where concurrency=1
+- Concurrency test = matrix results where block_size=64KB
+- **Recommendation:** Consider deprecating individual tests; matrix test is comprehensive
 
 **Why matrix test is critical:**
 - Individual tests don't reveal interaction effects
@@ -126,10 +131,18 @@ for block_size in block_sizes:
 - **Write pattern:** Random writes in blocks = `vm.page-cluster` size
   - Kernel writes pages as they're evicted (pseudo-random addresses)
   - Clustering controlled by `vm.page-cluster` (groups adjacent pages)
-- **Read pattern:** Semi-sequential reads (spatial locality)
-  - Applications often access related memory regions together
-  - Example: 5 sequential blocks, then jump to new offset, repeat
-  - More sequential than writes due to application memory access patterns
+- **Read pattern:** Logical vs Physical access
+  - **Logical (application view):** Semi-sequential - applications access related memory regions
+  - **Physical (disk view):** With striped swap files, logical sequential reads become physically random
+  - Fragmentation over time: Pages scattered across multiple swap files
+  - Example: Reading 5 sequential logical pages may hit 5 different physical swap files
+  - **Real-world implication:** Pure sequential test patterns overestimate performance
+
+**Why matrix test should use mixed patterns:**
+- Current tests use pure sequential I/O (write then read)
+- Real swap has mixed random/sequential patterns simultaneously
+- **Improvement needed:** Use fio's `readwrite=randrw` for more realistic testing
+- This would better represent: concurrent eviction (writes) + page faults (reads)
 
 **Bandwidth vs. Latency tradeoffs:**
 
@@ -360,6 +373,14 @@ results = {
   - Actual RAM write bandwidth is much higher (~5-10 GB/s typically)
 - The 21s includes: allocation time + filling with patterns + forcing pages into RAM
 - Pure memory bandwidth is not the bottleneck; pattern computation is
+
+**Optimization opportunity:**
+- **Current approach:** Fill entire 7GB with patterns (CPU-intensive)
+- **Alternative approach:** 
+  - Block 7GB with malloc() to prevent interference (fast)
+  - Only generate patterns for the ~300MB test area actually used for swap tests
+  - Could reduce pattern generation time from ~21s to ~1s
+  - **Trade-off:** More complex code vs faster test setup
 
 **Root causes of Python slowness:**
 1. Python's bytearray allocation is slow for large sizes (memory management overhead)

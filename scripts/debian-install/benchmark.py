@@ -1167,6 +1167,11 @@ def test_blocksize_concurrency_matrix(block_sizes=None, concurrency_levels=None,
     This tests all combinations of block sizes and concurrency levels to discover
     which configuration provides the best throughput for the specific hardware.
     
+    Current pattern: Sequential write, then sequential read (separate phases)
+    More realistic pattern (TODO): Use rw=randrw for mixed random read/write
+    - Would better simulate: concurrent eviction (writes) + page faults (reads)
+    - Trade-off: More complex to parse results, harder to compare write vs read
+    
     Args:
         block_sizes: List of block sizes in KB (default: [4, 8, 16, 32, 64])
         concurrency_levels: List of concurrency levels (default: [1, 2, 4])
