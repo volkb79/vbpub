@@ -186,7 +186,7 @@ ZRAM_STABILIZATION_DELAY_SEC = 2  # Time to wait after ZRAM cleanup for system s
 STRESS_NG_TIMEOUT_SEC = 15  # Timeout for stress-ng memory allocation
 STRESS_NG_WAIT_SEC = 20  # Maximum wait time for stress-ng process
 MEMORY_ACCESS_STEP_SIZE = 65536  # 64KB steps for memory access patterns
-COMPRESSION_TEST_TIMEOUT_SEC = 300  # Maximum time per compression test (5 minutes)
+COMPRESSION_TEST_TIMEOUT_SEC = 180  # Maximum time per compression test (3 minutes, optimized from 5 minutes)
 
 # FIO test configuration constants
 FIO_TEST_FILE_SIZE = '1G'  # Test file size for fio benchmarks
