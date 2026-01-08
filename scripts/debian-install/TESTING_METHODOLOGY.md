@@ -107,14 +107,15 @@ for block_size in block_sizes:
 
 | Test Type | Block Sizes | Concurrency | Access Pattern | Purpose | Status |
 |-----------|-------------|-------------|----------------|---------|--------|
-| **Block Size Test** | All sizes | Fixed (1) | Sequential | Find optimal `vm.page-cluster` | **Redundant** - covered by matrix at concurrency=1 |
-| **Concurrency Test** | Fixed (64KB) | All levels | Parallel sequential | Find optimal stripe width | **Redundant** - covered by matrix at 64KB |
-| **Matrix Test** | All sizes | All levels | Parallel sequential | Find **best combination** | **Primary test** - comprehensive |
+| **Block Size Test** | All sizes | Fixed (1) | Sequential | Find optimal `vm.page-cluster` | **DEPRECATED** - use matrix test instead |
+| **Concurrency Test** | Fixed (64KB) | All levels | Parallel sequential | Find optimal stripe width | **DEPRECATED** - use matrix test instead |
+| **Matrix Test** | All sizes | All levels | Mixed random read/write | Find **best combination** | **PRIMARY** - comprehensive and realistic |
 
-**Individual tests are slices of the matrix:**
+**Individual tests are now deprecated:**
 - Block size test = matrix results where concurrency=1
 - Concurrency test = matrix results where block_size=64KB
-- **Recommendation:** Consider deprecating individual tests; matrix test is comprehensive
+- **Use `--test-matrix` or `--test-all`** for comprehensive testing
+- Individual tests maintained only for backward compatibility
 
 **Why matrix test is critical:**
 - Individual tests don't reveal interaction effects
@@ -123,11 +124,11 @@ for block_size in block_sizes:
 - Matrix reveals the **inflection point** where performance plateaus
 
 **Access pattern in tests:**
-- **Block Size Test:** Pure sequential read/write (simplest case)
-- **Concurrency Test:** Multiple parallel sequential streams (more realistic)
-- **Matrix Test:** Multiple parallel sequential streams with varying block sizes
+- **Block Size Test (DEPRECATED):** Pure sequential read/write (simplest case)
+- **Concurrency Test (DEPRECATED):** Multiple parallel sequential streams (more realistic)
+- **Matrix Test:** Mixed random read/write (`rw=randrw`) - most realistic swap simulation
 
-**Real swap access pattern (not directly tested):**
+**Real swap access pattern (now implemented in matrix test):**
 - **Write pattern:** Random writes in blocks = `vm.page-cluster` size
   - Kernel writes pages as they're evicted (pseudo-random addresses)
   - Clustering controlled by `vm.page-cluster` (groups adjacent pages)
@@ -138,11 +139,11 @@ for block_size in block_sizes:
   - Example: Reading 5 sequential logical pages may hit 5 different physical swap files
   - **Real-world implication:** Pure sequential test patterns overestimate performance
 
-**Why matrix test should use mixed patterns:**
-- Current tests use pure sequential I/O (write then read)
-- Real swap has mixed random/sequential patterns simultaneously
-- **Improvement needed:** Use fio's `readwrite=randrw` for more realistic testing
-- This would better represent: concurrent eviction (writes) + page faults (reads)
+**Matrix test now uses mixed patterns:**
+- ✅ **IMPLEMENTED:** Matrix test uses `rw=randrw` for mixed random read/write
+- Simulates: concurrent eviction (writes) + page faults (reads)
+- Better represents real swap behavior with striped files and fragmentation
+- 50/50 read/write mix provides balanced workload simulation
 
 **Bandwidth vs. Latency tradeoffs:**
 

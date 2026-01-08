@@ -1167,10 +1167,10 @@ def test_blocksize_concurrency_matrix(block_sizes=None, concurrency_levels=None,
     This tests all combinations of block sizes and concurrency levels to discover
     which configuration provides the best throughput for the specific hardware.
     
-    Current pattern: Sequential write, then sequential read (separate phases)
-    More realistic pattern (TODO): Use rw=randrw for mixed random read/write
-    - Would better simulate: concurrent eviction (writes) + page faults (reads)
-    - Trade-off: More complex to parse results, harder to compare write vs read
+    Access pattern: Mixed random read/write (rw=randrw) - realistic swap simulation
+    - Simulates: concurrent eviction (writes) + page faults (reads)
+    - More realistic than sequential patterns used in older tests
+    - Better represents actual swap behavior with striped files and fragmentation
     
     Args:
         block_sizes: List of block sizes in KB (default: [4, 8, 16, 32, 64])
@@ -1214,6 +1214,7 @@ def test_blocksize_concurrency_matrix(block_sizes=None, concurrency_levels=None,
             log_info_ts(f"{progress_str} Testing {block_size}KB × {concurrency} jobs...")
             
             # Create fio job for this combination
+            # Use rw=randrw for mixed random read/write to simulate real swap behavior
             fio_job = f"""
 [global]
 ioengine=libaio
@@ -1225,14 +1226,10 @@ group_reporting
 runtime={runtime_sec}
 time_based
 
-[matrix_write]
-rw=write
+[matrix_randrw]
+rw=randrw
+rwmixread=50
 bs={block_size}k
-
-[matrix_read]
-rw=read
-bs={block_size}k
-stonewall
 """
             
             try:
@@ -1252,18 +1249,20 @@ stonewall
                     data = json.loads(result.stdout)
                     
                     # Validate data structure
-                    if 'jobs' not in data or len(data['jobs']) < 2:
+                    if 'jobs' not in data or len(data['jobs']) < 1:
                         raise ValueError("Incomplete fio results")
                     
-                    # Extract performance metrics
-                    write_bw = data['jobs'][0]['write']['bw'] / 1024  # MB/s
-                    read_bw = data['jobs'][1]['read']['bw'] / 1024  # MB/s
-                    write_iops = int(round(data['jobs'][0]['write']['iops'], 0))
-                    read_iops = int(round(data['jobs'][1]['read']['iops'], 0))
+                    # Extract performance metrics from randrw job
+                    # randrw produces both read and write data in a single job
+                    job = data['jobs'][0]
+                    write_bw = job['write']['bw'] / 1024  # MB/s
+                    read_bw = job['read']['bw'] / 1024  # MB/s
+                    write_iops = int(round(job['write']['iops'], 0))
+                    read_iops = int(round(job['read']['iops'], 0))
                     
                     # Extract latency metrics (in microseconds)
-                    write_lat_ns = data['jobs'][0]['write'].get('lat_ns', {})
-                    read_lat_ns = data['jobs'][1]['read'].get('lat_ns', {})
+                    write_lat_ns = job['write'].get('lat_ns', {})
+                    read_lat_ns = job['read'].get('lat_ns', {})
                     write_lat_us = write_lat_ns.get('mean', 0) / 1000 if write_lat_ns else 0  # Convert ns to us
                     read_lat_us = read_lat_ns.get('mean', 0) / 1000 if read_lat_ns else 0
                     
@@ -3738,7 +3737,7 @@ Examples:
     parser.add_argument('--test-all', action='store_true',
                        help='Run all benchmarks including latency tests')
     parser.add_argument('--block-size', type=int, metavar='KB',
-                       help='Test specific block size in KB')
+                       help='[DEPRECATED] Test specific block size in KB. Use --test-matrix instead for comprehensive testing')
     parser.add_argument('--test-compressors', action='store_true',
                        help='Test all compression algorithms')
     parser.add_argument('--test-allocators', action='store_true',
@@ -3746,7 +3745,7 @@ Examples:
     parser.add_argument('--compare-memory-only', action='store_true',
                        help='Compare ZRAM configurations')
     parser.add_argument('--test-concurrency', type=int, metavar='N',
-                       help='Test concurrency with N swap files')
+                       help='[DEPRECATED] Test concurrency with N swap files. Use --test-matrix instead for comprehensive testing')
     parser.add_argument('--test-matrix', action='store_true',
                        help='Test block size × concurrency matrix to find optimal configuration')
     parser.add_argument('--test-zswap', action='store_true',
@@ -3775,6 +3774,19 @@ Examples:
                        help='Convert charts to WebP format for smaller file size (requires Pillow)')
     
     args = parser.parse_args()
+    
+    # Deprecation warnings for individual tests
+    if args.block_size:
+        log_warn("⚠ WARNING: --block-size is DEPRECATED")
+        log_warn("   Individual block size tests are redundant with --test-matrix")
+        log_warn("   Use --test-matrix for comprehensive block size × concurrency testing")
+        log_warn("   See TESTING_METHODOLOGY.md for details")
+    
+    if args.test_concurrency:
+        log_warn("⚠ WARNING: --test-concurrency is DEPRECATED")
+        log_warn("   Individual concurrency tests are redundant with --test-matrix")
+        log_warn("   Use --test-matrix for comprehensive block size × concurrency testing")
+        log_warn("   See TESTING_METHODOLOGY.md for details")
     
     # Validate arguments
     if args.latency_size <= 0 or args.latency_size > 10240:
@@ -3837,10 +3849,12 @@ Examples:
     
     # Calculate total number of tests
     total_tests = 0
-    if args.test_all or args.block_size:
-        block_sizes = [4, 8, 16, 32, 64, 128] if args.test_all else [args.block_size]
-        # Each block size has sequential test, and --test-all adds random tests
-        total_tests += len(block_sizes) * (2 if args.test_all else 1)
+    
+    # Note: --test-all now uses matrix test instead of individual block size/concurrency tests
+    # Individual tests are deprecated as they are redundant with matrix test
+    if not args.test_all and args.block_size:
+        # Only run if explicitly requested with --block-size (deprecated path)
+        total_tests += 1  # single block size test
     
     if args.test_all or args.test_compressors:
         compressors = ['lz4', 'zstd', 'lzo-rle']
@@ -3850,9 +3864,9 @@ Examples:
         allocators = ['zsmalloc', 'z3fold', 'zbud']
         total_tests += len(allocators)
     
-    if args.test_all or args.test_concurrency:
-        file_counts = [1, 2, 4, 8] if args.test_all else [args.test_concurrency]
-        total_tests += len(file_counts)
+    if not args.test_all and args.test_concurrency:
+        # Only run if explicitly requested with --test-concurrency (deprecated path)
+        total_tests += 1  # single concurrency test
     
     if args.test_matrix or args.test_all:
         # Matrix test counts as one comprehensive test
@@ -3879,38 +3893,24 @@ Examples:
     current_test = 0
     
     # Run benchmarks
-    if args.test_all or args.block_size:
-        block_sizes = [4, 8, 16, 32, 64, 128] if args.test_all else [args.block_size]
+    # Note: Individual block size and concurrency tests are deprecated
+    # --test-all now uses matrix test which provides comprehensive coverage
+    if not args.test_all and args.block_size:
+        # Only run individual block size test if explicitly requested (deprecated)
+        log_warn("Running deprecated individual block size test")
         results['block_sizes'] = []
-        for size in block_sizes:
-            try:
-                # Test sequential
-                current_test += 1
-                seq_result = benchmark_block_size_fio(
-                    size, 
-                    runtime_sec=args.duration, 
-                    pattern='sequential',
-                    test_num=current_test,
-                    total_tests=total_tests
-                )
-                
-                # Test random (if --test-all)
-                if args.test_all:
-                    current_test += 1
-                    rand_result = benchmark_block_size_fio(
-                        size, 
-                        runtime_sec=args.duration, 
-                        pattern='random',
-                        test_num=current_test,
-                        total_tests=total_tests
-                    )
-                    # Merge results
-                    seq_result['rand_write_mb_per_sec'] = rand_result.get('write_mb_per_sec', 0)
-                    seq_result['rand_read_mb_per_sec'] = rand_result.get('read_mb_per_sec', 0)
-                
-                results['block_sizes'].append(seq_result)
-            except Exception as e:
-                log_error(f"Block size {size}KB failed: {e}")
+        try:
+            current_test += 1
+            seq_result = benchmark_block_size_fio(
+                args.block_size, 
+                runtime_sec=args.duration, 
+                pattern='sequential',
+                test_num=current_test,
+                total_tests=total_tests
+            )
+            results['block_sizes'].append(seq_result)
+        except Exception as e:
+            log_error(f"Block size {args.block_size}KB failed: {e}")
     
     if args.test_all or args.test_compressors:
         compressors = ['lz4', 'zstd', 'lzo-rle']
@@ -3959,27 +3959,26 @@ Examples:
             except Exception as e:
                 log_error(f"Allocator {alloc} failed: {e}")
     
-    if args.test_all or args.test_concurrency:
-        file_counts = [1, 2, 4, 8] if args.test_all else [args.test_concurrency]
+    if not args.test_all and args.test_concurrency:
+        # Only run individual concurrency test if explicitly requested (deprecated)
+        log_warn("Running deprecated individual concurrency test")
         results['concurrency'] = []
-        for count in file_counts:
-            try:
-                current_test += 1
-                result = test_concurrency(
-                    count,
-                    test_num=current_test,
-                    total_tests=total_tests
-                )
-                results['concurrency'].append(result)
-            except Exception as e:
-                log_error(f"Concurrency test with {count} files failed unexpectedly: {e}")
-                # Append error result so it shows in output
-                results['concurrency'].append({
-                    'num_files': count,
-                    'error': str(e),
-                    'write_mb_per_sec': 0,
-                    'read_mb_per_sec': 0
-                })
+        try:
+            current_test += 1
+            result = test_concurrency(
+                args.test_concurrency,
+                test_num=current_test,
+                total_tests=total_tests
+            )
+            results['concurrency'].append(result)
+        except Exception as e:
+            log_error(f"Concurrency test with {args.test_concurrency} files failed unexpectedly: {e}")
+            results['concurrency'].append({
+                'num_files': args.test_concurrency,
+                'error': str(e),
+                'write_mb_per_sec': 0,
+                'read_mb_per_sec': 0
+            })
     
     # Matrix testing (block size × concurrency)
     if args.test_matrix or args.test_all:
