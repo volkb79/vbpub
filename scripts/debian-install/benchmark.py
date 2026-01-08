@@ -1266,9 +1266,9 @@ bs={block_size}k
                 if result.returncode == 0:
                     data = json.loads(result.stdout)
                     
-                    # Validate data structure
-                    if 'jobs' not in data or not data['jobs']:
-                        raise ValueError("Incomplete fio results")
+                    # Validate data structure - randrw produces exactly one job with both metrics
+                    if 'jobs' not in data or len(data['jobs']) != 1:
+                        raise ValueError("Expected exactly one fio job for randrw test")
                     
                     # Extract performance metrics from randrw job
                     # randrw produces both read and write data in a single job
@@ -3915,7 +3915,7 @@ Examples:
     # --test-all now uses matrix test which provides comprehensive coverage
     if not args.test_all and args.block_size:
         # Only run individual block size test if explicitly requested (deprecated)
-        log_warn("Running deprecated individual block size test")
+        log_warn("Running deprecated individual block size test - use --test-matrix instead for comprehensive testing")
         results['block_sizes'] = []
         try:
             current_test += 1
@@ -3979,7 +3979,7 @@ Examples:
     
     if not args.test_all and args.test_concurrency:
         # Only run individual concurrency test if explicitly requested (deprecated)
-        log_warn("Running deprecated individual concurrency test")
+        log_warn("Running deprecated individual concurrency test - use --test-matrix instead for comprehensive testing")
         results['concurrency'] = []
         try:
             current_test += 1
