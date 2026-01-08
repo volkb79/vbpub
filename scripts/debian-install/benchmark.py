@@ -16,40 +16,53 @@ This tool provides both synthetic and semi-realistic performance testing for:
 
 TEST TYPES
 ----------
-1. **Block Size Tests** (SYNTHETIC)
+1. **Block Size × Concurrency Matrix Test** (REALISTIC - PRIMARY TEST)
+   - Tests all combinations of block sizes (4KB-128KB) and concurrency levels (1-8)
+   - Uses mixed random read/write (rw=randrw) for realistic swap simulation
+   - Identifies optimal configuration for both throughput and latency
+   - Replaces individual block size and concurrency tests
+   
+2. **Block Size Tests** [DEPRECATED - use matrix test]
    - Tests I/O performance with different block sizes (4KB-128KB)
    - Matches vm.page-cluster settings (0=4KB, 1=8KB, 2=16KB, 3=32KB, 4=64KB, 5=128KB)
    - Uses fio for accurate I/O measurement
    - Measures sequential read/write throughput and latency
    
-2. **Compression Tests** (SEMI-REALISTIC)
+3. **Compression Tests** (SEMI-REALISTIC)
    - Tests different compression algorithms with memory workloads
    - Creates actual memory pressure to trigger swapping
    - Measures compression ratio and performance
    - Tests with random, zero-filled, and pattern data
    
-3. **Allocator Tests** (REALISTIC)
+4. **Allocator Tests** (REALISTIC)
    - Tests zsmalloc (~90% efficiency), z3fold (~75%), zbud (~50%)
    - Measures actual memory usage vs theoretical
    - Identifies fragmentation characteristics
    
-4. **Concurrency Tests** (REALISTIC)
+5. **Concurrency Tests** [DEPRECATED - use matrix test]
    - Tests multiple swap files with parallel I/O
    - Measures throughput scaling with 1-8 files
    - Identifies optimal number of concurrent swap devices
    
-5. **Memory-Only Comparison** (REALISTIC)
+6. **Memory-Only Comparison** (REALISTIC)
    - Compares ZRAM vs ZSWAP without disk backing
    - Measures latency differences
    - Tests with real application-like workloads
 
 INTERPRETATION GUIDE
 -------------------
-**Block Size Results:**
+**Matrix Test Results (RECOMMENDED):**
+- Comprehensive view of block size × concurrency interactions
+- Use concurrency=1 results to find optimal vm.page-cluster
+- Use higher concurrency results to optimize for throughput
+- Mixed random I/O pattern represents real swap behavior
+
+**Block Size Results [DEPRECATED]:**
 - Higher throughput is better
 - Lower latency is better  
 - Match block size to storage type (SSD: 32-64KB, HDD: 64-128KB)
 - vm.page-cluster should match optimal block size
+- NOTE: Use matrix test instead for comprehensive analysis
 
 **Compression Results:**
 - Higher compression ratio = more effective memory extension
@@ -63,10 +76,11 @@ INTERPRETATION GUIDE
 - z3fold: Balanced, good for general use
 - zbud: Lowest CPU, but 50% overhead, use when CPU is bottleneck
 
-**Concurrency Results:**
+**Concurrency Results [DEPRECATED]:**
 - Throughput should scale linearly up to number of CPU cores
 - Optimal file count typically matches or exceeds core count
 - Default 8 files is good for most systems
+- NOTE: Use matrix test instead for comprehensive analysis
 
 USE CASES COVERED
 ----------------
@@ -87,18 +101,19 @@ USE CASES NOT COVERED
 
 SYNTHETIC VS REALISTIC
 ---------------------
-**Synthetic Tests:**
-- Block size I/O: Pure sequential I/O, not representative of random access patterns
-- Simple to interpret, identifies hardware limits
+**Realistic Tests (RECOMMENDED):**
+- Matrix Test: Mixed random I/O representing real swap patterns
+- Allocator: Actual ZRAM operation under memory pressure
+- Memory-only: Actual swap cache behavior
 
 **Semi-Realistic Tests:**
 - Compression: Uses memory pressure but with controlled data patterns
 - Good for comparing algorithms
 
-**Realistic Tests:**
-- Allocator: Actual ZRAM operation under memory pressure
-- Concurrency: Real parallel swap I/O
-- Memory-only: Actual swap cache behavior
+**Deprecated Tests:**
+- Block size I/O: Pure sequential I/O, not representative of random access patterns
+- Concurrency: Sequential patterns don't match real swap behavior
+- Use matrix test instead for realistic testing
 
 DEPENDENCIES
 -----------
@@ -109,11 +124,11 @@ DEPENDENCIES
 
 EXAMPLES
 --------
-# Test all configurations
+# Test all configurations (recommended - includes matrix test)
 sudo ./benchmark.py --test-all
 
-# Test specific block size
-sudo ./benchmark.py --block-size 64
+# Test comprehensive block size × concurrency matrix (best single test)
+sudo ./benchmark.py --test-matrix
 
 # Test compressors only
 sudo ./benchmark.py --test-compressors
@@ -121,7 +136,10 @@ sudo ./benchmark.py --test-compressors
 # Test all allocators  
 sudo ./benchmark.py --test-allocators
 
-# Test concurrency scaling
+# [DEPRECATED] Test specific block size - use --test-matrix instead
+sudo ./benchmark.py --block-size 64
+
+# [DEPRECATED] Test concurrency scaling - use --test-matrix instead
 sudo ./benchmark.py --test-concurrency 8
 
 # Compare ZRAM vs ZSWAP
@@ -3723,13 +3741,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --test-all
-  %(prog)s --block-size 64
-  %(prog)s --test-compressors
-  %(prog)s --test-allocators
-  %(prog)s --test-concurrency 8
-  %(prog)s --test-latency --latency-size 100
-  %(prog)s --compare-memory-only
+  %(prog)s --test-all                         # Recommended: run all benchmarks including matrix test
+  %(prog)s --test-matrix                      # Run comprehensive block size × concurrency matrix
+  %(prog)s --test-compressors                 # Test compression algorithms
+  %(prog)s --test-allocators                  # Test memory allocators
+  %(prog)s --test-latency --latency-size 100  # Run latency tests
+  %(prog)s --block-size 64                    # [DEPRECATED] Use --test-matrix instead
+  %(prog)s --test-concurrency 8               # [DEPRECATED] Use --test-matrix instead
   %(prog)s --output results.json --shell-config swap.conf
         """
     )

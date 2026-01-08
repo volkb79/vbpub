@@ -853,11 +853,11 @@ cat /sys/module/zram/parameters/*
 ### Benchmark Your Configuration
 
 ```bash
-# Test all configurations (block sizes, compressors, allocators, concurrency, latency)
+# Recommended: Test all configurations (includes matrix test)
 sudo ./benchmark.py --test-all
 
-# Test specific block size (matching vm.page-cluster)
-sudo ./benchmark.py --block-size 64
+# Test comprehensive block size × concurrency matrix (most useful test)
+sudo ./benchmark.py --test-matrix
 
 # Test compression algorithms
 sudo ./benchmark.py --test-compressors
@@ -865,12 +865,15 @@ sudo ./benchmark.py --test-compressors
 # Test memory allocators
 sudo ./benchmark.py --test-allocators
 
-# Test concurrency scaling
-sudo ./benchmark.py --test-concurrency 8
-
 # **NEW: Test memory access latency**
 # Comprehensive latency comparison (read/write, all compressors/allocators)
 sudo ./benchmark.py --test-latency --latency-size 100
+
+# [DEPRECATED] Test specific block size - use --test-matrix instead
+sudo ./benchmark.py --block-size 64
+
+# [DEPRECATED] Test concurrency scaling - use --test-matrix instead
+sudo ./benchmark.py --test-concurrency 8
 
 # Compare ZRAM vs ZSWAP memory-only performance
 sudo ./benchmark.py --compare-memory-only
