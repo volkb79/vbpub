@@ -1267,7 +1267,7 @@ bs={block_size}k
                     data = json.loads(result.stdout)
                     
                     # Validate data structure
-                    if 'jobs' not in data or len(data['jobs']) < 1:
+                    if 'jobs' not in data or not data['jobs']:
                         raise ValueError("Incomplete fio results")
                     
                     # Extract performance metrics from randrw job
