@@ -169,13 +169,13 @@ install_essential_packages() {
     export DEBIAN_FRONTEND=noninteractive
     
     # Core utilities
-    local core_packages="ca-certificates gnupg lsb-release curl wget git vim less jq bash-completion"
+    local core_packages="ca-certificates gnupg lsb-release curl wget git vim less jq bash-completion man-db"
     
     # Network tools
     local network_packages="netcat-traditional iputils-ping dnsutils iproute2"
     
     # Additional useful tools
-    local additional_packages="ripgrep fd-find tree fzf tldr httpie"
+    local additional_packages="ripgrep fd-find tree fzf httpie"
     
     # Benchmark/system tools
     local system_packages="fio sysstat python3-matplotlib"
@@ -196,6 +196,26 @@ install_essential_packages() {
         else
             log_warn "Failed to install yq"
         fi
+    fi
+    
+    # Install tldr with proper setup
+    if ! command -v tldr >/dev/null 2>&1; then
+        log_info "Installing tldr (Python-based) system-wide..."
+        if pip3 install --system tldr 2>/dev/null || pip3 install tldr; then
+            # Update tldr cache for immediate use
+            log_info "Updating tldr cache..."
+            if tldr --update 2>/dev/null; then
+                log_info "✓ tldr installed and cache updated"
+            else
+                log_warn "tldr installed but cache update failed (run 'tldr --update' manually)"
+            fi
+        else
+            log_warn "Failed to install tldr"
+        fi
+    else
+        # Update cache if tldr already exists
+        log_info "Updating tldr cache..."
+        tldr --update 2>/dev/null || log_warn "Failed to update tldr cache"
     fi
     
     log_info "✓ Essential packages installed"

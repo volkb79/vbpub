@@ -233,6 +233,29 @@ class TelegramClient:
                     }
                     
                     response = requests.post(url, data=data, files=files, timeout=60)
+                    
+                    # Debug response
+                    if response.status_code != 200:
+                        error_data = response.json() if response.headers.get('content-type', '').startswith('application/json') else {}
+                        print(f"Telegram API error (status {response.status_code}): {error_data}")
+                        
+                        # Common error cases for media groups
+                        if response.status_code == 400:
+                            error_desc = error_data.get('description', '')
+                            if 'group send failed' in error_desc.lower():
+                                print("Hint: Media group might be too large or contain too many items")
+                                print(f"     Attempted to send {len(valid_files)} files")
+                            elif 'wrong file identifier' in error_desc.lower():
+                                print("Hint: File format might not be supported in media groups")
+                            elif 'too many requests' in error_desc.lower() or response.status_code == 429:
+                                print("Hint: Rate limited by Telegram. Reduce sending frequency")
+                                # Extract retry_after if available
+                                retry_after = error_data.get('parameters', {}).get('retry_after', 60)
+                                print(f"     Retry after {retry_after} seconds")
+                                if attempt < max_retries - 1:
+                                    time.sleep(retry_after)
+                                    continue
+                    
                     response.raise_for_status()
                     return True
                     
@@ -241,6 +264,25 @@ class TelegramClient:
                     for f in files.values():
                         f.close()
                         
+            except requests.exceptions.HTTPError as e:
+                last_error = f"HTTP error: {e}"
+                # Try to get more detailed error info
+                try:
+                    error_data = e.response.json() if e.response else {}
+                    error_desc = error_data.get('description', 'No description')
+                    last_error = f"HTTP {e.response.status_code}: {error_desc}"
+                except:
+                    pass
+                print(f"HTTP error sending media group: {last_error}")
+                # Don't retry HTTP 4xx errors (client errors)
+                if e.response and 400 <= e.response.status_code < 500:
+                    return False
+                # Retry 5xx errors (server errors)
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    print(f"Server error, retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
             except requests.exceptions.ConnectionError as e:
                 last_error = f"Connection error: {e}"
                 if attempt < max_retries - 1:
