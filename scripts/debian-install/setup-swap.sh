@@ -925,11 +925,13 @@ setup_zswap() {
     
     # Add kernel parameters for boot
     # NOTE: Only set zswap.enabled=1 via GRUB - do NOT set compressor here!
-    # REASON: zstd (and other non-lz4 compressors) are kernel modules that may not be
-    # available at early boot. The kernel loads before initramfs completes module loading,
-    # so setting zswap.compressor=zstd via GRUB silently fails - the kernel falls back to
-    # lz4 or disables ZSWAP entirely. We use a systemd service instead for reliable
-    # compressor configuration. See KNOWN_ISSUES.md for details.
+    # REASON: Non-built-in compressors (zstd, lzo-rle) are kernel modules that may not be
+    # available at early boot. The kernel loads ZSWAP before initramfs completes module loading:
+    # - lz4: Built into kernel, always works via GRUB
+    # - lzo-rle: Module, may fail via GRUB (depends on kernel config)
+    # - zstd: Module, does NOT work via GRUB (silent failure, falls back to lz4)
+    # We use a systemd service instead for reliable compressor configuration.
+    # See KNOWN_ISSUES.md for detailed explanation.
     if ! grep -q "zswap.enabled" /etc/default/grub; then
         log_info "Adding ZSWAP enabled flag to GRUB config"
         log_info "Note: Compressor configured via systemd service (not GRUB) for reliability"
