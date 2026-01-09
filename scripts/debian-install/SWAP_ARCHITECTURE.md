@@ -636,6 +636,39 @@ echo z3fold > /sys/module/zswap/parameters/zpool
 echo 1 > /sys/module/zswap/parameters/accept_threshold_percent
 ```
 
+### ⚠️ IMPORTANT: Compressor Configuration via GRUB Does NOT Work for zstd
+
+**Critical limitation:** Setting `zswap.compressor=zstd` via GRUB kernel command line parameters **does NOT work reliably**. This is because zstd is a kernel module that may not be loaded at the time ZSWAP initializes during early boot.
+
+| Compressor | GRUB Boot Config | Systemd Config |
+|------------|------------------|----------------|
+| lz4 | ✅ Works | ✅ Works |
+| lzo-rle | ⚠️ May fail | ✅ Works |
+| zstd | ❌ Does NOT work | ✅ Works |
+
+**Solution:** Use a systemd service to configure the compressor after boot:
+
+```bash
+# /etc/systemd/system/zswap-config.service
+[Unit]
+Description=Configure ZSWAP Parameters
+After=local-fs.target
+Before=swap.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'echo 1 > /sys/module/zswap/parameters/enabled && \
+    echo zstd > /sys/module/zswap/parameters/compressor && \
+    echo z3fold > /sys/module/zswap/parameters/zpool && \
+    echo 20 > /sys/module/zswap/parameters/max_pool_percent'
+
+[Install]
+WantedBy=multi-user.target
+```
+
+See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for detailed explanation.
+
 ### Compression Algorithms
 
 | Algorithm | Speed | Ratio | CPU | Use Case |

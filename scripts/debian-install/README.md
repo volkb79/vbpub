@@ -277,7 +277,7 @@ DEBUG_MODE=yes SWAP_TOTAL_GB=16 ./bootstrap.sh
 | `ZRAM_SIZE_GB` | `auto` | ZRAM size (typically 50% of RAM) |
 | `ZRAM_PRIORITY` | `100` | ZRAM priority (higher than disk) |
 | `ZSWAP_POOL_PERCENT` | `20` | ZSWAP pool size as % of RAM |
-| `ZSWAP_COMPRESSOR` | `lz4` | Compression algorithm (lz4, zstd, lzo-rle) |
+| `ZSWAP_COMPRESSOR` | `lz4` | Compression algorithm (lz4, zstd, lzo-rle) - see note below |
 | `ZRAM_COMPRESSOR` | `lz4` | ZRAM compression algorithm |
 | `ZRAM_ALLOCATOR` | `zsmalloc` | ZRAM allocator (zsmalloc, z3fold, zbud) |
 | `ZFS_POOL` | `tank` | ZFS pool name for zvol (arch 5 & 6) |
@@ -290,6 +290,8 @@ DEBUG_MODE=yes SWAP_TOTAL_GB=16 ./bootstrap.sh
 | `RUN_BENCHMARKS` | `yes` | Run swap benchmarks during bootstrap (yes/no) |
 | `TELEGRAM_BOT_TOKEN` | - | Telegram bot token for notifications |
 | `TELEGRAM_CHAT_ID` | - | Telegram chat ID for notifications |
+
+⚠️ **Note on ZSWAP_COMPRESSOR:** Non-lz4 compressors (zstd, lzo-rle) are configured via a systemd service, not GRUB kernel parameters. This is because these compressors are kernel modules that may not be available at early boot time. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for details.
 
 ### Swap File Sizing Formula
 
@@ -1042,6 +1044,7 @@ See [SWAP_ARCHITECTURE.md](SWAP_ARCHITECTURE.md) for comprehensive technical doc
 |------|---------|
 | `README.md` | This user guide |
 | `SWAP_ARCHITECTURE.md` | Technical deep-dive documentation |
+| `KNOWN_ISSUES.md` | Known issues and limitations (zstd/initrd, etc.) |
 | `bootstrap.sh` | Minimal bootstrap script (<10KB) |
 | `setup-swap.sh` | Main swap installation and configuration |
 | `configure-users.sh` | User environment setup (nano, mc, htop, iftop, bash aliases) |
