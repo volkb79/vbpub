@@ -126,6 +126,8 @@ tg_send() {
     local msg="$1"
     [ -z "$TELEGRAM_BOT_TOKEN" ] && return 0
     [ -z "$TELEGRAM_CHAT_ID" ] && return 0
+    # Only try to send if the script exists (repo must be cloned first)
+    [ ! -f "${SCRIPT_DIR}/telegram_client.py" ] && return 0
     python3 "${SCRIPT_DIR}/telegram_client.py" --send "$msg" 2>/dev/null || true
 }
 
@@ -135,6 +137,8 @@ tg_send_file() {
     local caption="${2:-}"
     [ -z "$TELEGRAM_BOT_TOKEN" ] && return 0
     [ -z "$TELEGRAM_CHAT_ID" ] && return 0
+    # Only try to send if the script exists (repo must be cloned first)
+    [ ! -f "${SCRIPT_DIR}/telegram_client.py" ] && return 0
     if [ -n "$caption" ]; then
         python3 "${SCRIPT_DIR}/telegram_client.py" --file "$file" --caption "$caption" 2>/dev/null || true
     else
@@ -168,8 +172,8 @@ install_essential_packages() {
     
     export DEBIAN_FRONTEND=noninteractive
     
-    # Core utilities
-    local core_packages="ca-certificates gnupg lsb-release curl wget git vim less jq bash-completion man-db"
+    # Core utilities (including python3 which is needed for telegram and benchmarks)
+    local core_packages="ca-certificates gnupg lsb-release curl wget git vim less jq bash-completion man-db python3 python3-pip python3-requests"
     
     # Network tools
     local network_packages="netcat-traditional iputils-ping dnsutils iproute2"
@@ -330,7 +334,7 @@ main() {
     export SWAP_RAM_SOLUTION SWAP_RAM_TOTAL_GB
     export ZRAM_COMPRESSOR ZRAM_ALLOCATOR ZRAM_PRIORITY
     export ZSWAP_COMPRESSOR ZSWAP_ZPOOL
-    export SWAP_DISK_TOTAL_GB SWAP_BACKING_TYPE SWAP_BACKING_TYPE_EXPLICIT SWAP_STRIPE_WIDTH
+    export SWAP_DISK_TOTAL_GB SWAP_BACKING_TYPE SWAP_STRIPE_WIDTH
     export SWAP_PRIORITY EXTEND_ROOT
     export ZFS_POOL
     export TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID LOG_FILE
@@ -425,14 +429,18 @@ main() {
             GEEKBENCH_ARGS="--geekbench --notify"
         fi
         
-        if ./sysinfo-notify.py $GEEKBENCH_ARGS 2>&1 | tee -a "$LOG_FILE"; then
-            GEEKBENCH_END=$(date +%s)
-            GEEKBENCH_DURATION=$((GEEKBENCH_END - GEEKBENCH_START))
+        # Run geekbench and capture exit code properly
+        set +e  # Temporarily disable exit on error
+        ./sysinfo-notify.py $GEEKBENCH_ARGS 2>&1 | tee -a "$LOG_FILE"
+        GEEKBENCH_EXIT_CODE=${PIPESTATUS[0]}
+        set -e  # Re-enable exit on error
+        
+        GEEKBENCH_END=$(date +%s)
+        GEEKBENCH_DURATION=$((GEEKBENCH_END - GEEKBENCH_START))
+        
+        if [ "$GEEKBENCH_EXIT_CODE" -eq 0 ]; then
             log_info "✓ Geekbench complete (took ${GEEKBENCH_DURATION}s)"
         else
-            GEEKBENCH_EXIT_CODE=$?
-            GEEKBENCH_END=$(date +%s)
-            GEEKBENCH_DURATION=$((GEEKBENCH_END - GEEKBENCH_START))
             log_error "✗ Geekbench failed (exit code: $GEEKBENCH_EXIT_CODE, took ${GEEKBENCH_DURATION}s)"
             log_error "Check logs for details: $LOG_FILE"
             
