@@ -5,6 +5,16 @@ Swap Performance Benchmark Script
 
 Comprehensive benchmark tool for testing swap configurations on Debian 12/13 systems.
 
+IMPORTANT RECOMMENDATION
+------------------------
+**Always use ZSWAP over ZRAM** - Based on extensive testing documented in chat-merged.md:
+- ZSWAP provides automatic LRU-based hot/cold page separation
+- Cold pages are evicted to disk, keeping RAM for active data
+- ZRAM pages "stick" forever, wasting RAM with cold data
+- ZSWAP shrinker (kernel 6.8+) prevents OOM conditions
+
+There is no use case where ZRAM is better than ZSWAP for general-purpose systems.
+
 OVERVIEW
 --------
 This tool provides both synthetic and semi-realistic performance testing for:
@@ -21,6 +31,7 @@ TEST TYPES
    - Uses mixed random read/write (rw=randrw) for realistic swap simulation
    - Identifies optimal configuration for both throughput and latency
    - Replaces individual block size and concurrency tests
+   - Critical finding: numjobs parameter is essential for parallel device testing
    
 2. **Block Size Tests** [DEPRECATED - use matrix test]
    - Tests I/O performance with different block sizes (4KB-128KB)
@@ -33,6 +44,7 @@ TEST TYPES
    - Creates actual memory pressure to trigger swapping
    - Measures compression ratio and performance
    - Tests with random, zero-filled, and pattern data
+   - Recommendation: lz4 for most cases (fast), zstd for low RAM (better compression)
    
 4. **Allocator Tests** (REALISTIC)
    - Tests zsmalloc (~90% efficiency), z3fold (~75%), zbud (~50%)
@@ -48,6 +60,7 @@ TEST TYPES
    - Compares ZRAM vs ZSWAP without disk backing
    - Measures latency differences
    - Tests with real application-like workloads
+   - Note: ZSWAP is always recommended over ZRAM
 
 INTERPRETATION GUIDE
 -------------------

@@ -4,16 +4,31 @@
 
 This document explains the comprehensive testing approach used in `benchmark.py` to evaluate and optimize swap configurations for Debian systems. The benchmark suite provides actionable data for making system-specific swap configuration decisions.
 
+**Key Recommendation: Always Use ZSWAP**
+
+Based on extensive testing and analysis documented in `chat-merged.md`, **ZSWAP is always superior to ZRAM** for general-purpose systems:
+
+| Feature | ZRAM | ZSWAP |
+|---------|------|-------|
+| Cold page eviction | ❌ No automatic eviction | ✅ LRU-based eviction |
+| Hot/cold separation | ❌ Pages stick forever | ✅ Automatic rebalancing |
+| Memory efficiency | ❌ Cold pages waste RAM | ✅ Cold pages go to disk |
+| Disk backing | ❌ Requires priority management | ✅ Transparent writeback |
+| Shrinker support | ❌ N/A | ✅ Dynamic sizing (kernel 6.8+) |
+
+**There is no use case where ZRAM is better than ZSWAP for general-purpose systems.**
+
 ---
 
 ## Table of Contents
 
 1. [Testing Philosophy](#testing-philosophy)
-2. [Test Types and What They Measure](#test-types-and-what-they-measure)
-3. [Performance Counters and Metrics](#performance-counters-and-metrics)
-4. [Memory Management Strategy](#memory-management-strategy)
-5. [System-Specific Decision Making](#system-specific-decision-making)
-6. [Data Output and Interpretation](#data-output-and-interpretation)
+2. [Why ZSWAP Over ZRAM](#why-zswap-over-zram)
+3. [Test Types and What They Measure](#test-types-and-what-they-measure)
+4. [Performance Counters and Metrics](#performance-counters-and-metrics)
+5. [Memory Management Strategy](#memory-management-strategy)
+6. [System-Specific Decision Making](#system-specific-decision-making)
+7. [Data Output and Interpretation](#data-output-and-interpretation)
 
 ---
 
@@ -47,6 +62,69 @@ We use a **three-tier testing approach**:
    - Real ZRAM operation under memory pressure
    - Actual parallel swap I/O
    - Represents production workloads
+
+---
+
+## Why ZSWAP Over ZRAM
+
+### The Fundamental Problem with ZRAM
+
+ZRAM is a block device that compresses pages in RAM. When combined with disk swap at lower priority, it creates a tiered system:
+
+```
+Application Memory
+       ↓
+   [ZRAM] (priority 100) - Compressed in RAM
+       ↓ (when full)
+   [Disk Swap] (priority 10) - Uncompressed on disk
+```
+
+**Critical Problem**: Pages "stick" in ZRAM forever:
+- No automatic migration of cold pages to disk
+- Cold (inactive) pages waste valuable RAM
+- Hot (active) pages may end up on slow disk
+- No LRU-based rebalancing
+
+ZRAM only frees space when:
+- ✓ Process exits/terminates
+- ✓ Page is swapped in AND modified
+- ✗ **Never**: automatic cold page eviction
+- ✗ **Never**: migration to disk tier
+
+### How ZSWAP Solves This
+
+ZSWAP is a compressed write-through cache for swap pages:
+
+```
+Application Memory
+       ↓
+   [ZSWAP Cache] (in RAM) - LRU-managed compressed cache
+       ↓ (automatic writeback)
+   [Disk Swap] - Backing store, cold pages evicted from cache
+```
+
+**ZSWAP Page Lifecycle:**
+
+1. **Swap out**: Compress to ZSWAP cache (RAM) + Write uncompressed to disk
+2. **Cache fills**: Shrinker identifies cold pages (LRU) and evicts them
+3. **Swap in (hot)**: Read from ZSWAP cache (~10-20µs)
+4. **Swap in (cold)**: Read from disk (~500µs-10ms)
+
+### Performance Implications
+
+| Scenario | ZRAM Behavior | ZSWAP Behavior |
+|----------|---------------|----------------|
+| After hours of use | Cold data wastes RAM | Cold data on disk, hot data cached |
+| Memory pressure | New data goes to slow disk | Hot data replaces cold in cache |
+| Active/idle mix | No differentiation | Automatic hot/cold separation |
+| OOM risk | ZRAM fills, no reclaim | Shrinker reclaims cache |
+
+### Recommendation
+
+**Always use ZSWAP** regardless of RAM size:
+- **Small RAM (1-4GB)**: ZSWAP maximizes effective memory with compression
+- **Medium RAM (4-16GB)**: ZSWAP provides best balance of speed and capacity
+- **Large RAM (16GB+)**: ZSWAP still optimal, larger cache for hot data
 
 ---
 

@@ -59,54 +59,62 @@ sudo ./configure-users.sh
 
 ## Architecture Options Overview
 
-The toolkit supports 7 different swap architectures. **Default: 8 swap files** for optimal concurrency.
+The toolkit supports 7 different swap architectures. **Default: ZSWAP + 8 swap files** for optimal performance.
 
-### 1. ZRAM Only (Memory-Only Compression)
+**Important: ZSWAP is Always Recommended Over ZRAM**
 
-**Best for:** Systems that need fast compressed swap without disk I/O, or when disk space is limited.
+Based on extensive testing (see `chat-merged.md`), **ZSWAP is superior to ZRAM** for all use cases:
+- ZSWAP provides automatic LRU-based hot/cold page separation
+- Cold pages are evicted to disk, keeping RAM for active data
+- ZRAM pages "stick" forever, wasting RAM with cold data
+- ZSWAP shrinker (kernel 6.8+) prevents OOM conditions
+
+### 1. ZRAM Only (Memory-Only Compression) - NOT RECOMMENDED
+
+**⚠️ Note:** ZSWAP (Architecture 3) is preferred. ZRAM is kept for backward compatibility.
+
+**Issues with ZRAM:**
+- Cold pages never evict automatically - they waste RAM forever
+- No hot/cold separation - active data may go to slow disk
+- Requires priority management between ZRAM and disk swap
 
 ```bash
+# Not recommended - use SWAP_ARCH=3 instead
 sudo SWAP_ARCH=1 SWAP_TOTAL_GB=4 ./setup-swap.sh
 ```
 
-- ✅ Fastest performance (no disk I/O)
-- ✅ Extends RAM capacity 2-3x with compression
-- ✅ No disk space required
-- ⚠️ Limited by available RAM - data lost if full
-- ⚠️ No persistence across reboots
+### 2. ZRAM + Swap Files (Two-Tier) - NOT RECOMMENDED
 
-**Use case:** Small VPS with limited disk, workloads that fit in compressed memory.
-
-### 2. ZRAM + Swap Files (Two-Tier)
-
-**Best for:** Fast tier for hot data + disk overflow for cold data.
+**⚠️ Note:** ZSWAP (Architecture 3) is preferred. ZRAM+disk has the same issues as ZRAM-only.
 
 ```bash
+# Not recommended - use SWAP_ARCH=3 instead
 sudo SWAP_ARCH=2 SWAP_TOTAL_GB=8 SWAP_FILES=8 ./setup-swap.sh
 ```
 
-- ✅ Fast compressed RAM tier (priority 100)
-- ✅ Disk tier for overflow (priority 10)
-- ✅ Good performance with disk safety net
-- ⚠️ ZRAM overflow requires decompress→recompress cycle
+### 3. ZSWAP + Swap Files (ALWAYS RECOMMENDED)
 
-**Use case:** Systems needing both speed and capacity with tiered priorities.
-
-### 3. ZSWAP + Swap Files (Recommended)
-
-**Best for:** Production systems with moderate to high memory pressure. **DEFAULT RECOMMENDED.**
+**Best for:** ALL systems. This is the recommended configuration for production use.
 
 ```bash
 sudo SWAP_ARCH=3 SWAP_TOTAL_GB=16 SWAP_FILES=8 ./setup-swap.sh
 ```
 
 - ✅ Single compression stage (efficient)
-- ✅ Automatic writeback to disk when pool full
+- ✅ Automatic LRU-based hot/cold separation
+- ✅ Cold pages evicted to disk automatically
 - ✅ Better for working sets larger than RAM
 - ✅ Transparent to applications
-- ⚠️ Requires kernel 3.11+ (Debian 12/13 ✓)
+- ✅ Shrinker support (kernel 6.8+) prevents OOM
+- ✅ Works for all RAM sizes (1GB to 128GB+)
 
-**Use case:** General purpose servers, databases, web applications with memory pressure.
+**Why ZSWAP for low RAM too:**
+- Cold pages automatically evicted saves RAM for active data
+- ZRAM keeps cold pages in RAM indefinitely
+- ZSWAP compression provides same memory savings as ZRAM
+- Disk backing provides safety net for memory spikes
+
+**Use case:** All general-purpose systems, servers, databases, web applications.
 
 ### 4. Swap Files Only
 
