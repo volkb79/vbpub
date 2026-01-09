@@ -607,6 +607,12 @@ curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-i
 | zstd | Fast | ~2.5:1 | Low | Better compression |
 | lzo-rle | Medium | ~2:1 | Medium | Legacy compatibility |
 
+### ⚠️ IMPORTANT: zstd Configuration
+
+**Note:** The zstd compressor is configured via a systemd service, NOT via GRUB kernel parameters. This is because zstd is a kernel module that is not available during early boot. Attempting to set `zswap.compressor=zstd` in GRUB will silently fail, falling back to lz4.
+
+See `scripts/debian-install/KNOWN_ISSUES.md` for details.
+
 ## Monitoring
 
 Monitor swap usage:
