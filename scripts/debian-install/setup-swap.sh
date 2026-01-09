@@ -265,16 +265,21 @@ auto_detect_swap_configuration() {
     # - ZSWAP evicts cold pages to disk, keeping RAM for hot data
     # - ZRAM pages "stick" forever, wasting RAM with cold data
     # - ZSWAP shrinker (kernel 6.8+) prevents OOM conditions
+    #
+    # Users can still override by explicitly setting SWAP_RAM_SOLUTION=zram
+    # The pool size recommendations below are informational only.
+    # Actual pool size is configured via ZSWAP_POOL_PERCENT (default: 20%)
+    # which can be set via environment variable or adjusted based on RAM in setup_zswap()
     if [ -z "$SWAP_RAM_SOLUTION" ] || [ "$SWAP_RAM_SOLUTION" = "auto" ]; then
         # Always use ZSWAP - it's superior to ZRAM for all RAM sizes
         # The only difference is pool size tuning based on RAM
         SWAP_RAM_SOLUTION="zswap"
         if [ "$RAM_GB" -ge 16 ]; then
-            log_info "Auto-selected: ZSWAP (high RAM system ≥16GB, 15-20% pool recommended)"
+            log_info "Auto-selected: ZSWAP (high RAM system ≥16GB, consider 15-20% pool)"
         elif [ "$RAM_GB" -ge 4 ]; then
-            log_info "Auto-selected: ZSWAP (medium RAM system, 25-30% pool recommended)"
+            log_info "Auto-selected: ZSWAP (medium RAM system, consider 25-30% pool)"
         else
-            log_info "Auto-selected: ZSWAP (low RAM system <4GB, 30-40% pool for max compression)"
+            log_info "Auto-selected: ZSWAP (low RAM system <4GB, consider 30-40% pool for max compression)"
             log_info "Note: ZSWAP is preferred over ZRAM even for low RAM - cold page eviction saves memory"
         fi
     else
