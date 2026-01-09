@@ -1,0 +1,1414 @@
+# Linux Swap Optimization for Idle Applications - Complete Guide
+
+**Version**: 1.0  
+**Date**: 2026-01-09  
+**Tested On**:  Debian with kernel 6.12.57+deb13-amd64  
+**Target**: Systems running many idle applications with limited RAM
+
+---
+
+## Table of Contents
+
+1. [Executive Summary](#executive-summary)
+2. [Kernel Swap Mechanics Deep Dive](#kernel-swap-mechanics-deep-dive)
+3. [Understanding Memory Pressure and Swap Behavior](#understanding-memory-pressure-and-swap-behavior)
+4. [ZRAM vs ZSWAP Architecture](#zram-vs-zswap-architecture)
+5. [Testing Methodology with fio](#testing-methodology-with-fio)
+6. [Configuration Guide](#configuration-guide)
+7. [Performance Analysis and Tuning](#performance-analysis-and-tuning)
+8. [Monitoring and Verification](#monitoring-and-verification)
+9. [Troubleshooting Guide](#troubleshooting-guide)
+10. [Quick Reference](#quick-reference)
+
+---
+
+## Executive Summary
+
+This document provides a comprehensive guide to optimizing Linux swap performance for systems running many idle applications with limited RAM. The key findings and recommendations are:
+
+### Key Findings
+
+1. **ZSWAP is superior to ZRAM** for idle workloads
+   - Automatic hot/cold page migration via LRU eviction
+   - Write-through cache architecture prevents cold pages from wasting RAM
+   - Dynamic cache sizing with shrinker (kernel 6.8+)
+
+2. **Kernel swap I/O patterns**
+   - Writes:  Batched up to 32 pages (SWAP_CLUSTER_MAX) per reclaim cycle
+   - Reads: Controlled by vm.page-cluster (readahead, 2^value pages)
+   - Round-robin distribution across equal-priority swap devices
+
+3. **Compression algorithm trade-offs**
+   - lz4: 2.0:1 ratio, ~3µs latency, most reliable
+   - zstd: 2.3:1 ratio, ~15µs latency, best compression
+   - For idle apps: 10µs difference negligible vs disk I/O (500µs+)
+
+4. **fio testing insights**
+   - `numjobs` parameter essential for parallel device testing
+   - numjobs=1 serializes access regardless of file count
+   - Sweet spot: numjobs=8-12 for balanced bandwidth/latency
+
+5. **Memory accounting**
+   - ZSWAP memory is HIDDEN from `free`, `top`, `htop`
+   - Only visible via `/sys/kernel/debug/zswap/`
+   - ZSWAP competes with applications for RAM (not "free" memory)
+
+### Recommended Configuration
+
+```yaml
+System:  8GB RAM, running 16+ idle applications
+ZSWAP: 3GB cache (38% of RAM)
+Compressor: lz4 or zstd
+Disk Swap: 8 partitions × 1GB = 8GB
+Sysctls:
+  vm.swappiness: 80
+  vm.page-cluster: 0
+  vm.vfs_cache_pressure: 50
+THP: madvise mode
+Expected Performance
+Effective capacity: ~23GB virtual memory (8GB RAM + 7GB ZSWAP + 8GB disk)
+Hot page access: <20µs (ZSWAP cache)
+Cold page access: 500µs-10ms (disk)
+Sustained throughput: 300-350 MB/s with 8 devices
+99th percentile latency: <1ms under normal load
+Kernel Swap Mechanics Deep Dive
+Understanding Page Reclaim and Swap-Out
+The Linux kernel's memory management subsystem uses a multi-stage approach to handle memory pressure:
+
+Code
+Memory Pressure Detection
+         ↓
+    kswapd daemon wakes up
+         ↓
+    Scans LRU lists (active/inactive)
+         ↓
+    Selects pages for reclaim
+         ↓
+    Page writeback/swap-out
+         ↓
+    Free memory available
+The Role of SWAP_CLUSTER_MAX
+Definition: Kernel constant defining batch size for page reclaim (typically 32 pages)
+
+Location in code: include/linux/swap.h
+
+C
+#define SWAP_CLUSTER_MAX 32UL
+Why 32 pages?
+
+I/O efficiency: 32 × 4KB = 128KB per batch
+
+Optimal for disk I/O (not too small, not too large)
+Matches typical disk readahead window
+Reduces syscall overhead (32 operations → 1 batch)
+CPU cache efficiency: 32 pages fit well in L2/L3 cache
+
+Kernel can process page descriptors efficiently
+Reduces TLB pressure during reclaim
+Latency balance: Small enough to avoid long pauses
+
+Total time: ~1-5ms for 128KB write
+Prevents noticeable application stalls
+Allows interleaving with other work
+How it works in practice:
+
+Code
+shrink_page_list() cycle: 
+┌─────────────────────────────────────┐
+│ Input: List of 32 pages to reclaim │
+├─────────────────────────────────────┤
+│ For each page:                       │
+│   1. Check if dirty                 │
+│   2. Allocate swap space            │
+│   3. Write to swap (may batch)      │
+│   4. Mark PTE as swapped            │
+│   5. Free physical page             │
+└─────────────────────────────────────┘
+Impact of multiple swap devices:
+
+Code
+4 swap devices at priority 10:
+32 pages to swap out
+  ↓
+Round-robin allocation: 
+  Device 1: Pages 0, 4, 8, 12, 16, 20, 24, 28  (8 pages)
+  Device 2: Pages 1, 5, 9, 13, 17, 21, 25, 29  (8 pages)
+  Device 3: Pages 2, 6, 10, 14, 18, 22, 26, 30 (8 pages)
+  Device 4: Pages 3, 7, 11, 15, 19, 23, 27, 31 (8 pages)
+  ↓
+Block layer may coalesce adjacent writes: 
+  8 pages → 32KB write per device
+  Total: 128KB across 4 devices in parallel
+Why you can't configure it:
+
+Compiled into kernel (no module parameter)
+Changing requires kernel recompile
+Default value (32) optimized for broad hardware
+Too small: Excessive overhead
+Too large: Increased latency, memory pressure
+Implications for fio testing:
+
+Test with iodepth=4-8 per device (matches kernel behavior)
+Use numjobs to simulate parallel swap-out
+32 pages = 128KB is maximum "natural" burst size
+vm.page-cluster: Swap Readahead Explained
+Definition: Sysctl controlling swap readahead (reads only, NOT writes)
+
+Value is logarithmic: pages_read = 2^vm.page-cluster
+
+Code
+vm.page-cluster=0  →  2^0 = 1 page  (4KB)
+vm.page-cluster=1  →  2^1 = 2 pages (8KB)
+vm.page-cluster=2  →  2^2 = 4 pages (16KB)
+vm.page-cluster=3  →  2^3 = 8 pages (32KB) ← default
+Why readahead exists:
+
+Disk seek cost: HDD seeks are expensive (~10ms)
+
+Reading 1 page: seek(10ms) + read(0.1ms) = 10.1ms
+Reading 8 pages: seek(10ms) + read(0.8ms) = 10.8ms
+8× more data for 7% more time!
+Swap slot locality: Pages swapped out together often accessed together
+
+Code
+Process memory scan:
+Pages A, B, C, D (virtually contiguous)
+  ↓ Memory pressure
+Swapped out together → Swap slots 100, 101, 102, 103
+  ↓ Later... 
+Page fault on C (slot 102)
+  ↓ Readahead
+Read slots 100-107 (gets A, B, C, D back)
+Temporal locality: If page N is accessed, pages N-1, N+1 likely needed soon
+
+How page-cluster creates locality from randomness:
+
+Code
+Application view (random virtual addresses):
+  Page 0x1000 → swapped
+  Page 0x5000 → swapped  
+  Page 0x2000 → swapped
+  Page 0x6000 → swapped
+
+Kernel swap allocator (batched, creates locality):
+  Allocates consecutive swap slots: 
+    0x1000 → slot 100
+    0x5000 → slot 101  ← Adjacent in swap! 
+    0x2000 → slot 102
+    0x6000 → slot 103
+
+Later, fault on 0x5000 (slot 101):
+  With page-cluster=3: 
+    Read slots 96-103 (8 pages)
+    Includes 100, 101, 102, 103 (likely related pages)
+Performance impact by storage type:
+
+Storage	Seek Cost	Readahead Benefit	Recommended Value
+HDD	10ms	Very high	3 (8 pages)
+SATA SSD	0.1ms	Medium	1-2 (2-4 pages)
+NVMe	0.01ms	Low	0-1 (1-2 pages)
+ZRAM	0µs	None	0 (1 page)
+ZSWAP	0µs	None	0 (1 page)
+Why set to 0 for ZSWAP:
+
+No seek cost: ZSWAP is in RAM, random access is free
+Cache granularity: ZSWAP caches individual 4KB pages
+Avoid waste: Reading extra pages wastes memory bandwidth
+LRU precision: Kernel's LRU already handles hot/cold detection
+Testing page-cluster effects:
+
+bash
+# Test different readahead values
+for cluster in 0 1 2 3; do
+    sysctl vm.page-cluster=$cluster
+    
+    # Random read test
+    fio --name=read-test --rw=randread --bs=4k \
+        --filename=/swapfile --size=1G \
+        --runtime=60 --time_based=1
+    
+    # Measure: 
+    # - Bandwidth (should increase with page-cluster on HDD)
+    # - Latency (may increase with unnecessary readahead)
+    # - CPU usage (higher with more decompression)
+done
+Common misconception: "page-cluster controls swap writes"
+
+Reality: Only reads! Writes are controlled by:
+
+SWAP_CLUSTER_MAX (batch size)
+Page reclaim algorithm (which pages)
+Block layer (I/O coalescing)
+VMA-Based Readahead (Kernel 4.8+)
+Modern kernels have smarter readahead:
+
+Code
+Traditional (swap slot based):
+  Fault on slot 102
+    ↓
+  Read slots 100-107
+  Problem: May not be related in virtual address space
+
+VMA-based (address based):
+  Fault on virtual address 0x5000
+    ↓
+  Read pages around 0x5000 in same VMA
+    ↓
+  Look up their swap slots (may not be consecutive)
+    ↓
+  Read those specific slots
+  Benefit: True spatial locality in process address space
+Enable VMA-based readahead (kernel 6.12 has it by default):
+
+No configuration needed
+Automatically used when beneficial
+Falls back to traditional if VMA info unavailable
+Understanding Memory Pressure and Swap Behavior
+The Memory Pressure Cascade
+Code
+Stage 1: Comfortable (< 80% RAM used)
+  ↓
+  Kernel:  No action, all pages stay in RAM
+  
+Stage 2: Warning (80-90% RAM used)
+  ↓
+  Kernel: kswapd starts background reclaim
+  - Scans inactive LRU list
+  - Frees clean file pages (cheapest)
+  - May swap out a few cold anonymous pages
+  
+Stage 3: Pressure (90-95% RAM used)
+  ↓
+  Kernel:  Aggressive reclaim
+  - Both kswapd and direct reclaim active
+  - Swapping out more anonymous pages
+  - Dropping caches
+  - ZSWAP starts filling up
+  
+Stage 4: Critical (> 95% RAM used)
+  ↓
+  Kernel:  Emergency mode
+  - Direct reclaim in application context (stalls)
+  - ZSWAP evicting to disk
+  - OOM killer may activate if no progress
+How vm.swappiness Affects Behavior
+Definition: Tendency to reclaim anonymous pages vs file cache (0-200)
+
+Code
+vm.swappiness=0:   "Avoid swap at all costs"
+  Kernel: Only swap when absolutely necessary
+  Result: File cache stays large, apps may get OOM killed
+  
+vm. swappiness=60: "Balanced" (default)
+  Kernel: Treat anonymous and file pages similarly
+  Result: Moderate swapping, moderate cache
+  
+vm.swappiness=80: "Aggressive swapping" (recommended with ZSWAP)
+  Kernel: Prefer swapping over dropping cache
+  Result: More data in swap, larger file cache
+  Reason: With ZSWAP, swapping is cheap (compressed in RAM)
+  
+vm.swappiness=100: "Very aggressive"
+  Kernel: Strongly prefer swapping
+  Result: Maximum swap usage, maximum cache retention
+  
+vm.swappiness=200: "Extreme"
+  Kernel: Reclaim anonymous pages twice as aggressively
+  Result: Apps mostly swapped, huge cache
+  Use case: Servers with read-heavy file workloads
+Why 80 for ZSWAP:
+
+Code
+Without ZSWAP:
+  Swapping = disk I/O (slow, ~10ms latency)
+  Better to keep pages in RAM and drop cache
+  
+With ZSWAP:
+  Swapping = compressed in RAM (~15µs latency)
+  Almost as cheap as RAM itself
+  Can keep both swap cache AND file cache
+  
+Math:
+  8GB RAM with swappiness=80 and ZSWAP: 
+    - 2GB active apps (in RAM)
+    - 3GB ZSWAP (compressed, ~6GB effective)
+    - 3GB file cache
+  Total effective: ~11GB
+  
+  vs swappiness=60: 
+    - 4GB active apps (in RAM)
+    - 1GB ZSWAP (compressed, ~2GB effective)
+    - 3GB file cache
+  Total effective:  ~9GB
+Transparent Huge Pages (THP) Deep Dive
+What are huge pages?
+
+Code
+Normal pages:   4KB (4096 bytes)
+Huge pages:    2MB (2097152 bytes) on x86_64
+               512× larger! 
+THP modes:
+
+Code
+always:     Kernel tries to use 2MB pages everywhere
+           - Best for large, sequential workloads
+           - Worst for many small apps (memory bloat)
+           
+madvise:   Only use huge pages when requested by application
+           - App calls madvise(MADV_HUGEPAGE)
+           - Default for databases, VMs
+           
+never:     Never use huge pages
+           - Lowest overhead
+           - Best for many small apps
+Why THP hurts idle applications:
+
+Example scenario:
+
+Code
+16 applications, each using 100MB RAM: 
+
+Without THP (4KB pages):
+  App 1: 25,600 pages × 4KB = 100MB ✓
+  App 2: 25,600 pages × 4KB = 100MB ✓
+  ... 
+  Total: 1,600MB
+
+With THP (2MB pages):
+  App 1: 50 pages × 2MB = 100MB ✓
+  But kernel rounds up: 
+  App 1: Actually allocated 2MB pages = 100MB
+  Problem: Each allocation rounded to 2MB boundary
+  
+  Reality with fragmentation:
+  App 1: 50 huge pages, but fragmented
+       → Some as 4KB pages
+       → khugepaged tries to compact
+       → CPU overhead, memory moves around
+The swap problem:
+
+Code
+Scenario: App uses 8KB of memory
+
+Without THP:
+  Allocated:  2 pages × 4KB = 8KB
+  Inactive: 1 page (4KB)
+    ↓
+  Swap out: 4KB written to disk ✓
+
+With THP: 
+  Allocated: 1 huge page = 2MB (for 8KB usage!)
+  Inactive:  Entire 2MB
+    ↓
+  Swap out options:
+    a) Split huge page (CPU cost) → swap 4KB
+    b) Swap entire 2MB (wasteful)
+    
+  Either way:  Higher cost than necessary
+Memory fragmentation with THP:
+
+Code
+Memory layout without THP:
+[App1][App2][App3][App4][App5][App6][App7][App8]
+  ↓ App3 exits
+[App1][App2][FREE][App4][App5][App6][App7][App8]
+  ↓ App9 starts (needs 16KB)
+[App1][App2][App9][App4][App5][App6][App7][App8] ✓
+
+Memory layout with THP:
+[App1--------------][App2--------------][App3--------------]
+  ↓ App3 exits  
+[App1--------------][App2--------------][FREE--------------]
+  ↓ App9 starts (needs 100KB)
+  Can't find contiguous 2MB for huge page! 
+  ↓ khugepaged tries to compact
+  CPU overhead, memory moves, latency spikes
+khugepaged overhead:
+
+Code
+khugepaged daemon: 
+  - Runs periodically (default: every 10 seconds)
+  - Scans memory for fragmented regions
+  - Tries to promote small pages to huge pages
+  - CPU overhead:  1-5% on busy systems
+  - Memory moves:  Causes cache invalidation
+  - Latency spikes: Can stall applications briefly
+Impact on swap performance:
+
+Metric	THP=always	THP=madvise	THP=never
+Memory overhead	+20-50%	Minimal	None
+Swap I/O size	2MB or split	4KB	4KB
+CPU overhead	High	Low	Lowest
+Latency variance	High	Medium	Low
+Idle app count	-30%	Baseline	Baseline
+Recommended setting for idle apps:
+
+bash
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
+echo never > /sys/kernel/mm/transparent_hugepage/defrag
+Rationale:
+
+madvise: Apps that benefit (databases, VMs) can opt-in
+never for defrag: Prevent khugepaged from consuming CPU
+Result: 4KB pages for most apps, huge pages only when explicitly requested
+ZRAM vs ZSWAP Architecture
+ZRAM Architecture
+Code
+┌────────────────────────────────────────────────┐
+│         Application Memory                     │
+└────────────┬───────────────────────────────────┘
+             │ Swap out
+             ↓
+┌────────────────────────────────────────────────┐
+│  ZRAM Block Device (/dev/zram0)                │
+│  Priority: 100 (highest)                       │
+│                                                │
+│  ┌──────────────────────────────────────┐    │
+│  │  Compressed Pages in RAM             │    │
+│  │  - lz4/zstd compression              │    │
+│  │  - Fixed allocation (disksize)       │    │
+│  │  - No automatic eviction             │    │
+│  └──────────────────────────────────────┘    │
+└────────────┬───────────────────────────────────┘
+             │ When ZRAM full
+             ↓
+┌────────────────────────────────────────────────┐
+│  Disk Swap Partitions                          │
+│  Priority: 10 (lower)                          │
+│                                                │
+│  /dev/vda4, /dev/vda5, .. ., /dev/vda11        │
+│  - Uncompressed pages                          │
+│  - Round-robin allocation                      │
+└────────────────────────────────────────────────┘
+Page lifecycle in ZRAM:
+
+Code
+1. Page swapped out
+     ↓
+   Check swap priorities
+     ↓
+   ZRAM (priority 100) available? 
+     ↓ YES
+   Compress page (4KB → ~1.5KB)
+     ↓
+   Store in ZRAM
+     ↓
+   Page stays in ZRAM until: 
+     - Process exits (page freed)
+     - Page swapped back in AND modified
+     - NEVER:  automatic eviction to disk
+The "cold page" problem:
+
+Code
+Time T0: System starts, 8GB RAM
+  App1-8 start: 4GB used
+    ↓
+  Swap to ZRAM: 2GB compressed (4GB effective)
+    ↓
+  ZRAM:  2GB/4GB used (disksize=4GB)
+  
+Time T1: Apps 1-8 go idle (cold pages)
+  App9-16 start: Need 4GB
+    ↓
+  Try to swap to ZRAM: Only 2GB space left
+    ↓
+  App9-12 go to ZRAM:  2GB more
+    ↓
+  ZRAM: 4GB/4GB FULL
+  App13-16 go to disk: 2GB uncompressed
+  
+Problem: 
+  - Cold pages (App1-8) waste ZRAM space
+  - Hot pages (App9-16) split between ZRAM and disk
+  - No automatic migration
+  
+Result: 
+  - Apps 13-16 suffer disk I/O
+  - Apps 1-8 occupy fast ZRAM but aren't accessed
+  - Suboptimal resource usage
+ZSWAP Architecture
+Code
+┌────────────────────────────────────────────────┐
+│         Application Memory                     │
+└────────────┬───────────────────────────────────┘
+             │ Swap out
+             ↓
+┌────────────────────────────────────────────────┐
+│            ZSWAP Cache Layer                   │
+│         (Compressed in RAM)                    │
+│                                                │
+│  ┌──────────────────────────────────────┐    │
+│  │  Compressed Page Cache               │    │
+│  │  - LRU-based eviction                │    │
+│  │  - Dynamic sizing (shrinker)         │    │
+│  │  - Write-through to disk             │    │
+│  └──────────────────────────────────────┘    │
+└────────────┬───────────────────────────────────┘
+             │ All swapped pages
+             │ (compressed in cache AND
+             │  uncompressed on disk)
+             ↓
+┌────────────────────────────────────────────────┐
+│        Disk Swap Partitions                    │
+│      (Uncompressed backing store)              │
+│                                                │
+│  /dev/vda4, /dev/vda5, ..., /dev/vda11        │
+└────────────────────────────────────────────────┘
+Page lifecycle in ZSWAP:
+
+Code
+1. Page swapped out
+     ↓
+   Compress page (4KB → ~1.5KB)
+     ↓
+   Store in ZSWAP cache (RAM)
+     ↓
+   ALSO write uncompressed to disk swap
+     ↓
+   Page now exists in TWO places:
+     - Compressed in ZSWAP cache (fast access)
+     - Uncompressed on disk (backup)
+   
+2. ZSWAP cache fills up
+     ↓
+   Shrinker evicts LRU (cold) pages
+     ↓
+   Remove from ZSWAP cache
+     ↓
+   Page still on disk (no I/O needed)
+   
+3. Page fault (swap in)
+     ↓
+   Check ZSWAP cache
+     ↓
+   In cache? (hot page)
+     ↓ YES
+     Decompress from RAM (~15µs) ✓ FAST
+     
+     ↓ NO (cold page)
+     Read from disk (500µs-10ms) ✗ SLOW
+     ↓
+     Optionally add back to ZSWAP cache
+The "cold page" solution:
+
+Code
+Same scenario as ZRAM: 
+
+Time T0: System starts
+  App1-8: 4GB → ZSWAP cache (2GB compressed)
+          4GB → Disk (uncompressed backup)
+  
+Time T1: Apps 1-8 go idle, Apps 9-16 active
+  ↓
+  Memory pressure detected
+  ↓
+  ZSWAP shrinker activates
+  ↓
+  Evicts cold pages (App1-8) from cache
+  ↓
+  Cache space freed:  2GB available
+  ↓
+  App9-16: 4GB → ZSWAP cache (2GB compressed)
+           4GB → Disk (uncompressed backup)
+  
+Result:
+  - Hot pages (App9-16) in ZSWAP cache ✓
+  - Cold pages (App1-8) only on disk ✓
+  - Automatic rebalancing ✓
+  
+Performance:
+  - App9-16 access: ~15µs (ZSWAP cache)
+  - App1-8 access: ~5ms (disk, but rare)
+  - Optimal resource allocation ✓
+Memory Accounting: The Hidden Truth
+Critical fact: ZSWAP memory is INVISIBLE to standard tools!
+
+Code
+What you see:
+# free -h
+              total        used        free      shared  buff/cache   available
+Mem:            7.8Gi       541Mi       7.4Gi       568Ki       154Mi       7.2Gi
+
+Reality:
+  Total:        7.8Gi
+  Apps:        541Mi  ← Visible
+  ZSWAP:       ??? Mi  ← HIDDEN! 
+  Free:        7.4Gi
+  
+Where is ZSWAP?  It's counted as "used" but not visible! 
+Actual memory breakdown:
+
+Code
+With ZSWAP actively caching 2GB: 
+
+User perspective (free -h):
+  Used:         2641Mi  ← Includes ZSWAP but can't see split
+  Free:        5299Mi
+  
+Reality:
+  Apps:         541Mi  ← Actual applications
+  ZSWAP:       2100Mi  ← Compressed swap cache
+  Free:        5299Mi
+  
+You can't distinguish the 2100Mi used by ZSWAP! 
+Why this matters:
+
+Troubleshooting: "Why is my RAM usage high?"
+May be ZSWAP caching (good thing)
+But looks like apps using memory
+Capacity planning: "Do I have enough RAM?"
+Must account for ZSWAP overhead
+3GB ZSWAP = 3GB less for apps
+OOM scenarios: "Why OOM with 2GB free?"
+"Free" may include ZSWAP headroom
+Actual available for apps < reported free
+How to see ZSWAP usage:
+
+bash
+# Only way to see it:
+mount -t debugfs none /sys/kernel/debug 2>/dev/null
+cat /sys/kernel/debug/zswap/pool_total_size  # bytes
+cat /sys/kernel/debug/zswap/stored_pages     # count
+
+# Calculate MB: 
+echo $(( $(cat /sys/kernel/debug/zswap/pool_total_size) / 1024 / 1024 ))
+
+# Stored data (uncompressed):
+echo $(( $(cat /sys/kernel/debug/zswap/stored_pages) * 4 / 1024 ))
+ZSWAP Shrinker (Kernel 6.8+)
+Problem without shrinker:
+
+Code
+Scenario: 8GB RAM, max_pool_percent=50 (4GB max)
+
+Apps allocate 10GB:
+  ↓
+  6GB in RAM, 4GB needs to swap
+  ↓
+  ZSWAP fills to 4GB limit
+  ↓
+  More pages need to swap
+  ↓
+  ZSWAP says:  "I'm full, can't accept more"
+  ↓
+  Pages go directly to disk (slow)
+  ↓
+  But ZSWAP still holds 4GB of old pages! 
+  ↓
+  No way to reclaim ZSWAP space
+  ↓
+  System OOM despite having "free" RAM
+Solution with shrinker:
+
+Code
+Same scenario with shrinker enabled:
+
+Apps allocate 10GB:
+  ↓
+  6GB in RAM, 4GB needs to swap
+  ↓
+  ZSWAP fills to 4GB limit
+  ↓
+  Memory pressure increases
+  ↓
+  Shrinker activates
+  ↓
+  Evicts cold pages from ZSWAP cache
+    (pages still on disk, just not cached)
+  ↓
+  ZSWAP size shrinks to 3GB
+  ↓
+  1GB space available for hot pages
+  ↓
+  New hot pages cached in ZSWAP
+  ↓
+  Old cold pages stay on disk
+  ↓
+  Optimal resource allocation ✓
+How shrinker works:
+
+C
+// Simplified kernel logic
+
+zswap_shrinker() {
+    if (memory_pressure_high() && zswap_near_limit()) {
+        // Calculate how much to evict
+        pages_to_free = calculate_shrink_amount();
+        
+        // Evict LRU pages from ZSWAP cache
+        for (i = 0; i < pages_to_free; i++) {
+            page = get_lru_page_from_zswap();
+            
+            // Page already on disk, just remove from cache
+            remove_from_zswap_cache(page);
+            
+            // No disk I/O needed! 
+        }
+    }
+}
+Enable shrinker:
+
+bash
+# Check if available (kernel 6.8+)
+if [ -f /sys/module/zswap/parameters/shrinker_enabled ]; then
+    echo "Y" > /sys/module/zswap/parameters/shrinker_enabled
+    echo "Shrinker enabled"
+else
+    echo "Shrinker not available (requires kernel 6.8+)"
+fi
+Shrinker benefits:
+
+Prevents OOM: ZSWAP can't cause OOM by hogging RAM
+Dynamic sizing: Cache size adjusts to workload
+Better efficiency: Hot pages stay cached, cold pages evicted
+No manual tuning: Kernel automatically balances
+Testing Methodology with fio
+Understanding fio Parameters
+Critical discovery: numjobs creates parallelism, not multiple filenames!
+
+Code
+Common misconception: 
+  fio --filename=file1:file2:file3:file4 --numjobs=1
+  Expectation: 4 parallel streams
+  Reality: 1 thread accessing files sequentially ✗
+
+Correct approach:
+  fio --filename=file1:file2:file3:file4 --numjobs=4
+  Reality: 4 threads, each accessing files ✓
+How fio distributes work:
+
+Code
+numjobs=1, 4 files: 
+  Thread 1: [file1] → [file2] → [file3] → [file4] → [file1] ... 
+           Sequential round-robin, NO parallelism
+
+numjobs=4, 4 files:
+  Thread 1: [file1] ┐
+  Thread 2: [file2] ├─ All concurrent
+  Thread 3: [file3] ���
+  Thread 4: [file4] ┘
+  
+  Each thread may also round-robin, but 4 in parallel! 
+Matrix Testing Framework
+Goal: Find optimal configuration for bandwidth AND latency
+
+Test dimensions:
+
+Block size: 4k, 8k, 16k, 32k
+Queue depth (iodepth): 1, 2, 4, 8, 16
+Concurrency (numjobs): 1, 2, 4, 8, 16, 32
+Read/write mix: 50/50, 70/30, 80/20, 90/10
+Complete test script:
+
+bash
+#!/bin/bash
+# Comprehensive swap performance matrix test
+
+TESTFILE="/swaptest"
+RUNTIME=60
+OUTDIR="./fio-results"
+mkdir -p "$OUTDIR"
+
+echo "=== Starting Swap Performance Matrix Test ==="
+echo "Output directory: $OUTDIR"
+echo ""
+
+# Test 1: Block size impact (single thread)
+echo "Test 1: Block size impact"
+for BS in 4k 8k 16k 32k 64k 128k; do
+    echo "  Testing bs=$BS..."
+    fio --name="bs-${BS}" \
+        --filename="$TESTFILE" \
+        --rw=randrw \
+        --rwmixread=70 \
+        --bs="$BS" \
+        --ioengine=libaio \
+        --direct=1 \
+        --iodepth=8 \
+        --numjobs=1 \
+        --size=2G \
+        --runtime="$RUNTIME" \
+        --time_based=1 \
+        --group_reporting=1 \
+        --output="$OUTDIR/bs-${BS}. json" \
+        --output-format=json
+done
+
+# Test 2: Queue depth impact (4k blocks)
+echo ""
+echo "Test 2: Queue depth impact"
+for QD in 1 2 4 8 16 32; do
+    echo "  Testing iodepth=$QD..."
+    fio --name="qd-${QD}" \
+        --filename="$TESTFILE" \
+        --rw=randrw \
+        --rwmixread=70 \
+        --bs=4k \
+        --ioengine=libaio \
+        --direct=1 \
+        --iodepth="$QD" \
+        --numjobs=1 \
+        --size=2G \
+        --runtime="$RUNTIME" \
+        --time_based=1 \
+        --group_reporting=1 \
+        --output="$OUTDIR/qd-${QD}.json" \
+        --output-format=json
+done
+
+# Test 3: Concurrency impact
+echo ""
+echo "Test 3: Concurrency impact"
+for JOBS in 1 2 4 8 16 32; do
+    echo "  Testing numjobs=$JOBS..."
+    fio --name="jobs-${JOBS}" \
+        --filename="$TESTFILE" \
+        --rw=randrw \
+        --rwmixread=70 \
+        --bs=4k \
+        --ioengine=libaio \
+        --direct=1 \
+        --iodepth=4 \
+        --numjobs="$JOBS" \
+        --size=2G \
+        --runtime="$RUNTIME" \
+        --time_based=1 \
+        --group_reporting=1 \
+        --output="$OUTDIR/jobs-${JOBS}.json" \
+        --output-format=json
+done
+
+# Test 4: Read/write mix impact
+echo ""
+echo "Test 4: Read/write mix impact"
+for MIX in 50 70 80 90; do
+    echo "  Testing rwmixread=$MIX%..."
+    fio --name="mix-${MIX}" \
+        --filename="$TESTFILE" \
+        --rw=randrw \
+        --rwmixread="$MIX" \
+        --bs=4k \
+        --ioengine=libaio \
+        --direct=1 \
+        --iodepth=8 \
+        --numjobs=8 \
+        --size=2G \
+        --runtime="$RUNTIME" \
+        --time_based=1 \
+        --group_reporting=1 \
+        --output="$OUTDIR/mix-${MIX}.json" \
+        --output-format=json
+done
+
+# Test 5: Latency-focused test
+echo ""
+echo "Test 5: Latency profile"
+fio --name="latency-test" \
+    --filename="$TESTFILE" \
+    --rw=randrw \
+    --rwmixread=70 \
+    --bs=4k \
+    --ioengine=libaio \
+    --direct=1 \
+    --iodepth=1 \
+    --numjobs=4 \
+    --size=2G \
+    --runtime="$RUNTIME" \
+    --time_based=1 \
+    --lat_percentiles=1 \
+    --clat_percentiles=1 \
+    --percentile_list=50: 90:95: 99:99.9: 99.99 \
+    --group_reporting=1 \
+    --output="$OUTDIR/latency. json" \
+    --output-format=json
+
+echo ""
+echo "=== Tests complete!  ==="
+echo "Results saved to: $OUTDIR/"
+Analysis Script with Scoring
+Python
+#!/usr/bin/env python3
+"""
+Analyze fio matrix test results
+Calculates bandwidth, latency, and composite score
+"""
+
+import json
+import glob
+import sys
+from pathlib import Path
+
+def analyze_fio_results(results_dir):
+    """Analyze fio JSON results and rank configurations."""
+    
+    results = []
+    
+    for json_file in sorted(glob.glob(f"{results_dir}/*.json")):
+        try:
+            with open(json_file) as f:
+                data = json.load(f)
+            
+            if not data. get('jobs'):
+                continue
+                
+            job = data['jobs'][0]
+            
+            # Extract metrics
+            read_iops = job['read']['iops']
+            write_iops = job['write']['iops']
+            read_bw = job['read']['bw'] / 1024  # KB/s to MB/s
+            write_bw = job['write']['bw'] / 1024
+            
+            # Latency (convert ns to ms)
+            read_lat_50 = job['read']['clat_ns']['percentile']. get('50.000000', 0) / 1e6
+            read_lat_99 = job['read']['clat_ns']['percentile'].get('99.000000', 0) / 1e6
+            read_lat_999 = job['read']['clat_ns']['percentile'].get('99.900000', 0) / 1e6
+            
+            write_lat_50 = job['write']['clat_ns']['percentile'].get('50.000000', 0) / 1e6
+            write_lat_99 = job['write']['clat_ns']['percentile']. get('99.000000', 0) / 1e6
+            write_lat_999 = job['write']['clat_ns']['percentile'].get('99.900000', 0) / 1e6
+            
+            # Combined metrics
+            total_iops = read_iops + write_iops
+            total_bw = read_bw + write_bw
+            avg_lat_50 = (read_lat_50 + write_lat_50) / 2
+            avg_lat_99 = (read_lat_99 + write_lat_99) / 2
+            avg_lat_999 = (read_lat_999 + write_lat_999) / 2
+            
+            # Calculate scores
+            # Bandwidth score: normalize to 500 MB/s = 100 points
+            bw_score = min(100, (total_bw / 500) * 100)
+            
+            # Latency score: 1ms = 100 points, worse = lower
+            # Penalize 99th percentile more than median
+            lat_score_50 = max(0, 100 - (avg_lat_50 - 1. 0) * 50)
+            lat_score_99 = max(0, 100 - (avg_lat_99 - 1.0) * 30)
+            lat_score_999 = max(0, 100 - (avg_lat_999 - 5.0) * 10)
+            
+            lat_score = (lat_score_50 * 0.3 + lat_score_99 * 0.5 + lat_score_999 * 0.2)
+            
+            # Composite score (bandwidth 40%, latency 60% for idle apps)
+            composite_score = bw_score * 0.4 + lat_score * 0.6
+            
+            # Responsiveness score (IOPS / latency)
+            responsiveness = total_iops / (1 + avg_lat_99)
+            
+            results.append({
+                'name': Path(json_file).stem,
+                'file': json_file,
+                'total_iops': total_iops,
+                'read_iops': read_iops,
+                'write_iops': write_iops,
+                'total_bw_mbs': total_bw,
+                'read_bw_mbs': read_bw,
+                'write_bw_mbs': write_bw,
+                'lat_50_ms': avg_lat_50,
+                'lat_99_ms': avg_lat_99,
+                'lat_999_ms': avg_lat_999,
+                'bw_score': bw_score,
+                'lat_score': lat_score,
+                'composite_score':  composite_score,
+                'responsiveness': responsiveness,
+            })
+        except Exception as e:
+            print(f"Warning: Failed to parse {json_file}: {e}", file=sys.stderr)
+            continue
+    
+    if not results:
+        print("No valid results found!", file=sys.stderr)
+        return
+    
+    # Sort by composite score
+    results.sort(key=lambda x: x['composite_score'], reverse=True)
+    
+    # Print results
+    print("=" * 120)
+    print("SWAP PERFORMANCE ANALYSIS - Matrix Test Results")
+    print("=" * 120)
+    print()
+    
+    print("Top 10 configurations by composite score:")
+    print()
+    print(f"{'Rank':<6} {'Test':<20} {'IOPS':<10} {'BW(MB/s)':<12} "
+          f"{'Lat 50%':<10} {'Lat 99%':<10} {'Lat 99.9%':<12} {'Score':<8}")
+    print("-" * 120)
+    
+    for i, r in enumerate(results[:10], 1):
+        print(f"{i: <6} {r['name']: <20} {r['total_iops']:<10.0f} {r['total_bw_mbs']: <12.1f} "
+              f"{r['lat_50_ms']:<10.3f} {r['lat_99_ms']:<10.3f} {r['lat_999_ms']:<12.3f} "
+              f"{r['composite_score']:<8.1f}")
+    
+    print()
+    print("=" * 120)
+    
+    # Detailed analysis of top result
+    best = results[0]
+    print("RECOMMENDED CONFIGURATION (Top scorer):")
+    print("=" * 120)
+    print(f"Test: {best['name']}")
+    print()
+    print(f"Performance:")
+    print(f"  Total IOPS:      {best['total_iops']: >10.0f} (R:  {best['read_iops']:.0f}, W: {best['write_iops']:.0f})")
+    print(f"  Total BW:        {best['total_bw_mbs']:>10.1f} MB/s (R: {best['read_bw_mbs']:.1f}, W: {best['write_bw_mbs']:.1f})")
+    print()
+    print(f"Latency:")
+    print(f"  50th percentile: {best['lat_50_ms']: >9.3f} ms")
+    print(f"  99th percentile:  {best['lat_99_ms']:>9.3f} ms")
+    print(f"  99.9th percentile: {best['lat_999_ms']: >7.3f} ms")
+    print()
+    print(f"Scores:")
+    print(f"  Bandwidth:       {best['bw_score']:>10.1f} / 100")
+    print(f"  Latency:        {best['lat_score']:>10.1f} / 100")
+    print(f"  Composite:      {best['composite_score']:>10.1f} / 100")
+    print(f"  Responsiveness: {best['responsiveness']:>10.1f}")
+    print()
+    
+    # Recommendations based on test name
+    if 'bs-' in best['name']:
+        bs = best['name'].split('-')[1]
+        print(f"→ Optimal block size: {bs}")
+        if bs == '4k':
+            print("  Matches kernel page size - good for random access")
+        elif int(bs. rstrip('k')) > 32:
+            print("  Larger blocks - consider sequential I/O patterns")
+    
+    if 'qd-' in best['name']:
+        qd = best['name'].split('-')[1]
+        print(f"→ Optimal queue depth: {qd}")
+        if int(qd) < 4:
+            print("  Low queue depth - good for latency-sensitive workloads")
+        elif int(qd) > 16:
+            print("  High queue depth - good for throughput, watch latency")
+    
+    if 'jobs-' in best['name']:
+        jobs = best['name'].split('-')[1]
+        print(f"→ Optimal concurrency: {jobs} parallel operations")
+        print(f"  System can handle ~{jobs} applications swapping simultaneously")
+    
+    print()
+    print("=" * 120)
+    
+    # Bandwidth vs Latency trade-off analysis
+    print()
+    print("BANDWIDTH vs LATENCY TRADE-OFF:")
+    print("=" * 120)
+    
+    # Find highest bandwidth
+    bw_sorted = sorted(results, key=lambda x: x['total_bw_mbs'], reverse=True)
+    max_bw = bw_sorted[0]
+    
+    # Find lowest latency
+    lat_sorted = sorted(results, key=lambda x: x['lat_99_ms'])
+    min_lat = lat_sorted[0]
+    
+    print(f"{'Config':<20} {'BW (MB/s)':<12} {'Lat 99% (ms)':<15} {'Score':<8} {'Note':<30}")
+    print("-" * 120)
+    print(f"{max_bw['name']: <20} {max_bw['total_bw_mbs']:<12.1f} {max_bw['lat_99_ms']:<15.3f} "
+          f"{max_bw['composite_score']:<8.1f} {'Max bandwidth':<30}")
+    print(f"{min_lat['name']:<20} {min_lat['total_bw_mbs']:<12.1f} {min_lat['lat_99_ms']:<15.3f} "
+          f"{min_lat['composite_score']:<8.1f} {'Min latency': <30}")
+    print(f"{best['name']:<20} {best['total_bw_mbs']:<12.1f} {best['lat_99_ms']:<15.3f} "
+          f"{best['composite_score']:<8.1f} {'Best balance (recommended)':<30}")
+    
+    print()
+    print("Analysis:")
+    if max_bw['name'] == best['name']:
+        print("  ✓ Best configuration achieves maximum bandwidth with acceptable latency")
+    elif min_lat['name'] == best['name']:
+        print("  ✓ Best configuration achieves minimum latency with acceptable bandwidth")
+    else:
+        bw_penalty = ((max_bw['total_bw_mbs'] - best['total_bw_mbs']) / max_bw['total_bw_mbs']) * 100
+        lat_penalty = ((best['lat_99_ms'] - min_lat['lat_99_ms']) / min_lat['lat_99_ms']) * 100
+        print(f"  • Bandwidth trade-off: {bw_penalty:.1f}% lower than maximum")
+        print(f"  • Latency trade-off:  {lat_penalty:.1f}% higher than minimum")
+        print(f"  ✓ Recommended config balances both metrics for idle applications")
+    
+    print()
+    print("=" * 120)
+
+if __name__ == '__main__':
+    if len(sys.argv) != 2:
+        print(f"Usage: {sys.argv[0]} <results_directory>")
+        sys.exit(1)
+    
+    analyze_fio_results(sys. argv[1])
+Test Results Analysis (Example Output)
+Code
+Test results on 8 partitions (single disk):
+
+Block Size Impact:
+  4k:    312 MB/s,  0.8ms latency → Score: 85
+  8k:   330 MB/s,  0.9ms latency → Score: 86
+  16k:  345 MB/s,  1.1ms latency → Score: 84
+  32k:  360 MB/s,  1.4ms latency → Score: 81
+  
+Analysis:  8k-16k sweet spot for this storage
+
+Queue Depth Impact:
+  1:     210 MB/s,  0.4ms latency → Score: 75
+  2:    280 MB/s,  0.6ms latency → Score: 83
+  4:    320 MB/s,  0.8ms latency → Score: 87
+  8:    350 MB/s,  1.2ms latency → Score: 84
+  16:   365 MB/s,  2.1ms latency → Score: 76
+  
+Analysis: iodepth=4 optimal (matches SWAP_CLUSTER_MAX / devices)
+
+Concurrency Impact:
+  1:     95 MB/s,  0.8ms latency → Score: 60
+  2:    180 MB/s,  0.9ms latency → Score: 72
+  4:    285 MB/s,  1.0ms latency → Score: 82
+  8:    312 MB/s,  1.1ms latency → Score: 85
+  16:   408 MB/s,  1.5ms latency → Score: 86
+  32:   519 MB/s,  1.7ms latency → Score: 84
+  
+Analysis: numjobs=16 best composite, 8 best for latency
+
+Recommended:  numjobs=8-12, iodepth=4, bs=8k-16k
+Configuration Guide
+Complete ZSWAP Setup Script
+bash
+#!/bin/bash
+# Complete ZSWAP + Swap Configuration
+# Version: 1.0
+# Tested on:  Debian with kernel 6.12.57+deb13-amd64
+# Purpose: Optimize swap for idle applications
+
+set -e
+
+echo "=================================================="
+echo "     Complete ZSWAP + Swap Configuration"
+echo "=================================================="
+echo ""
+
+# ============================================================
+# Configuration Variables
+# ============================================================
+TOTAL_RAM_MB=$(grep MemTotal /proc/meminfo | awk '{print int($2/1024)}')
+TARGET_ZSWAP_MB=3072
+MAX_POOL_PERCENT=$(( TARGET_ZSWAP_MB * 100 / TOTAL_RAM_MB ))
+SWAP_DEVS="/dev/vda4 /dev/vda5 /dev/vda6 /dev/vda7 /dev/vda8 /dev/vda9 /dev/vda10 /dev/vda11"
+
+echo "System Configuration:"
+echo "  Total RAM:        ${TOTAL_RAM_MB}MB"
+echo "  ZSWAP target:   ${TARGET_ZSWAP_MB}MB (${MAX_POOL_PERCENT}%)"
+echo "  Swap devices:   $(echo $SWAP_DEVS | wc -w) partitions"
+echo ""
+
+# ============================================================
+# Step 1: Setup swap partitions
+# ============================================================
+echo "Step 1: Configuring swap partitions..."
+
+for dev in $SWAP_DEVS; do
+    swapoff $dev 2>/dev/null || true
+done
+
+for dev in $SWAP_DEVS; do
+    if [ -b "$dev" ]; then
+        mkswap $dev
+        swapon -p 10 $dev
+        echo "  ✓ $dev"
+    else
+        echo "  ✗ $dev not found!"
+    fi
+done
+
+echo ""
+swapon -s
+echo ""
+
+# ============================================================
+# Step 2: Configure ZSWAP via kernel parameters
+# ============================================================
+echo "Step 2: Configuring ZSWAP kernel parameters..."
+
+GRUB_FILE="/etc/default/grub"
+BACKUP_FILE="${GRUB_FILE}.backup. $(date +%Y%m%d-%H%M%S)"
+cp "${GRUB_FILE}" "${BACKUP_FILE}"
+echo "  Backed up to: ${BACKUP_FILE}"
+
+# Remove old zswap parameters
+sed -i 's/zswap\.[^ ]*//g' "${GRUB_FILE}"
+sed -i 's/  */ /g' "${GRUB_FILE}"
+
+# Use lz4 (widely available) or lzo (built-in fallback)
+ZSWAP_PARAMS="zswap.enabled=1 zswap.compressor=lz4 zswap.zpool=zsmalloc zswap.max_pool_percent=${MAX_POOL_PERCENT} zswap.accept_threshold_percent=90 zswap.shrinker_enabled=1"
+sed -i "s/GRUB_CMDLINE_LINUX=\"/GRUB_CMDLINE_LINUX=\"${ZSWAP_PARAMS} /" "${GRUB_FILE}"
+
+if command -v update-grub &> /dev/null; then
+    update-grub
+elif command -v grub2-mkconfig &> /dev/null; then
+    grub2-mkconfig -o /boot/grub2/grub.cfg
+fi
+
+echo "  ✓ GRUB configured"
+echo ""
+
+# ============================================================
+# Step 3: Configure immediate ZSWAP (current session)
+# ============================================================
+echo "Step 3: Enabling ZSWAP for current session..."
+
+echo Y > /sys/module/zswap/parameters/enabled
+
+# Try compressors in order of preference
+for comp in lz4 zstd lzo; do
+    if echo "$comp" > /sys/module/zswap/parameters/compressor 2>/dev/null; then
+        echo "  ✓ Using compressor: $comp"
+        break
+    fi
+done
+
+echo "zsmalloc" > /sys/module/zswap/parameters/zpool 2>/dev/null || \
+echo "zbud" > /sys/module/zswap/parameters/zpool
+
+echo "${MAX_POOL_PERCENT}" > /sys/module/zswap/parameters/max_pool_percent
+echo "90" > /sys/module/zswap/parameters/accept_threshold_percent
+echo "Y" > /sys/module/zswap/parameters/shrinker_enabled 2>/dev/null || \
+    echo "  ⓘ Shrinker not available (requires kernel 6.8+)"
+
+echo "  ✓ ZSWAP enabled"
+echo ""
+
+# ============================================================
+# Step 4: Configure sysctl
+# ============================================================
+echo "Step 4: Configuring sysctl parameters..."
+
+cat > /etc/sysctl. d/99-zswap-tuning.conf <<'SYSCTL_EOF'
+# ZSWAP configuration for idle applications
+
+# Aggressive swapping (ZSWAP makes it cheap)
+vm.swappiness=80
+
+# No readahead (ZSWAP caches 4K pages)
+vm.page-cluster=0
+
+# Keep metadata cached
+vm.vfs_cache_pressure=50
+
+# Dirty page writeback
+vm.dirty_ratio=15
+vm.dirty_background_ratio=5
+vm.dirty_expire_centisecs=1000
+vm.dirty_writeback_centisecs=500
+
+# Memory management
+vm.compact_unevictable_allowed=0
+vm.watermark_scale_factor=125
+
+# Overcommit
+vm.overcommit_memory=1
+vm.overcommit_ratio=100
+SYSCTL_EOF
+
+sysctl -p /etc/sysctl.d/99-zswap-tuning.conf > /dev/null
+echo "  ✓ Sysctl configured"
+echo ""
+
+# ============================================================
+# Step 5: Make swap persistent in /etc/fstab
+# ============================================================
+echo "Step 5:   Updating /etc/fstab..."
+
+FSTAB_BACKUP="/etc/fstab.backup.$(date +%Y%m%d-%H%M%S)"
+cp /etc/fstab "${FSTAB_BACKUP}"
+
+for dev in $SWAP_DEVS; do
+    sed -i "\|$dev|d" /etc/fstab
+    UUID=$(blkid -s UUID -o value $dev 2>/dev/null)
+    if [ -n "$UUID" ]; then
+        sed -i "\|UUID=$UUID|d" /etc/fstab
+    fi
+done
+
+echo "" >> /etc/fstab
+echo "# ZSWAP-backed swap partitions (configured $(date))" >> /etc/fstab
+for dev in $SWAP_DEVS; do
+    if [ -b "$dev" ]; then
+        UUID=$(blkid -s UUID -o value $dev)
+        if [ -n "$UUID" ]; then
+            echo "UUID=$UUID  none  swap  sw,pri=10  0  0" >> /etc/fstab
+        fi
+    fi
+done
+
+echo "  ✓ /etc/fstab updated (backup: ${FSTAB_BACKUP})"
+echo ""
+
+# ============================================================
+# Step 6: Configure THP
+# ============================================================
+echo "Step 6: Configuring Transparent Huge Pages..."
+
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
+echo never > /sys/kernel/mm/transparent_hugepage/defrag
+
+cat > /etc/systemd/system/thp-config.service <<'THP_EOF'
+[Unit]
+Description=Configure Transparent Huge Pages
+DefaultDependencies=no
+After=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'echo madvise > /sys/kernel/mm/transparent_hugepage/enabled'
+ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/defrag'
+
+[Install]
+WantedBy=sysinit.target
+THP_EOF
+
+systemctl daemon-reload
+systemctl enable thp-config.service 2>/dev/null
+
+echo "  ✓ THP configured"
+echo ""
+
+# ============================================================
+# Step 7: Create monitoring tools
+# ============================================================
+echo "Step 7: Creating monitoring tools..."
+
+cat > /usr/local/bin/check-zswap <<'CHECK_EOF'
+#!/bin/bash
+echo "=== ZSWAP Status ==="
+echo "Enabled:     $(cat /sys/module/zswap/parameters/enabled)"
+echo "Config:    $(cat /sys/module/zswap/parameters/compressor) / $(cat /sys/module/zswap/parameters/zpool)"
+echo "Max:         $(cat /sys/module/zswap/parameters/max_pool_percent)%"
+echo ""
+
+mount | grep -q debugfs || mount -t debugfs none /sys/kernel/debug 2>/dev/null
+
+if [ -f /sys/kernel/debug/zswap/pool_total_size ]; then
+    POOL_SIZE=$(cat /sys/kernel/debug/zswap/pool_total_size)
+    STORED_PAGES=$(cat /sys/kernel/debug/zswap/stored_pages)
+    POOL_MB=$(( POOL_SIZE / 1024 / 1024 ))
+    STORED_MB=$(( STORED_PAGES * 4 / 1024 ))
+    
+    echo "=== ZSWAP Usage ==="
+    echo "Cache size:     ${POOL_MB} MB"
+    echo "Data cached:   ${STORED_MB} MB uncompressed"
+    if [ ${POOL_MB} -gt 0 ]; then
+        RATIO=$(echo "scale=2; ${STORED_MB} / ${POOL_MB}" | bc 2>/dev/null || echo "N/A")
+        echo "Compression:      ${RATIO}: 1"
+    fi
+    echo ""
+fi
+
+echo "=== Swap Devices ==="
+swapon -s
+CHECK_EOF
+
+chmod +x /usr/local/bin/check-zswap
+
+cat > /usr/local/bin/monitor-zswap <<'MONITOR_EOF'
+#!/bin/bash
+mount | grep -q debugfs || mount -t debugfs none /sys/kernel/debug 2>/dev/null
+
+watch -n 2 'echo "=== ZSWAP Statistics ($(date +"%H:%M:%S")) ==="; \
+echo ""; \
+echo "Config:"; \
+echo "  Enabled:          $(cat /sys/module/zswap/parameters/enabled)"; \
+echo
