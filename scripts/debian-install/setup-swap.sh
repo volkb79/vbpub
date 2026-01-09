@@ -259,23 +259,31 @@ auto_detect_swap_configuration() {
     log_step "Auto-detecting optimal swap configuration"
     
     # Auto-detect SWAP_RAM_SOLUTION if not set or set to "auto"
+    # IMPORTANT: ZSWAP is ALWAYS the recommended choice over ZRAM
+    # See chat-merged.md for detailed analysis:
+    # - ZSWAP provides automatic LRU-based hot/cold page separation
+    # - ZSWAP evicts cold pages to disk, keeping RAM for hot data
+    # - ZRAM pages "stick" forever, wasting RAM with cold data
+    # - ZSWAP shrinker (kernel 6.8+) prevents OOM conditions
     if [ -z "$SWAP_RAM_SOLUTION" ] || [ "$SWAP_RAM_SOLUTION" = "auto" ]; then
-        # Decision tree based on RAM and storage type
+        # Always use ZSWAP - it's superior to ZRAM for all RAM sizes
+        # The only difference is pool size tuning based on RAM
+        SWAP_RAM_SOLUTION="zswap"
         if [ "$RAM_GB" -ge 16 ]; then
-            # High RAM systems: ZSWAP is optimal (low overhead, good compression)
-            SWAP_RAM_SOLUTION="zswap"
-            log_info "Auto-selected: ZSWAP (high RAM system ≥16GB)"
+            log_info "Auto-selected: ZSWAP (high RAM system ≥16GB, 15-20% pool recommended)"
         elif [ "$RAM_GB" -ge 4 ]; then
-            # Medium RAM: ZSWAP recommended for balanced performance
-            SWAP_RAM_SOLUTION="zswap"
-            log_info "Auto-selected: ZSWAP (medium RAM system)"
+            log_info "Auto-selected: ZSWAP (medium RAM system, 25-30% pool recommended)"
         else
-            # Low RAM: ZRAM for maximum compression and performance
-            SWAP_RAM_SOLUTION="zram"
-            log_info "Auto-selected: ZRAM (low RAM system <4GB, maximizes available memory)"
+            log_info "Auto-selected: ZSWAP (low RAM system <4GB, 30-40% pool for max compression)"
+            log_info "Note: ZSWAP is preferred over ZRAM even for low RAM - cold page eviction saves memory"
         fi
     else
         log_info "SWAP_RAM_SOLUTION explicitly set: $SWAP_RAM_SOLUTION"
+        # Warn if ZRAM is explicitly selected
+        if [ "$SWAP_RAM_SOLUTION" = "zram" ]; then
+            log_warn "ZRAM selected - consider ZSWAP instead for better hot/cold page management"
+            log_warn "See chat-merged.md for detailed ZSWAP vs ZRAM comparison"
+        fi
     fi
     
     # Auto-detect SWAP_BACKING_TYPE if not set or set to "auto"
