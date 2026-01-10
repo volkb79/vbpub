@@ -49,6 +49,98 @@ Environment Variables:
 
 **Why:** This comment appears in the server's `authorized_keys` file, helping administrators identify which key belongs to which developer, machine, or system.
 
+
+### SSH Config
+
+Create `~/.ssh/config` entries for convenience:
+
+```
+Host netcup-prod
+    HostName hosting218629.ae98d.netcup.net
+    User hosting218629
+    IdentityFile ~/.ssh/netcup-hosting218629-ed25519
+    
+Host github
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/github-vb-ed25519
+```
+
+## USAGE 
+
+**New:** on local system (server mode), send private key via Telegram
+```bash
+TELEGRAM_BOT_TOKEN=123:abc \
+TELEGRAM_CHAT_ID=456 \
+./ssh-keygen-deploy.py --user root --send-private --non-interactive
+```
+**New:** on remote system (client mode), deploy public key via ssh-copy-id
+```bash
+./ssh-keygen-deploy.py \
+  --remote hosting218629@hosting218629.ae98d.netcup.net \
+  --key-owner vb \
+  --key-hostname gstammtisch.dchive.de \
+  --service netcup
+```
+
+### Pattern 1: Bootstrap Server Setup
+
+```bash
+# Complete bootstrap with SSH key
+curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | \
+TELEGRAM_BOT_TOKEN=<token> \
+TELEGRAM_CHAT_ID=<chat-id> \
+SETUP_SSH_ACCESS=yes \
+SSH_ACCESS_USER=root \
+bash
+```
+
+### Pattern 2: Manual Server Setup
+
+```bash
+# Clone repo
+git clone https://github.com/volkb79/vbpub.git /opt/vbpub
+
+# Generate and send key
+export TELEGRAM_BOT_TOKEN="<token>"
+export TELEGRAM_CHAT_ID="<chat-id>"
+
+python3 /opt/vbpub/scripts/ssh-keygen-deploy.py \
+  --user root \
+  --send-private \
+  --non-interactive
+```
+
+### Pattern 3: Client Access Setup
+
+```bash
+# For accessing Netcup hosting
+./ssh-keygen-deploy.py \
+  --remote hosting218629@hosting218629.ae98d.netcup.net \
+  --key-owner vb \
+  --key-hostname workstation \
+  --service netcup
+
+# For accessing GitHub
+./ssh-keygen-deploy.py \
+  --remote git@github.com \
+  --key-owner vb \
+  --key-hostname laptop \
+  --service github
+```
+
+### Pattern 4: Automated CI/CD
+
+```bash
+# No passphrase, deploy to production
+./ssh-keygen-deploy.py \
+  --remote deploy@prod.example.com \
+  --key-owner ci-bot \
+  --key-hostname github-actions \
+  --service production \
+  --non-interactive
+```
+
 """
 
 import argparse

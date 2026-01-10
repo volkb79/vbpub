@@ -2440,15 +2440,26 @@ def export_shell_config(results, output_file):
                 
                 # Map block size to page-cluster
                 block_to_cluster = {4: 0, 8: 1, 16: 2, 32: 3, 64: 4, 128: 5}
-                cluster = block_to_cluster.get(best_matrix.get('block_size_kb'), 0)
+                cluster_disk_optimal = block_to_cluster.get(best_matrix.get('block_size_kb'), 0)
+                
+                # CRITICAL: Matrix test finds optimal DISK block size, NOT ZSWAP readahead
+                # ZSWAP is a RAM cache - no seek cost, readahead wastes bandwidth
+                # ALWAYS use page-cluster=0 for ZSWAP systems (see chat-merged.md section 2.2)
+                cluster_zswap = 0
                 
                 f.write(f"# Matrix test result: {best_matrix.get('block_size_kb')}KB "
                        f"× {best_matrix.get('num_jobs')} jobs\n")
-                f.write(f"# Combined throughput: "
+                f.write(f"# Disk I/O throughput: "
                        f"{best_matrix.get('write_mb_per_sec', 0) + best_matrix.get('read_mb_per_sec', 0):.0f} MB/s\n")
-                f.write(f"# Recommended: vm.page-cluster={cluster}\n")
-                f.write(f"# NOTE: For ZSWAP, page-cluster=0 is often better (see chat-merged.md)\n")
-                f.write(f"SWAP_PAGE_CLUSTER={cluster}\n\n")
+                f.write(f"# Optimal DISK page-cluster: {cluster_disk_optimal} ({best_matrix.get('block_size_kb')}KB blocks)\n")
+                f.write(f"#\n")
+                f.write(f"# IMPORTANT: For ZSWAP (RAM cache), page-cluster MUST be 0\n")
+                f.write(f"# - ZSWAP caches individual 4KB pages, no seek cost\n")
+                f.write(f"# - Readahead wastes memory bandwidth and cache space\n")
+                f.write(f"# - See chat-merged.md lines 168-179 for rationale\n")
+                f.write(f"#\n")
+                f.write(f"SWAP_PAGE_CLUSTER={cluster_zswap}  # Always 0 for ZSWAP\n")
+                f.write(f"SWAP_PAGE_CLUSTER_DISK={cluster_disk_optimal}  # Use this if disk-only swap (no ZSWAP)\n\n")
                 page_cluster_written = True
         
         # Fallback to deprecated block_sizes test
@@ -3587,27 +3598,32 @@ def format_benchmark_html(results):
     # Matrix test results (block size × concurrency)
     if 'matrix' in results and isinstance(results['matrix'], dict) and 'optimal' in results['matrix']:
         matrix = results['matrix']
-        html += "<b>🎯 Optimal Configuration (Matrix Test):</b>\n"
+        html += "<b>🎯 Optimal Configuration:</b>\n\n"
         
+        # Show disk I/O optimization results
+        html += "  <b>📀 Disk I/O Optimized:</b>\n"
         if 'best_combined' in matrix.get('optimal', {}):
             best = matrix['optimal']['best_combined']
-            html += f"  Best Overall: {best['block_size_kb']}KB × {best['concurrency']} jobs = {best['throughput_mb_per_sec']:.0f} MB/s\n"
+            html += f"  Best: {best['block_size_kb']}KB × {best['concurrency']} jobs = {best['throughput_mb_per_sec']:.0f} MB/s\n"
         
-        if 'best_write' in matrix.get('optimal', {}):
-            best_w = matrix['optimal']['best_write']
-            html += f"  Best Write: {best_w['block_size_kb']}KB × {best_w['concurrency']} jobs = {best_w['throughput_mb_per_sec']:.0f} MB/s\n"
+        if 'recommended_swap_stripe_width' in matrix.get('optimal', {}):
+            rec_width = matrix['optimal']['recommended_swap_stripe_width']
+            html += f"  SWAP_STRIPE_WIDTH={rec_width} ✅\n"
         
-        if 'best_read' in matrix.get('optimal', {}):
-            best_r = matrix['optimal']['best_read']
-            html += f"  Best Read: {best_r['block_size_kb']}KB × {best_r['concurrency']} jobs = {best_r['throughput_mb_per_sec']:.0f} MB/s\n"
-        
-        # Show recommended settings
+        # Show ZSWAP-specific configuration
+        html += "\n  <b>💾 ZSWAP Configuration:</b>\n"
         if 'recommended_page_cluster' in matrix.get('optimal', {}):
-            rec_cluster = matrix['optimal']['recommended_page_cluster']
-            rec_width = matrix['optimal'].get('recommended_swap_stripe_width', 'N/A')
-            html += f"\n  <i>Recommended:</i>\n"
-            html += f"  SWAP_PAGE_CLUSTER={rec_cluster}\n"
-            html += f"  SWAP_STRIPE_WIDTH={rec_width}\n"
+            disk_cluster = matrix['optimal']['recommended_page_cluster']
+            html += f"  SWAP_PAGE_CLUSTER=0 ✅ (not {disk_cluster}!)\n"
+        else:
+            html += f"  SWAP_PAGE_CLUSTER=0 ✅\n"
+        html += "  <i>Reason: ZSWAP is RAM cache, no seek cost</i>\n"
+        if 'best_combined' in matrix.get('optimal', {}):
+            best = matrix['optimal']['best_combined']
+            html += f"  <i>{best['block_size_kb']}KB readahead wastes bandwidth</i>\n"
+        
+        html += "\n  ⚠️ <i>Matrix test shows DISK performance.</i>\n"
+        html += "  <i>For ZSWAP+disk hybrid, use page-cluster=0.</i>\n"
         html += "\n"
     
     # ZSWAP vs ZRAM comparison
@@ -3762,16 +3778,36 @@ def format_benchmark_html(results):
         if compression_ratio > 1.0:
             ram_gb = results['system_info'].get('ram_gb', 0)
             if ram_gb > 0:
-                # Calculate effective capacity (assuming swap uses all RAM for compression)
-                effective_capacity_gb = ram_gb * compression_ratio
-                space_saved_gb = effective_capacity_gb - ram_gb
-                efficiency_pct = ((compression_ratio - 1.0) / 1.0) * 100
+                # Calculate ZSWAP pool size dynamically:
+                # - 2GB RAM: 50% pool (maximize compression with zstd)
+                # - 16GB RAM: 25% pool (use lz4 for speed)
+                # - Scale linearly between these points
+                if ram_gb <= 2:
+                    zswap_pool_pct = 50
+                elif ram_gb >= 16:
+                    zswap_pool_pct = 25
+                else:
+                    # Linear interpolation: 50% at 2GB, 25% at 16GB
+                    # slope = (25 - 50) / (16 - 2) = -25/14 ≈ -1.786 per GB
+                    zswap_pool_pct = 50 - ((ram_gb - 2) * 1.786)
                 
-                html += "<b>💾 Space Efficiency (Optimal Config):</b>\n"
+                zswap_pool_gb = ram_gb * (zswap_pool_pct / 100)
+                zswap_effective_gb = zswap_pool_gb * compression_ratio
+                disk_swap_gb = ram_gb * 2  # Per new 2x sizing policy
+                total_virtual_gb = ram_gb + zswap_effective_gb + disk_swap_gb
+                
+                html += "<b>💾 Virtual Memory Capacity:</b>\n"
                 html += f"  Physical RAM: {ram_gb:.1f}GB\n"
-                html += f"  Best Compressor: {compressor_name} ({compression_ratio:.1f}x)\n"
-                html += f"  Effective Capacity: {effective_capacity_gb:.1f}GB\n"
-                html += f"  Space Saved: {space_saved_gb:.1f}GB ({efficiency_pct:.0f}% more capacity)\n"
+                html += f"  ZSWAP pool: {zswap_pool_gb:.1f}GB ({zswap_pool_pct:.0f}% of RAM)\n"
+                html += f"  ZSWAP effective: {zswap_effective_gb:.1f}GB (@ {compression_ratio:.1f}x {compressor_name})\n"
+                html += f"  Disk swap: {disk_swap_gb:.0f}GB (2× RAM per config)\n"
+                html += f"  ────────────────────────────\n"
+                html += f"  Total Virtual: ~{total_virtual_gb:.1f}GB\n"
+                html += f"\n"
+                html += f"  <i>Breakdown:</i>\n"
+                html += f"  <i>- Active apps: {ram_gb:.1f}GB RAM</i>\n"
+                html += f"  <i>- ZSWAP cache: {zswap_effective_gb:.1f}GB effective (hot pages)</i>\n"
+                html += f"  <i>- Disk overflow: {disk_swap_gb:.0f}GB (cold pages)</i>\n"
                 html += "\n"
     
     # Memory-only comparison
