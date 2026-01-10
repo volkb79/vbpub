@@ -246,6 +246,10 @@ def log_debug_ts(msg):
     """Log debug message with timestamp"""
     print(f"{Colors.CYAN}[DEBUG]{Colors.NC} {format_timestamp()} {msg}", flush=True)
 
+def log_success_ts(msg):
+    """Log success message with timestamp"""
+    print(f"{Colors.GREEN}[SUCCESS]{Colors.NC} {format_timestamp()} {msg}", flush=True)
+
 
 def log_info(msg):
     print(f"{Colors.GREEN}[INFO]{Colors.NC} {msg}", flush=True)
@@ -261,6 +265,9 @@ def log_error(msg):
 
 def log_step(msg):
     print(f"{Colors.BLUE}[STEP]{Colors.NC} {msg}", flush=True)
+
+def log_success(msg):
+    print(f"{Colors.GREEN}[SUCCESS]{Colors.NC} {msg}", flush=True)
 
 
 
@@ -1855,25 +1862,55 @@ def create_temp_swap_files(total_size_mb=2048, num_files=4):
     """Create temporary swap files for ZSWAP testing before partitions exist"""
     swap_files = []
     file_size_mb = total_size_mb // num_files
-    
-    # Check available space in /tmp or /root
-    import shutil
-    stat = shutil.disk_usage('/tmp')
-    available_gb = stat.free / (1024**3)
-    
-    if available_gb < (total_size_mb / 1024) + 1:
-        log_warn(f"Insufficient space in /tmp ({available_gb:.1f}GB), trying /root")
-        base_dir = '/root'
-    else:
-        base_dir = '/tmp'
+
+    def _fs_type(path: str) -> str:
+        try:
+            r = subprocess.run(['stat', '-f', '-c', '%T', path], capture_output=True, text=True, check=False)
+            return (r.stdout or '').strip()
+        except Exception:
+            return ''
+
+    def _has_space(path: str, needed_mb: int) -> bool:
+        try:
+            import shutil
+            stat = shutil.disk_usage(path)
+            # +1GiB cushion
+            return stat.free >= (needed_mb * 1024 * 1024 + 1024**3)
+        except Exception:
+            return False
+
+    # Prefer disk-backed dirs (NOT tmpfs), since swapon on tmpfs often fails with "Invalid argument"
+    candidates = ['/var/tmp', '/root', '/tmp']
+    base_dir = None
+    for candidate in candidates:
+        if not os.path.isdir(candidate):
+            continue
+        fstype = _fs_type(candidate)
+        if fstype in {'tmpfs', 'ramfs', 'overlay', 'squashfs'}:
+            continue
+        if _has_space(candidate, total_size_mb):
+            base_dir = candidate
+            break
+    if base_dir is None:
+        # Last resort: try /var/tmp even if fstype detection failed
+        base_dir = '/var/tmp' if os.path.isdir('/var/tmp') else '/root'
     
     try:
         for i in range(num_files):
-            swap_file = f"{base_dir}/swap_test_{i}"
-            log_info(f"Creating {file_size_mb}MB swap file: {swap_file}")
-            subprocess.run(['dd', 'if=/dev/zero', f'of={swap_file}', 
-                          'bs=1M', f'count={file_size_mb}'], 
-                          capture_output=True, check=True)
+            swap_file = f"{base_dir}/swap_test_{os.getpid()}_{i}"
+            log_info(f"Creating {file_size_mb}MB swap file: {swap_file} (dir={base_dir})")
+
+            # Prefer fallocate (fast) but fall back to dd
+            fallocate_ok = subprocess.run(
+                ['fallocate', '-l', f'{file_size_mb}M', swap_file],
+                capture_output=True
+            ).returncode == 0
+            if not fallocate_ok:
+                subprocess.run(
+                    ['dd', 'if=/dev/zero', f'of={swap_file}', 'bs=1M', f'count={file_size_mb}'],
+                    capture_output=True,
+                    check=True
+                )
             subprocess.run(['chmod', '600', swap_file], check=True)
             subprocess.run(['mkswap', swap_file], capture_output=True, check=True)
             subprocess.run(['swapon', swap_file], check=True)
@@ -5022,25 +5059,41 @@ Examples:
                 
                 # Send charts as media group (single message with all charts)
                 if chart_files:
-                    log_info(f"Sending {len(chart_files)} performance charts as media group...")
-                    caption = f"📊 Benchmark Charts ({len(chart_files)} charts)"
-                    if telegram.send_media_group(chart_files, caption=caption):
-                        log_info(f"✓ Sent all {len(chart_files)} charts in single message")
-                    else:
-                        log_warn("Failed to send charts as media group, falling back to individual messages")
-                        # Fallback: send charts one by one
+                    # Telegram media groups are limited (10 items).
+                    max_group = 10
+                    groups = [chart_files[i:i + max_group] for i in range(0, len(chart_files), max_group)]
+
+                    log_info_ts(f"Sending {len(chart_files)} performance charts in {len(groups)} media group(s)...")
+
+                    all_groups_sent = True
+                    for gi, group in enumerate(groups, start=1):
+                        caption = f"📊 Benchmark Charts ({len(chart_files)} charts) — group {gi}/{len(groups)}"
+                        t0 = time.time()
+                        ok = telegram.send_media_group(group, caption=caption)
+                        dt = time.time() - t0
+                        if ok:
+                            log_success_ts(f"Sent media group {gi}/{len(groups)} ({len(group)} charts) in {dt:.1f}s")
+                        else:
+                            all_groups_sent = False
+                            log_warn_ts(f"Media group {gi}/{len(groups)} failed after {dt:.1f}s")
+                            break
+
+                    if not all_groups_sent:
+                        log_warn_ts("Falling back to individual chart sends (this can be slow)")
                         # Use the timestamp_str variable defined at line 3520 for consistency
                         for chart_file in chart_files:
-                            # Handle both .png and .webp extensions
                             chart_name = os.path.basename(chart_file)
                             for ext in ['.png', '.webp']:
                                 chart_name = chart_name.replace(ext, '')
                             chart_name = chart_name.replace('benchmark-', '').replace('-' + timestamp_str, '')
                             caption = f"📊 {chart_name.title()} Chart"
-                            if telegram.send_document(chart_file, caption=caption):
-                                log_info(f"✓ Sent {chart_name} chart")
+                            t0 = time.time()
+                            ok = telegram.send_document(chart_file, caption=caption)
+                            dt = time.time() - t0
+                            if ok:
+                                log_success_ts(f"Sent {chart_name} chart in {dt:.1f}s")
                             else:
-                                log_warn(f"Failed to send {chart_name} chart")
+                                log_warn_ts(f"Failed to send {chart_name} chart (took {dt:.1f}s)")
             except ValueError as e:
                 log_error(f"Telegram configuration error: {e}")
             except Exception as e:

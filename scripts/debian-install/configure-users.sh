@@ -339,6 +339,7 @@ configure_bash_aliases() {
     local target_dir="$1"
     local bash_aliases="${target_dir}/.bash_aliases"
     local bashrc="${target_dir}/.bashrc"
+    local profile="${target_dir}/.profile"
     
     get_bash_aliases_content > "$bash_aliases"
     chmod 644 "$bash_aliases"
@@ -365,6 +366,27 @@ fi
 BASHRC_EOF
         chmod 644 "$bashrc"
     fi
+
+    # Ensure login shells source .bashrc (Debian usually does, but some images don't)
+    if [ -f "$profile" ]; then
+        if ! grep -q "\.bashrc" "$profile"; then
+            cat >> "$profile" <<'PROFILE_EOF'
+
+# Load interactive bash configuration for login shells
+if [ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ]; then
+    . "$HOME/.bashrc"
+fi
+PROFILE_EOF
+        fi
+    else
+        cat > "$profile" <<'PROFILE_EOF'
+# Load interactive bash configuration for login shells
+if [ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ]; then
+    . "$HOME/.bashrc"
+fi
+PROFILE_EOF
+        chmod 644 "$profile"
+    fi
 }
 
 # Configure all tools for a user
@@ -390,7 +412,7 @@ configure_user() {
     if [ "$target_user" != "skel" ]; then
         chown -R "${target_user}:${target_user}" "$target_home/.nanorc" \
             "$target_home/.config" "$target_home/.iftoprc" \
-            "$target_home/.bash_aliases" 2>/dev/null || true
+            "$target_home/.bash_aliases" "$target_home/.profile" 2>/dev/null || true
     fi
     
     log_success "User ${target_user} configuration complete"

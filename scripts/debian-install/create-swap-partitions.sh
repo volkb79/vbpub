@@ -169,8 +169,13 @@ log_info "Root filesystem: $FS_TYPE"
 # Validate filesystem type for shrinking (if needed)
 if [ "$DISK_LAYOUT" = "full_root" ]; then
     case "$FS_TYPE" in
-        ext4|ext3|ext2|btrfs)
-            log_info "Filesystem supports resizing: $FS_TYPE"
+        btrfs)
+            log_info "Filesystem supports online shrinking: $FS_TYPE"
+            ;;
+        ext4|ext3|ext2)
+            log_warn "FULL ROOT on $FS_TYPE: will shrink partition end only (no online filesystem shrink)"
+            log_warn "Assumption: filesystem has free space at the end; this is NOT validated here"
+            log_warn "Expected follow-up: reboot and let fsck reconcile filesystem/partition size"
             ;;
         xfs)
             log_error "XFS does not support shrinking - cannot proceed with full_root layout"
@@ -310,22 +315,57 @@ log_info "  New swap partitions: ${OPTIMAL_DEVICES} × ${PER_DEVICE_GB}GB"
 # Write modified partition table
 log_step "Writing modified partition table to disk..."
 
-if sfdisk --force "/dev/$ROOT_DISK" < "$PTABLE_NEW" 2>&1 | tee -a "$LOG_FILE"; then
+if sfdisk --force --no-reread "/dev/$ROOT_DISK" < "$PTABLE_NEW" 2>&1 | tee -a "$LOG_FILE"; then
     log_info "Partition table written (Device or resource busy is NORMAL)"
 else
-    log_error "Failed to write partition table"
+    log_warn "sfdisk returned non-zero (expected sometimes for in-use disk); verifying state instead"
+fi
+
+log_step "Verifying partition table state (dump + expected entries)..."
+
+READBACK_FILE="/tmp/ptable-readback-$(date +%s).dump"
+if ! sfdisk --dump "/dev/$ROOT_DISK" > "$READBACK_FILE" 2>&1; then
+    log_error "Failed to read back partition table after write"
+    log_error "Backup: $BACKUP_FILE"
+    exit 1
+fi
+
+# Root size check
+READBACK_ROOT_SIZE=$(grep -E "^${ROOT_PARTITION}[[:space:]]" "$READBACK_FILE" | sed -E 's/.*size= *([0-9]+).*/\1/' | head -1)
+if [ -z "${READBACK_ROOT_SIZE:-}" ]; then
+    log_error "Could not find root partition entry in readback dump"
+    log_error "Readback: $READBACK_FILE"
+    exit 1
+fi
+if [ "$READBACK_ROOT_SIZE" != "$NEW_ROOT_SIZE_SECTORS" ]; then
+    log_error "Root partition size mismatch after write"
+    log_error "Expected: $NEW_ROOT_SIZE_SECTORS sectors; Found: $READBACK_ROOT_SIZE sectors"
     log_error "Restore with: sfdisk --force /dev/$ROOT_DISK < $BACKUP_FILE"
     exit 1
 fi
 
-# Verify partition table
-log_step "Verifying partition table..."
-if sfdisk --verify "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
-    log_success "Partition table verified"
-else
-    log_error "Partition table verification failed"
+# Swap partition entries check
+missing=0
+for i in $(seq 1 "$OPTIMAL_DEVICES"); do
+    SWAP_PART_NUM=$((ROOT_PART_NUM + i))
+    if [[ "$ROOT_DISK" =~ nvme ]]; then
+        EXPECTED_PART="/dev/${ROOT_DISK}p${SWAP_PART_NUM}"
+    else
+        EXPECTED_PART="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
+    fi
+    if ! grep -q -E "^${EXPECTED_PART}[[:space:]]" "$READBACK_FILE"; then
+        log_warn "Missing expected swap partition entry in table: $EXPECTED_PART"
+        missing=1
+    fi
+done
+
+if [ "$missing" -ne 0 ]; then
+    log_error "Partition table does not contain all expected swap partitions"
+    log_error "Readback: $READBACK_FILE"
+    log_error "Restore with: sfdisk --force /dev/$ROOT_DISK < $BACKUP_FILE"
     exit 1
 fi
+log_success "Partition table state verified via readback dump"
 
 # Sync and force write
 log_info "Syncing disk writes..."
@@ -357,7 +397,27 @@ fi
 
 # Wait for device nodes to appear
 log_info "Waiting for device nodes to appear..."
-sleep 3
+sleep 1
+
+log_info "Waiting for kernel to expose new partitions..."
+expected_last_num=$((ROOT_PART_NUM + OPTIMAL_DEVICES))
+if [[ "$ROOT_DISK" =~ nvme ]]; then
+    expected_last_name="${ROOT_DISK}p${expected_last_num}"
+else
+    expected_last_name="${ROOT_DISK}${expected_last_num}"
+fi
+
+for retry in {1..20}; do
+    if lsblk -n -o NAME "/dev/$ROOT_DISK" 2>/dev/null | grep -q "^${expected_last_name}$"; then
+        break
+    fi
+    sleep 1
+done
+
+if ! lsblk -n -o NAME "/dev/$ROOT_DISK" 2>/dev/null | grep -q "^${expected_last_name}$"; then
+    log_warn "Kernel does not yet show expected last partition: /dev/${expected_last_name}"
+    log_warn "Continuing, but swap partition formatting may fail until nodes appear"
+fi
 
 # Verify partitions are visible
 log_info "Verifying new partitions..."
@@ -381,14 +441,9 @@ case "$FS_TYPE" in
                 exit 1
             fi
         else
-            log_info "Shrinking filesystem to match partition..."
-            TARGET_SIZE="${NEW_ROOT_SIZE_SECTORS}s"  # 's' suffix for sectors
-            if resize2fs "$ROOT_PARTITION" "$TARGET_SIZE" 2>&1 | tee -a "$LOG_FILE"; then
-                log_success "Filesystem shrunk"
-            else
-                log_error "Failed to shrink filesystem"
-                exit 1
-            fi
+            log_warn "Skipping online filesystem shrink on mounted ext* root"
+            log_warn "Partition table was updated to a smaller root size; schedule a reboot and fsck"
+            log_warn "If the filesystem had allocated blocks beyond the new end, corruption is possible"
         fi
         ;;
     xfs)

@@ -149,6 +149,7 @@ import sys
 import subprocess
 import socket
 import logging
+import pwd
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Tuple
@@ -176,7 +177,16 @@ class SSHKeyManager:
     ):
         self.user = user
         self.algorithm = algorithm
-        self.key_storage_path = Path(key_storage_path or f'/home/{user}/.ssh')
+
+        if key_storage_path:
+            self.key_storage_path = Path(key_storage_path)
+        else:
+            try:
+                home_dir = pwd.getpwnam(user).pw_dir
+            except KeyError:
+                home_dir = f'/home/{user}'
+            self.key_storage_path = Path(home_dir) / '.ssh'
+
         self.telegram_bot_token = telegram_bot_token or os.environ.get('TELEGRAM_BOT_TOKEN')
         self.telegram_chat_id = telegram_chat_id or os.environ.get('TELEGRAM_CHAT_ID')
         self.non_interactive = non_interactive or os.environ.get('NONINTERACTIVE', '').lower() == 'yes'

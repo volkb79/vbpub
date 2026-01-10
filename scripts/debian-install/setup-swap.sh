@@ -63,6 +63,7 @@ fi
 # RAM-based swap configuration
 SWAP_RAM_SOLUTION="${SWAP_RAM_SOLUTION:-auto}"  # zram, zswap, none (auto = auto-detect)
 SWAP_RAM_TOTAL_GB="${SWAP_RAM_TOTAL_GB:-auto}"  # RAM dedicated to compression (auto = calculated)
+ZSWAP_POOL_PERCENT="${ZSWAP_POOL_PERCENT:-auto}"  # ZSWAP pool limit as % of RAM (auto = derived from SWAP_RAM_TOTAL_GB)
 ZRAM_COMPRESSOR="${ZRAM_COMPRESSOR:-lz4}"  # lz4, zstd, lzo-rle (can be overridden by benchmark)
 ZRAM_ALLOCATOR="${ZRAM_ALLOCATOR:-zsmalloc}"  # zsmalloc, z3fold, zbud (can be overridden by benchmark)
 ZRAM_PRIORITY="${ZRAM_PRIORITY:-100}"  # Priority for ZRAM (higher = preferred)
@@ -72,7 +73,7 @@ ZSWAP_ZPOOL="${ZSWAP_ZPOOL:-z3fold}"  # z3fold, zbud, zsmalloc
 # Disk-based swap configuration
 SWAP_DISK_TOTAL_GB="${SWAP_DISK_TOTAL_GB:-auto}"  # Total disk-based swap (auto = calculated)
 SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE:-auto}"  # files_in_root, partitions_swap, partitions_zvol, files_in_partitions, none (auto = auto-detect)
-SWAP_STRIPE_WIDTH="${SWAP_STRIPE_WIDTH:-8}"  # Number of parallel swap devices (for I/O striping)
+SWAP_STRIPE_WIDTH="${SWAP_STRIPE_WIDTH:-auto}"  # Number of parallel swap devices (for I/O striping)
 SWAP_PRIORITY="${SWAP_PRIORITY:-10}"  # Priority for disk swap (lower than RAM)
 EXTEND_ROOT="${EXTEND_ROOT:-yes}"  # Extend root partition when creating swap partitions at end of disk
 
@@ -268,8 +269,7 @@ auto_detect_swap_configuration() {
     #
     # Users can still override by explicitly setting SWAP_RAM_SOLUTION=zram
     # The pool size recommendations below are informational only.
-    # Actual pool size is configured via ZSWAP_POOL_PERCENT (default: 20%)
-    # which can be set via environment variable or adjusted based on RAM in setup_zswap()
+    # Actual pool size is derived from SWAP_RAM_TOTAL_GB (or ZSWAP_POOL_PERCENT override).
     if [ -z "$SWAP_RAM_SOLUTION" ] || [ "$SWAP_RAM_SOLUTION" = "auto" ]; then
         # Always use ZSWAP - it's superior to ZRAM for all RAM sizes
         # The only difference is pool size tuning based on RAM
@@ -423,10 +423,17 @@ calculate_swap_sizes() {
     
     # Calculate SWAP_RAM_TOTAL_GB if auto
     if [ "$SWAP_RAM_TOTAL_GB" = "auto" ]; then
-        SWAP_RAM_TOTAL_GB=$((RAM_GB / 2))
+        local pct=30
+        if [ "$RAM_GB" -ge 16 ]; then
+            pct=20
+        elif [ "$RAM_GB" -lt 4 ]; then
+            pct=40
+        fi
+        # Rounded integer GB
+        SWAP_RAM_TOTAL_GB=$(( (RAM_GB * pct + 50) / 100 ))
         [ "$SWAP_RAM_TOTAL_GB" -lt 1 ] && SWAP_RAM_TOTAL_GB=1
         [ "$SWAP_RAM_TOTAL_GB" -gt 16 ] && SWAP_RAM_TOTAL_GB=16
-        log_info "RAM swap size: ${SWAP_RAM_TOTAL_GB}GB (50% of RAM)"
+        log_info "RAM swap size: ${SWAP_RAM_TOTAL_GB}GB (~${pct}% of RAM; capped at 16GB)"
     fi
     
     # If SWAP_RAM_SOLUTION is none or SWAP_RAM_TOTAL_GB is 0, disable RAM swap
@@ -435,6 +442,40 @@ calculate_swap_sizes() {
         log_info "RAM-based swap compression disabled"
     fi
     
+    # Resolve SWAP_STRIPE_WIDTH if auto (prefer benchmark-exported value if present)
+    if [ "${SWAP_STRIPE_WIDTH:-}" = "auto" ]; then
+        local width=4
+        if [ "$CPU_CORES" -ge 16 ]; then
+            width=16
+        elif [ "$CPU_CORES" -ge 8 ]; then
+            width=8
+        elif [ "$CPU_CORES" -ge 4 ]; then
+            width=4
+        else
+            width=2
+        fi
+
+        if [ "$SWAP_DISK_TOTAL_GB" -gt 0 ] && [ "$width" -gt "$SWAP_DISK_TOTAL_GB" ]; then
+            width="$SWAP_DISK_TOTAL_GB"
+        fi
+        [ "$width" -lt 1 ] && width=1
+        SWAP_STRIPE_WIDTH="$width"
+        log_info "Stripe width auto-selected: ${SWAP_STRIPE_WIDTH} (CPU=${CPU_CORES}, diskSwap=${SWAP_DISK_TOTAL_GB}GB)"
+    fi
+
+    # Derive ZSWAP pool percent from SWAP_RAM_TOTAL_GB unless explicitly overridden
+    if [ "${ZSWAP_POOL_PERCENT:-}" = "auto" ] && [ "$SWAP_RAM_SOLUTION" = "zswap" ] && [ "$SWAP_RAM_TOTAL_GB" -gt 0 ]; then
+        # ceil(SWAP_RAM_TOTAL_GB / RAM_GB * 100)
+        if [ "$RAM_GB" -gt 0 ]; then
+            ZSWAP_POOL_PERCENT=$(( (SWAP_RAM_TOTAL_GB * 100 + RAM_GB - 1) / RAM_GB ))
+        else
+            ZSWAP_POOL_PERCENT=20
+        fi
+        [ "$ZSWAP_POOL_PERCENT" -lt 5 ] && ZSWAP_POOL_PERCENT=5
+        [ "$ZSWAP_POOL_PERCENT" -gt 60 ] && ZSWAP_POOL_PERCENT=60
+        log_info "ZSWAP pool percent derived: ${ZSWAP_POOL_PERCENT}% (from SWAP_RAM_TOTAL_GB=${SWAP_RAM_TOTAL_GB}GB)"
+    fi
+
     # Calculate per-device size for striping
     if [ "$SWAP_DISK_TOTAL_GB" -gt 0 ]; then
         SWAP_DEVICE_SIZE_GB=$((SWAP_DISK_TOTAL_GB / SWAP_STRIPE_WIDTH))
@@ -519,9 +560,7 @@ print_system_analysis_and_plan() {
             echo "  Allocator:     ${ZRAM_ALLOCATOR}"
             echo "  Priority:      ${ZRAM_PRIORITY}"
         elif [ "$SWAP_RAM_SOLUTION" = "zswap" ]; then
-            # Calculate actual pool size in GB
-            POOL_SIZE_GB=$(awk "BEGIN {printf \"%.1f\", ${RAM_GB} * 0.20}")
-            echo "  Pool Size:     20% of RAM (~${POOL_SIZE_GB}GB)"
+            echo "  Pool Size:     ${ZSWAP_POOL_PERCENT}% of RAM (~${SWAP_RAM_TOTAL_GB}GB)"
             echo "  Compressor:    ${ZSWAP_COMPRESSOR}"
             echo "  Zpool:         ${ZSWAP_ZPOOL}"
         fi
@@ -585,7 +624,7 @@ print_system_analysis_and_plan() {
         echo "  ${step}. Create ZRAM device (${SWAP_RAM_TOTAL_GB}GB compressed)"
         ((step++))
     elif [ "$SWAP_RAM_SOLUTION" = "zswap" ] && [ "$SWAP_RAM_TOTAL_GB" -gt 0 ]; then
-        echo "  ${step}. Enable ZSWAP (20% pool, ${ZSWAP_COMPRESSOR} compression)"
+        echo "  ${step}. Enable ZSWAP (${ZSWAP_POOL_PERCENT}% pool, ${ZSWAP_COMPRESSOR} compression)"
         ((step++))
     fi
     
@@ -679,11 +718,9 @@ print_system_analysis_and_plan() {
   - Allocator: ${ZRAM_ALLOCATOR}
   - Priority: ${ZRAM_PRIORITY}"
             elif [ "$SWAP_RAM_SOLUTION" = "zswap" ]; then
-                # Calculate actual pool size in GB
-                POOL_SIZE_GB=$(awk "BEGIN {printf \"%.1f\", ${RAM_GB} * 0.20}")
                 telegram_msg="${telegram_msg}
   - Compressor: ${ZSWAP_COMPRESSOR}
-  - Pool: 20% of RAM (~${POOL_SIZE_GB}GB)
+    - Pool: ${ZSWAP_POOL_PERCENT}% of RAM (~${SWAP_RAM_TOTAL_GB}GB)
   - Zpool: ${ZSWAP_ZPOOL}"
             fi
         fi
@@ -716,7 +753,7 @@ ${step}. Create ZRAM device (${SWAP_RAM_TOTAL_GB}GB compressed)"
             ((step++))
         elif [ "$SWAP_RAM_SOLUTION" = "zswap" ] && [ "$SWAP_RAM_TOTAL_GB" -gt 0 ]; then
             telegram_msg="${telegram_msg}
-${step}. Enable ZSWAP (20% pool, ${ZSWAP_COMPRESSOR} compression)"
+${step}. Enable ZSWAP (${ZSWAP_POOL_PERCENT}% pool, ${ZSWAP_COMPRESSOR} compression)"
             ((step++))
         fi
         
@@ -914,9 +951,12 @@ EOF
 # Setup ZSWAP
 setup_zswap() {
     log_step "Setting up ZSWAP"
-    
-    # Use fixed 20% pool size
-    local ZSWAP_POOL_PERCENT=20
+
+    # Pool percent is derived in calculate_swap_sizes unless explicitly overridden
+    if [ "${ZSWAP_POOL_PERCENT:-}" = "auto" ]; then
+        # Safe fallback if setup_zswap is called unexpectedly early
+        ZSWAP_POOL_PERCENT=20
+    fi
     
     # Enable ZSWAP
     if [ -d /sys/module/zswap ]; then
@@ -1448,16 +1488,10 @@ create_swap_partition() {
                 log_info "Checking ext filesystem integrity..."
                 # Online check (read-only, -n flag prevents modifications, -v for verbose)
                 e2fsck -n -v "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE" || true
-                
-                log_info "Resizing ext filesystem to match partition..."
-                if resize2fs "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
-                    log_success "Ext filesystem resized successfully"
-                else
-                    log_error "Failed to resize ext filesystem"
-                    log_warn "Partition table changed but filesystem not shrunk!"
-                    log_warn "System may be in inconsistent state - restore from backup: $BACKUP_FILE"
-                    return 1
-                fi
+
+                log_warn "Skipping online ext* filesystem shrink on mounted root"
+                log_warn "Partition table updated to a smaller root size (stealing tail free space)"
+                log_warn "Recommended: reboot and allow fsck to reconcile filesystem/partition size"
                 ;;
             btrfs)
                 log_info "Resizing btrfs filesystem..."
@@ -1744,7 +1778,7 @@ extend_root_partition() {
     
     # Step 3: Write modified partition table
     log_info "Step 3: Writing modified partition table..."
-    if sfdisk --force "/dev/$ROOT_DISK" < "$PTABLE_NEW" 2>&1 | tee -a "$LOG_FILE"; then
+    if sfdisk --force --no-reread "/dev/$ROOT_DISK" < "$PTABLE_NEW" 2>&1 | tee -a "$LOG_FILE"; then
         log_info "Modified partition table written (Device or resource busy is NORMAL)"
     else
         log_error "Failed to write modified partition table"
@@ -2084,7 +2118,11 @@ setup_swap_solution() {
             ;;
         partitions_swap)
             log_info "Setting up native swap partitions"
-            create_swap_partition
+            if ! create_swap_partition; then
+                log_warn "Swap partition setup failed (often due to in-use root disk). Falling back to swap files in root."
+                SWAP_BACKING_TYPE="files_in_root"
+                create_swap_files
+            fi
             ;;
         partitions_zvol)
             log_info "Setting up ZFS zvol swap"

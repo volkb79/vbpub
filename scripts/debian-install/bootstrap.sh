@@ -37,7 +37,7 @@ ZSWAP_ZPOOL="${ZSWAP_ZPOOL:-zbud}"  # zbud (most reliable), z3fold, zsmalloc
 # Disk-based swap
 SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE:-auto}"  # files_in_root, partitions_swap, partitions_zvol, files_in_partitions, none (auto-detected if not set)
 SWAP_DISK_TOTAL_GB="${SWAP_DISK_TOTAL_GB:-auto}"  # Total disk-based swap (auto = calculated)
-SWAP_STRIPE_WIDTH="${SWAP_STRIPE_WIDTH:-8}"  # Number of parallel swap devices (for I/O striping)
+SWAP_STRIPE_WIDTH="${SWAP_STRIPE_WIDTH:-auto}"  # Number of parallel swap devices (for I/O striping)
 SWAP_PRIORITY="${SWAP_PRIORITY:-10}"  # Priority for disk swap (lower than RAM)
 EXTEND_ROOT="${EXTEND_ROOT:-yes}"
 
@@ -73,6 +73,27 @@ log_error() { echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee
 log_debug() { 
     if [ "$DEBUG_MODE" = "yes" ]; then
         echo "[DEBUG] $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"
+    fi
+}
+
+log_root_layout() {
+    local root_part
+    root_part=$(findmnt -n -o SOURCE / 2>/dev/null || echo "")
+    if [ -z "$root_part" ]; then
+        log_warn "Could not determine root partition"
+        return 0
+    fi
+
+    log_info "Root mount source: $root_part"
+    df -h / 2>/dev/null | tee -a "$LOG_FILE" || true
+
+    local root_disk
+    root_disk=$(lsblk -no PKNAME "$root_part" 2>/dev/null | head -1 || true)
+    if [ -n "$root_disk" ] && [ -b "/dev/$root_disk" ]; then
+        log_info "Root disk layout: /dev/$root_disk"
+        lsblk -o NAME,SIZE,TYPE,MOUNTPOINT "/dev/$root_disk" 2>/dev/null | tee -a "$LOG_FILE" || true
+    else
+        log_warn "Could not determine root disk for $root_part"
     fi
 }
 
@@ -372,10 +393,16 @@ main() {
             if [ "$CREATE_SWAP_PARTITIONS" = "yes" ] && [ -f "$BENCHMARK_OUTPUT" ]; then
                 log_info "==> Creating optimized swap partitions from benchmark results"
                 log_info "This will modify disk partition table (root may be resized)"
+
+                log_info "==> Root layout BEFORE repartitioning"
+                log_root_layout
                 
                 export PRESERVE_ROOT_SIZE_GB
                 if ./create-swap-partitions.sh 2>&1 | tee -a "$LOG_FILE"; then
                     log_info "✓ Swap partitions created successfully"
+
+                    log_info "==> Root layout AFTER repartitioning"
+                    log_root_layout
                     
                     # Phase 3: Run ZSWAP latency tests with real partitions
                     if [ "$TEST_ZSWAP_LATENCY" = "yes" ]; then
