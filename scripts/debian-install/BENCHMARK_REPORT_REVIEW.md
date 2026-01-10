@@ -211,14 +211,16 @@ concurrency_levels = [1, 2, 4, 6, 8, 12, 16]
 # Purpose: Determine optimal number of swap devices for 4-32KB block size mix
 ```
 
-**Phase 2: Swap Partition Creation** ⏳ NEXT
+**Phase 2: Swap Partition Creation** ✅ COMPLETED
 ```bash
-# After matrix test completes:
-# 1. Query matrix results for best concurrency (e.g., 8 devices)
-# 2. Create that many swap partitions from available space
-# 3. Use lvresize or parted to shrink root and create swap partitions
-# 4. Format as swap with mkswap
-# 5. Enable with swapon (stripe width = optimal concurrency)
+# Implemented in: scripts/debian-install/create-swap-partitions.sh
+# Features:
+# 1. Reads benchmark results, extracts optimal concurrency
+# 2. Detects disk layout: MINIMAL ROOT or FULL ROOT
+# 3. Uses sfdisk dump-modify-write pattern (not LVM)
+# 4. Notifies kernel with partprobe + partx
+# 5. Formats as swap and enables with optimal count
+# 6. Adds to /etc/fstab using PARTUUID for stability
 ```
 
 **Phase 3: ZSWAP Latency Tests** ⏳ TODO
@@ -251,8 +253,8 @@ Latency Comparison:
 **Current Status:**
 - ✅ Matrix test now includes concurrency 12 and 16
 - ✅ Can determine optimal swap device count from matrix results
-- ⏳ Need to implement partition creation logic in bootstrap.sh
-- ⏳ Then can proceed with ZSWAP latency testing using real swap devices
+- ✅ Partition creation logic implemented in create-swap-partitions.sh
+- ⏳ Can now proceed with ZSWAP latency testing using real swap devices
 
 ### 4. **Improve Allocator Testing**
 
@@ -385,8 +387,9 @@ sudo ./benchmark.py --compare-zswap-zram
 4. **Add `benchmark_zswap_latency()` function** ⏳ IN PROGRESS
    - ✅ Extended matrix test to include concurrency 12 and 16
    - ✅ Matrix test can now determine optimal swap device count
-   - ⏳ NEXT: Implement partition creation based on matrix results
-   - ⏳ NEXT: Create real swap partitions (shrink root, create swap)
+   - ✅ Implemented partition creation based on matrix results
+   - ✅ Script creates real swap partitions (shrink/extend root, create swap)
+   - ⏳ NEXT: Implement benchmark_zswap_latency() function
    - ⏳ NEXT: Test hot cache hits using real swap backing
    - ⏳ NEXT: Test cold page faults using real swap backing
    - ⏳ NEXT: Compare with ZRAM baseline
@@ -456,7 +459,7 @@ Reality: ~29GB total virtual (7GB RAM + 8GB ZSWAP effective + 14GB disk)
 1. ✅ **DONE** - Fix `SWAP_PAGE_CLUSTER` export to always use 0 for ZSWAP
 2. ⏳ **IN PROGRESS** - Add ZSWAP latency testing
    - ✅ Extended matrix test to concurrency 12 and 16
-   - ⏳ Implement partition creation from matrix results
+   - ✅ Implemented partition creation from matrix results
    - ⏳ Implement ZSWAP latency tests with real swap
 3. ⏳ **TODO** - Improve allocator testing with varied data (needs refactoring)
 4. ✅ **DONE** - Fix space efficiency calculation with dynamic pool sizing
@@ -470,7 +473,7 @@ Reality: ~29GB total virtual (7GB RAM + 8GB ZSWAP effective + 14GB disk)
 ### For Testing Methodology:
 9. ⏳ **IN PROGRESS** - Add ZSWAP-specific benchmarks
    - ✅ Matrix test extended for device count optimization
-   - ⏳ Partition creation based on matrix results
+   - ✅ Partition creation based on matrix results
    - ⏳ ZSWAP latency tests with real backing devices
 10. ⏳ **TODO** - Test hot/cold page access patterns (future enhancement)
 11. ⏳ **TODO** - Use mixed data patterns for allocator tests (future enhancement)
@@ -489,13 +492,14 @@ Reality: ~29GB total virtual (7GB RAM + 8GB ZSWAP effective + 14GB disk)
    - **Impact**: Results guide partition creation (e.g., if 8 performs best, create 8 swap partitions)
 
 ### Partition Creation Strategy:
-14. ⏳ **NEXT** - Implement dynamic partition creation
-   - Query matrix results for best concurrency
-   - Calculate partition sizes (total_swap / optimal_devices)
-   - Shrink root partition to free space
-   - Create swap partitions using optimal count
-   - Configure with swapon using stripe width from matrix test
-   - Enable ZSWAP with real backing devices for latency testing ✅ IMPLEMENTED
+14. ✅ **DONE** - Implemented dynamic partition creation
+   - ✅ Query matrix results for best concurrency
+   - ✅ Calculate partition sizes (total_swap / optimal_devices)
+   - ✅ Shrink/extend root partition as needed
+   - ✅ Create swap partitions using optimal count (sfdisk dump-modify-write)
+   - ✅ Configure with swapon using optimal priority
+   - ✅ Notify kernel with partprobe + partx
+   - ⏳ NEXT: Enable ZSWAP with real backing devices for latency testing ✅ IMPLEMENTED
 
 ### Corrected Telegram Report (ACTUAL OUTPUT):
 ```
@@ -566,85 +570,83 @@ concurrency_levels = [1, 2, 4, 6, 8, 12, 16]  # Extended to 12 and 16
 
 ---
 
-### Phase 2: Dynamic Partition Creation ⏳ NEXT STEP
+### Phase 2: Dynamic Partition Creation ✅ COMPLETED
 
 **What:** Use matrix test results to automatically create optimal number of swap partitions
 
-**Implementation Location:** `scripts/debian-install/bootstrap.sh` or new `scripts/debian-install/create-swap-partitions.sh`
+**Implementation Location:** `scripts/debian-install/create-swap-partitions.sh`
 
-**Workflow:**
+**Key Features:**
+- **Auto-detects disk layout**: MINIMAL ROOT (free space available) or FULL ROOT (needs shrinking)
+- **Reads benchmark results**: Extracts optimal concurrency from matrix test
+- **Uses sfdisk pattern**: Dump → Modify → Write (not LVM lvresize/lvcreate)
+- **Kernel notification**: partprobe + partx to inform kernel of changes
+- **Filesystem-aware**: Supports ext4, xfs, btrfs with appropriate resize commands
+- **Stability**: Uses PARTUUID in /etc/fstab (survives mkswap calls)
+
+**Usage:**
 ```bash
-#!/bin/bash
 # After benchmark completes:
+sudo ./create-swap-partitions.sh
 
-# 1. Query matrix test results for optimal concurrency
-OPTIMAL_DEVICES=$(jq -r '.matrix.optimal.best_combined.concurrency' /var/log/benchmark-results.json)
-echo "Optimal swap device count: $OPTIMAL_DEVICES"
+# Script will:
+# 1. Find most recent benchmark results in /var/log/debian-install/
+# 2. Extract optimal device count (e.g., 8 from matrix test)
+# 3. Detect disk layout and filesystem type
+# 4. Backup partition table to /tmp/ptable-backup-*.dump
+# 5. Create modified partition table with optimal swap devices
+# 6. Write to disk, notify kernel, verify
+# 7. Resize root filesystem (grow or shrink as needed)
+# 8. Format swap partitions and enable with priority 10
+# 9. Add to /etc/fstab with PARTUUID
+```
 
-# 2. Calculate swap size and per-device size
-TOTAL_RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
-TOTAL_SWAP_GB=$((TOTAL_RAM_GB * 2))  # 2x RAM per sizing policy
-PER_DEVICE_GB=$((TOTAL_SWAP_GB / OPTIMAL_DEVICES))
+**Supported Scenarios:**
+```bash
+# Scenario 1: MINIMAL ROOT (e.g., 9GB root on 40GB disk)
+# - Extends root to use most of disk
+# - Places N swap partitions at end
+# - No filesystem shrinking needed
 
-echo "Total swap needed: ${TOTAL_SWAP_GB}GB across $OPTIMAL_DEVICES devices"
-echo "Per-device size: ${PER_DEVICE_GB}GB"
+# Scenario 2: FULL ROOT (e.g., 40GB root on 40GB disk)
+# - Shrinks root filesystem first
+# - Updates partition table to shrink root
+# - Adds N swap partitions at end
+# - Requires shrink-capable filesystem (ext4, btrfs)
+```
 
-# 3. Shrink root partition to free space
-ROOT_DEVICE=$(df / | tail -1 | awk '{print $1}')
-ROOT_FS_TYPE=$(df -T / | tail -1 | awk '{print $2}')
-
-echo "Root device: $ROOT_DEVICE (filesystem: $ROOT_FS_TYPE)"
-
-# For LVM (typical in Debian installs):
-if [[ $ROOT_DEVICE =~ /dev/mapper/ ]]; then
-    VG=$(lvs --noheadings -o vg_name $ROOT_DEVICE | tr -d ' ')
-    LV=$(lvs --noheadings -o lv_name $ROOT_DEVICE | tr -d ' ')
-    
-    # Shrink root LV to free space
-    echo "Shrinking root LV: ${VG}/${LV}"
-    lvresize -r -L -${TOTAL_SWAP_GB}G /dev/${VG}/${LV}
-    
-    # 4. Create swap logical volumes
-    for i in $(seq 1 $OPTIMAL_DEVICES); do
-        LV_NAME="swap${i}"
-        echo "Creating swap LV: ${VG}/${LV_NAME} (${PER_DEVICE_GB}GB)"
-        lvcreate -L ${PER_DEVICE_GB}G -n ${LV_NAME} ${VG}
-        mkswap /dev/${VG}/${LV_NAME}
-    done
-    
-    # 5. Enable swap with optimal stripe width
-    STRIPE_WIDTH=$OPTIMAL_DEVICES
-    for i in $(seq 1 $OPTIMAL_DEVICES); do
-        swapon -p 10 /dev/${VG}/swap${i}
-    done
-    
-    # Configure kernel for striping
-    echo "Configuring vm.page-cluster=0 (ZSWAP optimized)"
-    sysctl -w vm.page-cluster=0
-    
-    echo "Swap devices created and enabled with stripe width: $STRIPE_WIDTH"
-    swapon --show
-fi
-
-# For non-LVM (partition-based):
-# Use parted/gdisk to shrink root partition and create swap partitions
-# (Implementation depends on partition table type: GPT or MBR)
+**Example Output:**
+```
+[STEP] Creating Swap Partitions from Benchmark Results
+[INFO] Using benchmark results: /var/log/debian-install/benchmark-results-20260110-190000.json
+[INFO] Optimal swap device count from benchmark: 8
+[INFO] System RAM: 7GB
+[INFO] Total swap needed: 14GB
+[INFO] Per-device swap size: 1GB
+[INFO] Disk layout: MINIMAL ROOT (sufficient free space available)
+[INFO] Root filesystem: ext4
+[SUCCESS] Partition table backed up to: /tmp/ptable-backup-1736528000.dump
+[STEP] Creating modified partition table...
+[STEP] Writing modified partition table to disk...
+[STEP] Notifying kernel of partition table changes...
+[STEP] Resizing root filesystem...
+[STEP] Formatting and enabling swap partitions...
+[SUCCESS] Swap partition creation complete!
 ```
 
 **Validation:**
 ```bash
-# Check swap configuration
+# Check active swap devices
 swapon --show
-# Expected output:
-# NAME              TYPE SIZE PRIO
-# /dev/vg0/swap1    partition 2G   10
-# /dev/vg0/swap2    partition 2G   10
-# /dev/vg0/swap3    partition 2G   10
-# ... (up to OPTIMAL_DEVICES)
+# Expected: 8 partitions of ~1GB each with priority 10
 
-# Check ZSWAP configuration
-cat /sys/module/zswap/parameters/enabled  # Should be 'Y'
-sysctl vm.page-cluster                     # Should be 0
+# Verify in fstab
+grep swap /etc/fstab
+# Expected: 8 entries using PARTUUID
+
+# Check disk layout
+lsblk
+# Expected: root partition + 8 swap partitions at end
 ```
 
 ---
