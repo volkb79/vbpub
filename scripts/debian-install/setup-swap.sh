@@ -349,29 +349,23 @@ calculate_swap_sizes() {
             log_info "Using available space (${DISK_AVAIL_GB}GB) for file-based swap sizing"
         fi
         
-        if [ "$RAM_GB" -le 2 ]; then
-            # For very low RAM, use 2x RAM for disk swap
-            SWAP_DISK_TOTAL_GB=$((RAM_GB * 2))
-            [ "$SWAP_DISK_TOTAL_GB" -lt 4 ] && SWAP_DISK_TOTAL_GB=4
-            log_info "Low RAM system: Using ${SWAP_DISK_TOTAL_GB}GB disk swap (min 4GB)"
-        elif [ "$RAM_GB" -le 4 ]; then
-            # 4GB disk swap for 2-4GB RAM
-            SWAP_DISK_TOTAL_GB=4
-            log_info "Using ${SWAP_DISK_TOTAL_GB}GB disk swap"
-        elif [ "$RAM_GB" -le 8 ]; then
-            # 8GB disk swap for 4-8GB RAM
-            SWAP_DISK_TOTAL_GB=8
-            log_info "Using ${SWAP_DISK_TOTAL_GB}GB disk swap"
-        elif [ "$RAM_GB" -le 16 ]; then
-            # 16-32GB disk swap for 8-16GB RAM (scaling)
-            SWAP_DISK_TOTAL_GB=$((RAM_GB * 2))
-            [ "$SWAP_DISK_TOTAL_GB" -gt 32 ] && SWAP_DISK_TOTAL_GB=32
-            log_info "Using ${SWAP_DISK_TOTAL_GB}GB disk swap (scaling to 32GB max)"
-        else
-            # Cap at 32GB for high RAM systems
-            SWAP_DISK_TOTAL_GB=32
-            log_info "High RAM system: Using ${SWAP_DISK_TOTAL_GB}GB disk swap (capped)"
-        fi
+        # Swap Sizing Philosophy:
+        # - Base formula: 2x RAM (consistent across all RAM sizes)
+        # - Minimum: 4GB (safety for very low RAM systems)
+        # - Maximum: 64GB (practical limit for most workloads)
+        # - Rationale: With ZSWAP (2-2.5x compression), total effective memory:
+        #   Example 8GB RAM: 8GB physical + 4GB ZSWAP effective + 16GB disk = ~28GB total
+        # - NOT based on CPU performance - swap size is about capacity, not speed
+        # - CPU performance affects compressor choice (lz4 vs zstd), not swap size
+        
+        # Consistent 2x multiplier with practical caps
+        SWAP_DISK_TOTAL_GB=$((RAM_GB * 2))
+        
+        # Apply minimum (4GB) and maximum (64GB) caps
+        [ "$SWAP_DISK_TOTAL_GB" -lt 4 ] && SWAP_DISK_TOTAL_GB=4
+        [ "$SWAP_DISK_TOTAL_GB" -gt 64 ] && SWAP_DISK_TOTAL_GB=64
+        
+        log_info "Disk swap size: ${SWAP_DISK_TOTAL_GB}GB (2x RAM=${RAM_GB}GB, min 4GB, max 64GB)"
         
         # Check if we have enough space
         if [ "$SWAP_DISK_TOTAL_GB" -gt "$disk_reference_gb" ]; then
@@ -453,16 +447,29 @@ calculate_swap_sizes() {
         fi
     fi
     
-    # Recommendations for low RAM
+    # Recommendations for low RAM (compressor selection based on need, not swap size)
     if [ "$RAM_GB" -le 2 ]; then
-        log_warn "Low RAM detected. Recommend: ZSWAP_COMPRESSOR=zstd or ZRAM_COMPRESSOR=zstd"
+        log_warn "Low RAM detected. Recommend: ZSWAP_COMPRESSOR=zstd for better compression ratio"
         if [ "$SWAP_RAM_SOLUTION" = "zswap" ] && [ "$ZSWAP_COMPRESSOR" = "lz4" ]; then
-            log_warn "Current ZSWAP compressor is lz4. Consider zstd for better compression ratio."
+            log_warn "Current ZSWAP compressor is lz4. Consider zstd for better compression (saves more RAM)."
         fi
         if [ "$SWAP_RAM_SOLUTION" = "zram" ] && [ "$ZRAM_COMPRESSOR" = "lz4" ]; then
-            log_warn "Current ZRAM compressor is lz4. Consider zstd for better compression ratio."
+            log_warn "Current ZRAM compressor is lz4. Consider zstd for better compression (saves more RAM)."
         fi
     fi
+    
+    # Effective memory calculation for information
+    log_info "Effective memory with ZSWAP (assuming 2x compression):"
+    log_info "  Physical RAM: ${RAM_GB}GB"
+    if [ "$SWAP_RAM_TOTAL_GB" -gt 0 ]; then
+        local zswap_effective=$((SWAP_RAM_TOTAL_GB * 2))
+        log_info "  ZSWAP cache: ${SWAP_RAM_TOTAL_GB}GB → ~${zswap_effective}GB effective"
+    fi
+    if [ "$SWAP_DISK_TOTAL_GB" -gt 0 ]; then
+        log_info "  Disk swap: ${SWAP_DISK_TOTAL_GB}GB (overflow/cold pages)"
+    fi
+    local total_effective=$((RAM_GB + SWAP_RAM_TOTAL_GB * 2 + SWAP_DISK_TOTAL_GB))
+    log_info "  Total effective: ~${total_effective}GB virtual memory capacity"
 }
 
 # Print system analysis and execution plan
