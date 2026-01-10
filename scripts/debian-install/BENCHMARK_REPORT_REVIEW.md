@@ -200,16 +200,37 @@ f.write(f"# SWAP_PAGE_CLUSTER_DISK={cluster_disk_optimal}  # Use this if disk-on
   See chat-merged.md for rationale.
 ```
 
-### 3. **Add ZSWAP-Specific Tests**
+### 3. **Add ZSWAP-Specific Tests** ⏳ IN PROGRESS
 
-**New Test to Add:**
+**Implementation Plan:**
+
+**Phase 1: Matrix Test Extension** ✅ COMPLETED
+```python
+# Extended concurrency levels to include 12 and 16
+concurrency_levels = [1, 2, 4, 6, 8, 12, 16]
+# Purpose: Determine optimal number of swap devices for 4-32KB block size mix
+```
+
+**Phase 2: Swap Partition Creation** ⏳ NEXT
+```bash
+# After matrix test completes:
+# 1. Query matrix results for best concurrency (e.g., 8 devices)
+# 2. Create that many swap partitions from available space
+# 3. Use lvresize or parted to shrink root and create swap partitions
+# 4. Format as swap with mkswap
+# 5. Enable with swapon (stripe width = optimal concurrency)
+```
+
+**Phase 3: ZSWAP Latency Tests** ⏳ TODO
 ```python
 def benchmark_zswap_latency(compressor='lz4', zpool='zbud', test_size_mb=100):
     """
     Test ZSWAP cache latency with backing device
+    NOW POSSIBLE: Using real swap partitions created from matrix test results
+    
     Measures hot cache hits vs cold page faults from disk
     """
-    # 1. Setup ZSWAP with disk backing
+    # 1. Setup ZSWAP with real disk backing (from Phase 2)
     # 2. Fill ZSWAP cache
     # 3. Measure hot read latency (from ZSWAP cache)
     # 4. Trigger eviction to disk
@@ -226,6 +247,12 @@ Latency Comparison:
   ZRAM:        ~5 µs (no disk backing)
   Disk direct: ~5000 µs (no cache)
 ```
+
+**Current Status:**
+- ✅ Matrix test now includes concurrency 12 and 16
+- ✅ Can determine optimal swap device count from matrix results
+- ⏳ Need to implement partition creation logic in bootstrap.sh
+- ⏳ Then can proceed with ZSWAP latency testing using real swap devices
 
 ### 4. **Improve Allocator Testing**
 
@@ -353,13 +380,21 @@ sudo ./benchmark.py --compare-zswap-zram
    - ✅ Show breakdown: RAM + ZSWAP effective + disk
    - ✅ Add realistic virtual memory capacity estimate
 
-### Priority 2: Enhanced Testing (TODO)
+### Priority 2: Enhanced Testing
 
-4. **Add `benchmark_zswap_latency()` function** ⏳
-   - Test hot cache hits
-   - Test cold page faults
-   - Compare with ZRAM baseline
-   - **Note:** Complex to implement, requires real swap backing device
+4. **Add `benchmark_zswap_latency()` function** ⏳ IN PROGRESS
+   - ✅ Extended matrix test to include concurrency 12 and 16
+   - ✅ Matrix test can now determine optimal swap device count
+   - ⏳ NEXT: Implement partition creation based on matrix results
+   - ⏳ NEXT: Create real swap partitions (shrink root, create swap)
+   - ⏳ NEXT: Test hot cache hits using real swap backing
+   - ⏳ NEXT: Test cold page faults using real swap backing
+   - ⏳ NEXT: Compare with ZRAM baseline
+   - **Implementation Path:**
+     1. Matrix test runs with extended concurrency (1, 2, 4, 6, 8, 12, 16)
+     2. Results show optimal device count (e.g., 8 for best throughput)
+     3. Bootstrap creates that many swap partitions
+     4. ZSWAP latency tests can use these real partitions
 
 5. **Improve `benchmark_compression()` function** ⏳
    - Test multiple data patterns
@@ -419,7 +454,10 @@ Reality: ~29GB total virtual (7GB RAM + 8GB ZSWAP effective + 14GB disk)
 
 ### For Code Changes:
 1. ✅ **DONE** - Fix `SWAP_PAGE_CLUSTER` export to always use 0 for ZSWAP
-2. ⏳ **TODO** - Add ZSWAP latency testing (complex, needs backing device)
+2. ⏳ **IN PROGRESS** - Add ZSWAP latency testing
+   - ✅ Extended matrix test to concurrency 12 and 16
+   - ⏳ Implement partition creation from matrix results
+   - ⏳ Implement ZSWAP latency tests with real swap
 3. ⏳ **TODO** - Improve allocator testing with varied data (needs refactoring)
 4. ✅ **DONE** - Fix space efficiency calculation with dynamic pool sizing
 5. ✅ **DONE** - Enhance Telegram report with context
@@ -430,13 +468,34 @@ Reality: ~29GB total virtual (7GB RAM + 8GB ZSWAP effective + 14GB disk)
 8. ✅ **DONE** - Show realistic virtual memory breakdown with dynamic ZSWAP pool
 
 ### For Testing Methodology:
-9. ⏳ **TODO** - Add ZSWAP-specific benchmarks (future enhancement)
+9. ⏳ **IN PROGRESS** - Add ZSWAP-specific benchmarks
+   - ✅ Matrix test extended for device count optimization
+   - ⏳ Partition creation based on matrix results
+   - ⏳ ZSWAP latency tests with real backing devices
 10. ⏳ **TODO** - Test hot/cold page access patterns (future enhancement)
 11. ⏳ **TODO** - Use mixed data patterns for allocator tests (future enhancement)
 
-### ZSWAP Pool Sizing (IMPLEMENTED):
+### ZSWAP Pool Sizing:
 12. ✅ **DONE** - Dynamic pool sizing based on RAM:
-   - **2GB RAM: 50%** (maximize co ✅ IMPLEMENTED
+   - **2GB RAM: 50%** (maximize compression with zstd, still faster than disk)
+   - **16GB RAM: 25%** (use lz4 for speed)
+   - **Linear interpolation**: 50% - ((RAM_GB - 2) × 1.786%)
+
+### Matrix Test Enhancement:
+13. ✅ **DONE** - Extended concurrency testing
+   - **Old**: [1, 2, 4, 6, 8]
+   - **New**: [1, 2, 4, 6, 8, 12, 16]
+   - **Purpose**: Determine optimal swap device count for striping
+   - **Impact**: Results guide partition creation (e.g., if 8 performs best, create 8 swap partitions)
+
+### Partition Creation Strategy:
+14. ⏳ **NEXT** - Implement dynamic partition creation
+   - Query matrix results for best concurrency
+   - Calculate partition sizes (total_swap / optimal_devices)
+   - Shrink root partition to free space
+   - Create swap partitions using optimal count
+   - Configure with swapon using stripe width from matrix test
+   - Enable ZSWAP with real backing devices for latency testing ✅ IMPLEMENTED
 
 ### Corrected Telegram Report (ACTUAL OUTPUT):
 ```
@@ -485,6 +544,248 @@ SWAP_PAGE_CLUSTER_DISK=5  # Use this if disk-only swap (no ZSWAP
   Hot pages: ~15µs (ZSWAP cache)
   Cold pages: ~500µs (disk with cache)
   vs ZRAM: Better long-term (no stuck pages)
+```
+
+---
+
+## 🚀 Complete Implementation Workflow
+
+### Phase 1: Matrix Test Extension ✅ COMPLETED
+
+**What:** Extended concurrency testing from [1,2,4,6,8] to [1,2,4,6,8,12,16]
+
+**Why:** The 4-32KB block size range is typical for swap device access. Testing higher concurrency levels helps determine the optimal number of swap devices for striping.
+
+**Code Change:**
+```python
+# benchmark.py line 1232
+concurrency_levels = [1, 2, 4, 6, 8, 12, 16]  # Extended to 12 and 16
+```
+
+**Result:** Matrix test now identifies performance scaling up to 16 concurrent jobs, revealing the optimal device count for maximum throughput.
+
+---
+
+### Phase 2: Dynamic Partition Creation ⏳ NEXT STEP
+
+**What:** Use matrix test results to automatically create optimal number of swap partitions
+
+**Implementation Location:** `scripts/debian-install/bootstrap.sh` or new `scripts/debian-install/create-swap-partitions.sh`
+
+**Workflow:**
+```bash
+#!/bin/bash
+# After benchmark completes:
+
+# 1. Query matrix test results for optimal concurrency
+OPTIMAL_DEVICES=$(jq -r '.matrix.optimal.best_combined.concurrency' /var/log/benchmark-results.json)
+echo "Optimal swap device count: $OPTIMAL_DEVICES"
+
+# 2. Calculate swap size and per-device size
+TOTAL_RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
+TOTAL_SWAP_GB=$((TOTAL_RAM_GB * 2))  # 2x RAM per sizing policy
+PER_DEVICE_GB=$((TOTAL_SWAP_GB / OPTIMAL_DEVICES))
+
+echo "Total swap needed: ${TOTAL_SWAP_GB}GB across $OPTIMAL_DEVICES devices"
+echo "Per-device size: ${PER_DEVICE_GB}GB"
+
+# 3. Shrink root partition to free space
+ROOT_DEVICE=$(df / | tail -1 | awk '{print $1}')
+ROOT_FS_TYPE=$(df -T / | tail -1 | awk '{print $2}')
+
+echo "Root device: $ROOT_DEVICE (filesystem: $ROOT_FS_TYPE)"
+
+# For LVM (typical in Debian installs):
+if [[ $ROOT_DEVICE =~ /dev/mapper/ ]]; then
+    VG=$(lvs --noheadings -o vg_name $ROOT_DEVICE | tr -d ' ')
+    LV=$(lvs --noheadings -o lv_name $ROOT_DEVICE | tr -d ' ')
+    
+    # Shrink root LV to free space
+    echo "Shrinking root LV: ${VG}/${LV}"
+    lvresize -r -L -${TOTAL_SWAP_GB}G /dev/${VG}/${LV}
+    
+    # 4. Create swap logical volumes
+    for i in $(seq 1 $OPTIMAL_DEVICES); do
+        LV_NAME="swap${i}"
+        echo "Creating swap LV: ${VG}/${LV_NAME} (${PER_DEVICE_GB}GB)"
+        lvcreate -L ${PER_DEVICE_GB}G -n ${LV_NAME} ${VG}
+        mkswap /dev/${VG}/${LV_NAME}
+    done
+    
+    # 5. Enable swap with optimal stripe width
+    STRIPE_WIDTH=$OPTIMAL_DEVICES
+    for i in $(seq 1 $OPTIMAL_DEVICES); do
+        swapon -p 10 /dev/${VG}/swap${i}
+    done
+    
+    # Configure kernel for striping
+    echo "Configuring vm.page-cluster=0 (ZSWAP optimized)"
+    sysctl -w vm.page-cluster=0
+    
+    echo "Swap devices created and enabled with stripe width: $STRIPE_WIDTH"
+    swapon --show
+fi
+
+# For non-LVM (partition-based):
+# Use parted/gdisk to shrink root partition and create swap partitions
+# (Implementation depends on partition table type: GPT or MBR)
+```
+
+**Validation:**
+```bash
+# Check swap configuration
+swapon --show
+# Expected output:
+# NAME              TYPE SIZE PRIO
+# /dev/vg0/swap1    partition 2G   10
+# /dev/vg0/swap2    partition 2G   10
+# /dev/vg0/swap3    partition 2G   10
+# ... (up to OPTIMAL_DEVICES)
+
+# Check ZSWAP configuration
+cat /sys/module/zswap/parameters/enabled  # Should be 'Y'
+sysctl vm.page-cluster                     # Should be 0
+```
+
+---
+
+### Phase 3: ZSWAP Latency Testing ⏳ TODO
+
+**What:** Now that real swap partitions exist, implement comprehensive ZSWAP latency benchmarks
+
+**Implementation Location:** `scripts/debian-install/benchmark.py` - add `benchmark_zswap_latency()` function
+
+**Test Scenarios:**
+
+1. **Hot Cache Latency** (ZSWAP pool hit)
+   ```python
+   # Fill ZSWAP pool with test pages
+   # Measure read latency from ZSWAP cache
+   # Expected: ~10-20µs
+   ```
+
+2. **Cold Page Latency** (disk read through ZSWAP)
+   ```python
+   # Trigger ZSWAP writeback to disk
+   # Measure page fault latency (disk → ZSWAP → process)
+   # Expected: ~500µs (disk seek + ZSWAP overhead)
+   ```
+
+3. **Writeback Performance** (ZSWAP → disk eviction)
+   ```python
+   # Fill ZSWAP pool to trigger writeback
+   # Measure writeback throughput
+   # Monitor: /sys/kernel/debug/zswap/writeback_count
+   # Expected: Should match disk write speed from matrix test
+   ```
+
+4. **Comparison with ZRAM**
+   ```python
+   # Run same tests with ZRAM (memory-only)
+   # Compare:
+   # - ZRAM hot: ~5µs (faster, but no disk backing)
+   # - ZSWAP hot: ~15µs (slightly slower, but has disk overflow)
+   # - ZSWAP cold: ~500µs (transparent disk access)
+   # - ZRAM cold: N/A (OOM if pool fills)
+   ```
+
+**Expected Telegram Report Addition:**
+```
+⚡ ZSWAP Latency Analysis:
+  Hot cache (pool hit):  15.2µs
+  Cold page (disk read): 487µs
+  Writeback throughput:  185 MB/s
+  
+  vs ZRAM (memory-only):
+  ZRAM hot:  4.8µs (3.2× faster)
+  ZRAM cold: N/A (OOM risk)
+  
+  Verdict: ZSWAP adds ~10µs overhead but provides:
+  - Automatic disk overflow (no OOM)
+  - Hot/cold page separation
+  - Better for general-purpose systems
+```
+
+---
+
+### Phase 4: Integration with Bootstrap ⏳ TODO
+
+**What:** Integrate partition creation into main bootstrap flow
+
+**Changes to `bootstrap.sh`:**
+```bash
+# After benchmark completes successfully:
+if [[ $RUN_BENCHMARK == "yes" ]]; then
+    log "Running benchmark..."
+    ./benchmark.py --test-all
+    
+    # Check if matrix test completed
+    if [[ -f /var/log/benchmark-results.json ]]; then
+        # Create swap partitions based on matrix results
+        if [[ $CREATE_SWAP_PARTITIONS == "yes" ]]; then
+            log "Creating optimized swap partitions..."
+            ./create-swap-partitions.sh
+        fi
+        
+        # Run ZSWAP latency tests with real partitions
+        if [[ $TEST_ZSWAP_LATENCY == "yes" ]]; then
+            log "Testing ZSWAP latency..."
+            ./benchmark.py --test-zswap-latency
+        fi
+    fi
+fi
+```
+
+**Configuration Variables:**
+```bash
+# bootstrap.sh configuration
+RUN_BENCHMARK="yes"              # Run full benchmark suite
+CREATE_SWAP_PARTITIONS="yes"     # Create partitions from matrix results
+TEST_ZSWAP_LATENCY="yes"         # Run latency tests with real swap
+PRESERVE_ROOT_SIZE_GB="10"       # Minimum root partition size to preserve
+```
+
+---
+
+## 📊 Expected Complete Results
+
+After all phases are implemented, the benchmark Telegram report will include:
+
+```
+🎯 System Configuration:
+  RAM: 7GB
+  Swap: 14GB across 8 devices (optimal from matrix test)
+  ZSWAP pool: 2.5GB (36% of RAM, dynamic sizing)
+  
+📀 Disk I/O Performance (Matrix Test):
+  Best: 128KB × 8 jobs = 20711 MB/s
+  SWAP_STRIPE_WIDTH=8 ✅
+  
+💾 ZSWAP Configuration:
+  SWAP_PAGE_CLUSTER=0 ✅
+  Compressor: zstd (3.9× ratio)
+  Pool: zbud (reliable, kernel 6.8+ with shrinker)
+  
+⚡ Latency Comparison:
+  Native RAM:     35 ns
+  ZSWAP (hot):    15 µs (428× slower than RAM)
+  ZSWAP (cold):  487 µs (13914× slower than RAM)
+  ZRAM:            5 µs (faster but no disk backing)
+  Disk direct:  5000 µs (10× slower than ZSWAP cold)
+  
+💾 Virtual Memory Capacity:
+  Physical RAM:     7.0GB
+  ZSWAP pool:       2.5GB (36% of RAM)
+  ZSWAP effective:  9.8GB (@ 3.9× zstd)
+  Disk swap:       14.0GB (2× RAM, 8 devices)
+  ───────────────────────────────────
+  Total Virtual:  ~30.8GB
+  
+  Performance Profile:
+  - Active apps:      7.0GB in RAM (native speed)
+  - Hot pages:        9.8GB in ZSWAP (~15µs)
+  - Cold pages:      14.0GB on disk (~500µs)
+  - Total capacity:  30.8GB virtual memory
 ```
 
 ---

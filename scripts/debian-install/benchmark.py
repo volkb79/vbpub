@@ -1230,7 +1230,7 @@ def test_blocksize_concurrency_matrix(block_sizes=None, concurrency_levels=None,
     if block_sizes is None:
         block_sizes = [4, 8, 16, 32, 64, 128]  # Include 128KB - sequential tests show good performance
     if concurrency_levels is None:
-        concurrency_levels = [1, 2, 4, 6, 8]  # Include 6 to identify inflection point between 4 and 8
+        concurrency_levels = [1, 2, 4, 6, 8, 12, 16]  # Extended to 12 and 16 for optimal swap device count determination
     
     total_combinations = len(block_sizes) * len(concurrency_levels)
     log_step_ts(f"Block Size × Concurrency Matrix Test ({total_combinations} combinations)")
