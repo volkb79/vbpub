@@ -220,16 +220,31 @@ class SystemInfo:
         return info
     
     def get_kernel_params(self):
-        """Get kernel parameters related to swap and memory"""
+        """Get comprehensive kernel parameters related to swap, memory, and THP"""
         params = {}
         
-        # List of kernel parameters to collect
+        # List of kernel parameters to collect (comprehensive for swap/memory tuning)
         param_names = [
+            # Core swap parameters
             'vm.swappiness',
             'vm.page-cluster',
             'vm.vfs_cache_pressure',
+            
+            # Memory management
             'vm.watermark_scale_factor',
-            'vm.min_free_kbytes'
+            'vm.min_free_kbytes',
+            'vm.overcommit_memory',
+            'vm.overcommit_ratio',
+            
+            # Dirty page writeback
+            'vm.dirty_ratio',
+            'vm.dirty_background_ratio',
+            'vm.dirty_expire_centisecs',
+            'vm.dirty_writeback_centisecs',
+            
+            # Additional memory tuning
+            'vm.compact_unevictable_allowed',
+            'vm.zone_reclaim_mode'
         ]
         
         for param in param_names:
@@ -244,6 +259,63 @@ class SystemInfo:
                     params[param] = result.stdout.strip()
             except Exception:
                 params[param] = 'N/A'
+        
+        # Get Transparent Huge Pages (THP) status
+        try:
+            with open('/sys/kernel/mm/transparent_hugepage/enabled', 'r') as f:
+                thp_enabled = f.read().strip()
+                # Extract the selected option (marked with [])
+                import re
+                match = re.search(r'\[([^\]]+)\]', thp_enabled)
+                if match:
+                    params['transparent_hugepage.enabled'] = match.group(1)
+                else:
+                    params['transparent_hugepage.enabled'] = thp_enabled
+        except Exception:
+            params['transparent_hugepage.enabled'] = 'N/A'
+        
+        try:
+            with open('/sys/kernel/mm/transparent_hugepage/defrag', 'r') as f:
+                thp_defrag = f.read().strip()
+                import re
+                match = re.search(r'\[([^\]]+)\]', thp_defrag)
+                if match:
+                    params['transparent_hugepage.defrag'] = match.group(1)
+                else:
+                    params['transparent_hugepage.defrag'] = thp_defrag
+        except Exception:
+            params['transparent_hugepage.defrag'] = 'N/A'
+        
+        # Get ZSWAP status if available
+        try:
+            with open('/sys/module/zswap/parameters/enabled', 'r') as f:
+                params['zswap.enabled'] = f.read().strip()
+        except Exception:
+            params['zswap.enabled'] = 'N/A'
+        
+        try:
+            with open('/sys/module/zswap/parameters/compressor', 'r') as f:
+                params['zswap.compressor'] = f.read().strip()
+        except Exception:
+            params['zswap.compressor'] = 'N/A'
+        
+        try:
+            with open('/sys/module/zswap/parameters/max_pool_percent', 'r') as f:
+                params['zswap.max_pool_percent'] = f.read().strip()
+        except Exception:
+            params['zswap.max_pool_percent'] = 'N/A'
+        
+        try:
+            with open('/sys/module/zswap/parameters/zpool', 'r') as f:
+                params['zswap.zpool'] = f.read().strip()
+        except Exception:
+            params['zswap.zpool'] = 'N/A'
+        
+        try:
+            with open('/sys/module/zswap/parameters/shrinker_enabled', 'r') as f:
+                params['zswap.shrinker_enabled'] = f.read().strip()
+        except Exception:
+            params['zswap.shrinker_enabled'] = 'N/A'
         
         return params
     

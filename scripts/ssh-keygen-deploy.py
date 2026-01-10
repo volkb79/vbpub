@@ -19,6 +19,36 @@ Environment Variables:
     TELEGRAM_BOT_TOKEN - Telegram bot token for notifications
     TELEGRAM_CHAT_ID - Telegram chat ID for notifications
     NONINTERACTIVE - Skip interactive prompts (yes/no)
+
+
+## Naming Conventions
+
+### Private Key Filename
+
+**Format:** `<service>_<user>_<algorithm>`
+
+**Purpose:** Identifies **WHICH** server/service to connect **TO**
+
+**Examples:**
+- `netcup-hosting218629-ed25519`
+- `github-vb-ed25519`
+- `aws-ec2-production-rsa`
+
+**Why:** The private key filename should immediately tell you what it's used for - which service or server you're connecting to.
+
+### Public Key Comment
+
+**Format:** `<owner>@<hostname_or_context>_<date_or_version>`
+
+**Purpose:** Identifies **WHO** is using the key (appears in server's `authorized_keys`)
+
+**Examples:**
+- `vb@gstammtisch.dchive.de_202511`
+- `john@devlaptop_202601`
+- `ci-bot@github-actions_v2`
+
+**Why:** This comment appears in the server's `authorized_keys` file, helping administrators identify which key belongs to which developer, machine, or system.
+
 """
 
 import argparse

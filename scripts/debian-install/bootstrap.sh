@@ -31,7 +31,7 @@ ZRAM_COMPRESSOR="${ZRAM_COMPRESSOR:-zstd}"  # lz4, zstd, lzo-rle
 ZRAM_ALLOCATOR="${ZRAM_ALLOCATOR:-zsmalloc}"  # zsmalloc, z3fold, zbud
 ZRAM_PRIORITY="${ZRAM_PRIORITY:-100}"  # Priority for ZRAM (higher = preferred)
 ZSWAP_COMPRESSOR="${ZSWAP_COMPRESSOR:-zstd}"  # lz4, zstd, lzo-rle
-ZSWAP_ZPOOL="${ZSWAP_ZPOOL:-z3fold}"  # z3fold, zbud, zsmalloc
+ZSWAP_ZPOOL="${ZSWAP_ZPOOL:-zbud}"  # zbud (most reliable), z3fold, zsmalloc
 
 # Disk-based swap
 SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE:-auto}"  # files_in_root, partitions_swap, partitions_zvol, files_in_partitions, none (auto-detected if not set)
@@ -48,6 +48,7 @@ RUN_USER_CONFIG="${RUN_USER_CONFIG:-yes}"
 RUN_APT_CONFIG="${RUN_APT_CONFIG:-yes}"
 RUN_JOURNALD_CONFIG="${RUN_JOURNALD_CONFIG:-yes}"
 RUN_DOCKER_INSTALL="${RUN_DOCKER_INSTALL:-yes}"
+RUN_SSH_SETUP="${RUN_SSH_SETUP:-yes}"  # Generate SSH key for root and send via Telegram
 RUN_GEEKBENCH="${RUN_GEEKBENCH:-yes}"
 RUN_BENCHMARKS="${RUN_BENCHMARKS:-yes}"
 BENCHMARK_DURATION="${BENCHMARK_DURATION:-5}"  # Duration in seconds for each benchmark test
@@ -416,6 +417,32 @@ main() {
         fi
     else
         log_info "==> Docker installation skipped (RUN_DOCKER_INSTALL=$RUN_DOCKER_INSTALL)"
+    fi
+    
+    # SSH key generation and setup
+    if [ "$RUN_SSH_SETUP" = "yes" ]; then
+        log_info "==> Generating SSH key for root user"
+        
+        # Generate SSH key and send private key via Telegram if configured
+        SSH_ARGS="--user root --send-private --non-interactive"
+        
+        if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            log_info "Telegram configured - will send private key via Telegram"
+            if ./generate-ssh-key-pair.sh $SSH_ARGS 2>&1 | tee -a "$LOG_FILE"; then
+                log_info "✓ SSH key generated and private key sent via Telegram"
+            else
+                log_warn "SSH key generation had issues"
+            fi
+        else
+            log_warn "Telegram not configured - SSH key will be generated but not sent"
+            if ./generate-ssh-key-pair.sh --user root --non-interactive 2>&1 | tee -a "$LOG_FILE"; then
+                log_info "✓ SSH key generated (no Telegram delivery)"
+            else
+                log_warn "SSH key generation had issues"
+            fi
+        fi
+    else
+        log_info "==> SSH key generation skipped (RUN_SSH_SETUP=$RUN_SSH_SETUP)"
     fi
     
     # Geekbench (MOVED HERE - after swap configuration to avoid influencing benchmark results)
