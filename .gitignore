@@ -220,4 +220,11 @@ vol-*/
 # compose-init active TOML (generated, should not be committed)
 compose.config.active.toml
 
+# SSH private keys (never commit)
+scripts/server-access-*
+scripts/*.pem
+scripts/*.key
+*.pem
+*.key
+
 
