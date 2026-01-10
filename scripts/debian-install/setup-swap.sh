@@ -1863,12 +1863,17 @@ configure_kernel_params() {
     local page_cluster=3
     
     # Check if benchmark provided an optimal page-cluster value
-    if [ -n "$SWAP_PAGE_CLUSTER" ]; then
+    if [ -n "${SWAP_PAGE_CLUSTER:-}" ]; then
         page_cluster=$SWAP_PAGE_CLUSTER
         log_info "Using benchmark-optimized page-cluster: $page_cluster"
     else
-        # Default based on storage type
-        if [ "$STORAGE_TYPE" = "hdd" ]; then
+        # For ZSWAP, use page-cluster=0 (no readahead needed for RAM cache)
+        # See chat-merged.md: ZSWAP caches individual 4KB pages, readahead wastes bandwidth
+        if [ "$SWAP_RAM_SOLUTION" = "zswap" ]; then
+            page_cluster=0  # 4KB for ZSWAP (no seek cost)
+            log_info "Using page-cluster=0 for ZSWAP (no readahead needed)"
+        # For disk-only or ZRAM, use storage-type defaults
+        elif [ "$STORAGE_TYPE" = "hdd" ]; then
             page_cluster=4  # 64KB for HDD
         elif [ "$STORAGE_TYPE" = "ssd" ]; then
             page_cluster=3  # 32KB for SSD

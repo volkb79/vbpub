@@ -2424,10 +2424,35 @@ def export_shell_config(results, output_file):
     
     with open(output_file, 'w') as f:
         f.write("# Swap Configuration from Benchmark\n")
-        f.write(f"# Generated: {datetime.now().isoformat()}\n\n")
+        f.write(f"# Generated: {datetime.now().isoformat()}\n")
+        f.write("# Based on comprehensive testing documented in chat-merged.md\n\n")
         
-        # Find best block size
-        if 'block_sizes' in results and results['block_sizes']:
+        # Find best block size from matrix test (preferred) or old block_sizes test (fallback)
+        page_cluster_written = False
+        
+        if 'matrix' in results and isinstance(results['matrix'], dict):
+            # Extract from matrix test results
+            matrix_data = results['matrix'].get('matrix', [])
+            if matrix_data:
+                # Find test with best combined throughput
+                best_matrix = max(matrix_data,
+                                key=lambda x: x.get('write_mb_per_sec', 0) + x.get('read_mb_per_sec', 0))
+                
+                # Map block size to page-cluster
+                block_to_cluster = {4: 0, 8: 1, 16: 2, 32: 3, 64: 4, 128: 5}
+                cluster = block_to_cluster.get(best_matrix.get('block_size_kb'), 0)
+                
+                f.write(f"# Matrix test result: {best_matrix.get('block_size_kb')}KB "
+                       f"× {best_matrix.get('num_jobs')} jobs\n")
+                f.write(f"# Combined throughput: "
+                       f"{best_matrix.get('write_mb_per_sec', 0) + best_matrix.get('read_mb_per_sec', 0):.0f} MB/s\n")
+                f.write(f"# Recommended: vm.page-cluster={cluster}\n")
+                f.write(f"# NOTE: For ZSWAP, page-cluster=0 is often better (see chat-merged.md)\n")
+                f.write(f"SWAP_PAGE_CLUSTER={cluster}\n\n")
+                page_cluster_written = True
+        
+        # Fallback to deprecated block_sizes test
+        if not page_cluster_written and 'block_sizes' in results and results['block_sizes']:
             best_block = max(results['block_sizes'], 
                            key=lambda x: x.get('read_mb_per_sec', 0) + x.get('write_mb_per_sec', 0))
             # Map block size to page-cluster
@@ -2448,12 +2473,13 @@ def export_shell_config(results, output_file):
             f.write(f"ZSWAP_COMPRESSOR={best_comp['compressor']}\n")
             f.write(f"ZRAM_COMPRESSOR={best_comp['compressor']}\n\n")
         
-        # Best allocator
+        # Best allocator (note: prefer zbud for ZSWAP per chat-merged.md)
         if 'allocators' in results and results['allocators']:
             best_alloc = max(results['allocators'], 
                            key=lambda x: x.get('efficiency_pct', 0))
             f.write(f"# Best allocator: {best_alloc['allocator']}\n")
             f.write(f"# (Efficiency: {best_alloc.get('efficiency_pct', 0)}%)\n")
+            f.write(f"# NOTE: zbud often works better with ZSWAP (z3fold can fail to load)\n")
             f.write(f"ZRAM_ALLOCATOR={best_alloc['allocator']}\n\n")
         
         # Optimal file count
