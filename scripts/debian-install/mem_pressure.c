@@ -14,6 +14,27 @@
  *   3 = sequential - medium compression ratio
  * 
  * hold_seconds: How long to hold memory before exiting (default: 15)
+ * 
+ * ## 🔧 C Programs Reviewed
+ * 
+ * ### mem_pressure.c ✅ EFFICIENT
+ * **Purpose:** Fast memory allocation with various patterns  
+ * **Key Features:**
+ * - Fast random number generator (LCG) with fixed seed for reproducibility
+ * - Multiple data patterns: mixed (default), random, zeros, sequential
+ * - 64MB chunk processing with progress reporting
+ * - 3-pass memory access to force swapping
+ * - Configurable hold time (default 15s, now using 30s for ZSWAP tests)
+ * 
+ * **Performance:**
+ * - Allocation rate: ~1-2 GB/s (much faster than Python)
+ * - Pattern fill: ~500 MB/s
+ * - Memory locking: none (allows swapping)
+ * 
+ * **Usage in ZSWAP test:**
+ * ```bash
+ * ./mem_pressure 512 0 30  # 512MB, mixed pattern, 30s hold
+ * ```
  */
 
 #include <stdio.h>

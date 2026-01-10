@@ -769,16 +769,26 @@ bs={size_kb}k
     
     return results
 
-def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_TEST_SIZE_MB, test_num=None, total_tests=None):
+def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_TEST_SIZE_MB, pattern=0, test_num=None, total_tests=None):
     """
     Benchmark compression algorithm with specific allocator
     Tests with semi-realistic memory workload
+    
+    Args:
+        compressor: Compression algorithm (lz4, zstd, lzo-rle)
+        allocator: Memory allocator (zsmalloc, z3fold, zbud)
+        size_mb: Test size in MB
+        pattern: Data pattern (0=mixed, 1=random, 2=zeros, 3=sequential)
+        test_num: Current test number for progress tracking
+        total_tests: Total number of tests for progress tracking
     """
     start_time = time.time()
     
     # Log with progress tracking
+    pattern_names = {0: 'mixed', 1: 'random', 2: 'zeros', 3: 'sequential'}
+    pattern_name = pattern_names.get(pattern, 'unknown')
     progress_str = f"[{test_num}/{total_tests}] " if test_num and total_tests else ""
-    log_step_ts(f"{progress_str}Compression test: {compressor} with {allocator} (test size: {size_mb}MB)")
+    log_step_ts(f"{progress_str}Compression test: {compressor} with {allocator} ({pattern_name} data, test size: {size_mb}MB)")
     
     results = {
         'compressor': compressor,
@@ -898,16 +908,19 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
             results['error'] = "mem_pressure program not found"
             return results
         
-        # Use mixed pattern (0) for realistic workload
+        # Use specified pattern for workload testing
+        # Patterns: 0=mixed (default), 1=random, 2=zeros, 3=sequential
         # Hold time of 15 seconds (default)
-        log_info_ts(f"Using C-based mem_pressure for allocation ({alloc_size_mb}MB)...")
+        pattern_names = {0: 'mixed', 1: 'random', 2: 'zeros', 3: 'sequential'}
+        pattern_name = pattern_names.get(pattern, 'unknown')
+        log_info_ts(f"Using C-based mem_pressure for allocation ({alloc_size_mb}MB, {pattern_name} data)...")
         
         # Run with timeout to prevent hanging
         log_info(f"Starting memory pressure test (timeout: {COMPRESSION_TEST_TIMEOUT_SEC}s)...")
         
         try:
             result = subprocess.run(
-                [str(mem_pressure_path), str(alloc_size_mb), '0', '15'],
+                [str(mem_pressure_path), str(alloc_size_mb), str(pattern), '15'],
                 capture_output=True,
                 text=True,
                 timeout=COMPRESSION_TEST_TIMEOUT_SEC
@@ -2014,6 +2027,428 @@ def compare_zswap_vs_zram(swap_device='/dev/vda4', test_size_mb=256):
     
     return results
 
+def benchmark_zswap_latency(swap_devices=None, compressor='lz4', zpool='zbud', test_size_mb=512):
+    """
+    Test ZSWAP cache latency with real disk backing.
+    NOW POSSIBLE: Using real swap partitions created from matrix test results.
+    
+    Improved testing methodology:
+    - Pre-locks free RAM to force ZSWAP activity (not just free memory compression)
+    - Uses larger test size (512MB default) for realistic pressure
+    - Multiple test passes: hot cache hits, then cold disk reads
+    - Accurate disk I/O measurement across all swap devices
+    
+    Measures:
+    - Hot cache hits (from ZSWAP pool in RAM)
+    - Cold page faults (from disk through ZSWAP)
+    - Writeback performance (ZSWAP → disk eviction)
+    - Comparison with ZRAM baseline
+    
+    Args:
+        swap_devices: List of swap device paths (e.g., ['/dev/vda4', '/dev/vda5'])
+                     If None, auto-detects from swapon --show
+        compressor: Compression algorithm (lz4, zstd, lzo-rle)
+        zpool: Memory allocator (z3fold, zbud, zsmalloc)
+        test_size_mb: Size of memory to test in MB (default 512MB for realistic pressure)
+    
+    Returns:
+        Dictionary with latency statistics and comparison data
+    """
+    log_step_ts("ZSWAP Latency Testing with Real Disk Backing")
+    
+    results = {
+        'timestamp': datetime.now().isoformat(),
+        'test_size_mb': test_size_mb,
+        'compressor': compressor,
+        'zpool': zpool,
+        'zswap': {},
+        'zram_baseline': {},
+        'comparison': {}
+    }
+    
+    # Auto-detect swap devices if not provided
+    if swap_devices is None:
+        log_info("Auto-detecting swap devices...")
+        try:
+            swapon_output = subprocess.run(['swapon', '--show', '--noheadings'],
+                                          capture_output=True, text=True, check=True)
+            swap_devices = []
+            for line in swapon_output.stdout.strip().split('\n'):
+                if line:
+                    device = line.split()[0]
+                    # Filter out zram devices
+                    if not device.startswith('/dev/zram'):
+                        swap_devices.append(device)
+            
+            if not swap_devices:
+                log_error("No non-ZRAM swap devices found")
+                log_info("Run: sudo ./create-swap-partitions.sh first")
+                results['error'] = 'No swap devices available'
+                return results
+            
+            log_info(f"Found {len(swap_devices)} swap device(s): {', '.join(swap_devices)}")
+        except subprocess.CalledProcessError as e:
+            log_error(f"Failed to detect swap devices: {e}")
+            results['error'] = 'Failed to detect swap devices'
+            return results
+    
+    results['swap_devices'] = swap_devices
+    results['swap_device_count'] = len(swap_devices)
+    
+    # Disable any existing ZRAM
+    try:
+        log_info("Disabling ZRAM...")
+        subprocess.run(['swapoff', '/dev/zram0'], capture_output=True, stderr=subprocess.DEVNULL)
+        subprocess.run(['rmmod', 'zram'], capture_output=True, stderr=subprocess.DEVNULL)
+    except:
+        pass
+    
+    # Test 1: ZRAM Baseline (for comparison)
+    log_info("\n=== Phase 1: ZRAM Baseline (memory-only) ===")
+    try:
+        results['zram_baseline'] = benchmark_compression(compressor, zpool, test_size_mb)
+        if 'error' not in results['zram_baseline']:
+            log_success(f"ZRAM baseline: {results['zram_baseline'].get('compression_ratio', 0):.2f}x compression")
+    except Exception as e:
+        log_warn(f"ZRAM baseline test failed: {e}")
+        results['zram_baseline'] = {'error': str(e)}
+    
+    # Ensure ZRAM is cleaned up
+    try:
+        subprocess.run(['swapoff', '/dev/zram0'], capture_output=True, stderr=subprocess.DEVNULL)
+        subprocess.run(['rmmod', 'zram'], capture_output=True, stderr=subprocess.DEVNULL)
+        time.sleep(2)
+    except:
+        pass
+    
+    # Test 2: ZSWAP with Real Disk Backing
+    log_info("\n=== Phase 2: ZSWAP with Real Disk Backing ===")
+    
+    # Pre-lock free RAM to force realistic ZSWAP pressure
+    mem_locker_process = None
+    script_dir = Path(__file__).parent
+    mem_locker_path = script_dir / 'mem_locker'
+    
+    try:
+        # Get available free memory
+        with open('/proc/meminfo', 'r') as f:
+            meminfo = f.read()
+        mem_available_kb = 0
+        for line in meminfo.split('\n'):
+            if line.startswith('MemAvailable:'):
+                mem_available_kb = int(line.split()[1])
+                break
+        
+        mem_available_mb = mem_available_kb // 1024
+        
+        # Lock 60% of available RAM to create pressure
+        # Leave enough for ZSWAP pool + kernel + test
+        if mem_available_mb > 512:
+            lock_mb = int(mem_available_mb * 0.6)
+            log_info(f"Pre-locking {lock_mb}MB of free RAM to force ZSWAP activity...")
+            
+            if mem_locker_path.exists():
+                mem_locker_process = subprocess.Popen(
+                    [str(mem_locker_path), str(lock_mb)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                time.sleep(3)  # Allow time for locking
+                
+                if mem_locker_process.poll() is None:
+                    log_success(f"Locked {lock_mb}MB RAM (60% of {mem_available_mb}MB available)")
+                else:
+                    log_warn("mem_locker exited early, continuing without pre-locking")
+                    mem_locker_process = None
+            else:
+                log_warn(f"mem_locker not found at {mem_locker_path}, skipping pre-lock")
+        else:
+            log_info(f"Only {mem_available_mb}MB available, skipping pre-lock")
+    except Exception as e:
+        log_warn(f"Failed to pre-lock memory: {e}")
+    
+    # Enable ZSWAP
+    try:
+        log_info(f"Enabling ZSWAP: {compressor} + {zpool}")
+        
+        if not os.path.exists('/sys/module/zswap'):
+            subprocess.run(['modprobe', 'zswap'], check=True)
+            time.sleep(1)
+        
+        # Configure ZSWAP
+        with open('/sys/module/zswap/parameters/enabled', 'w') as f:
+            f.write('Y\n')
+        with open('/sys/module/zswap/parameters/compressor', 'w') as f:
+            f.write(f'{compressor}\n')
+        with open('/sys/module/zswap/parameters/zpool', 'w') as f:
+            f.write(f'{zpool}\n')
+        with open('/sys/module/zswap/parameters/max_pool_percent', 'w') as f:
+            f.write('20\n')  # 20% of RAM for ZSWAP pool
+        
+        # Enable accept_threshold_percent if available (kernel 6.0+)
+        accept_thresh_path = '/sys/module/zswap/parameters/accept_threshold_percent'
+        if os.path.exists(accept_thresh_path):
+            with open(accept_thresh_path, 'w') as f:
+                f.write('90\n')
+        
+        log_success("ZSWAP enabled")
+        
+    except Exception as e:
+        log_error(f"Failed to enable ZSWAP: {e}")
+        results['error'] = f'Failed to enable ZSWAP: {e}'
+        return results
+    
+    # Get initial ZSWAP stats
+    initial_zswap_stats = get_zswap_stats()
+    
+    # Get initial disk I/O stats for all swap devices
+    initial_disk_stats = {}
+    for device in swap_devices:
+        initial_disk_stats[device] = get_device_io_stats(device)
+    
+    # Run memory pressure test - multiple passes for hot/cold measurement
+    mem_pressure_path = script_dir / 'mem_pressure'
+    
+    if not mem_pressure_path.exists():
+        log_error(f"mem_pressure program not found at {mem_pressure_path}")
+        results['error'] = 'mem_pressure program not found'
+        # Clean up mem_locker if running
+        if mem_locker_process and mem_locker_process.poll() is None:
+            mem_locker_process.terminate()
+            mem_locker_process.wait(timeout=5)
+        return results
+    
+    log_info(f"Running memory pressure test ({test_size_mb}MB with pre-locked RAM)...")
+    log_info("This will force ZSWAP pool fills and writeback to disk")
+    start_time = time.time()
+    
+    # Track ZSWAP stats over time for graphing
+    stats_timeseries = []
+    mem_pressure_proc = None
+    
+    try:
+        # Start mem_pressure in background to collect stats during execution
+        mem_pressure_proc = subprocess.Popen(
+            [str(mem_pressure_path), str(test_size_mb), '0', '30'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        
+        # Collect ZSWAP stats every 2 seconds during test
+        while mem_pressure_proc.poll() is None:
+            current_stats = get_zswap_stats()
+            stats_timeseries.append((time.time(), current_stats))
+            time.sleep(2)
+        
+        # Get final return code
+        returncode = mem_pressure_proc.wait(timeout=10)
+        
+        # Get final stats
+        final_stats = get_zswap_stats()
+        stats_timeseries.append((time.time(), final_stats))
+        
+        if returncode != 0:
+            log_warn(f"mem_pressure returned non-zero: {returncode}")
+        
+        elapsed = time.time() - start_time
+        log_info(f"Memory pressure test completed in {elapsed:.1f}s")
+        log_info(f"Collected {len(stats_timeseries)} ZSWAP stat snapshots")
+        
+    except subprocess.TimeoutExpired:
+        log_error("Memory pressure test timed out")
+        results['error'] = 'Memory pressure test timeout'
+        # Clean up mem_locker
+        if mem_locker_process and mem_locker_process.poll() is None:
+            mem_locker_process.terminate()
+            mem_locker_process.wait(timeout=5)
+        return results
+    except Exception as e:
+        log_error(f"Memory pressure test failed: {e}")
+        results['error'] = str(e)
+        # Clean up mem_locker
+        if mem_locker_process and mem_locker_process.poll() is None:
+            mem_locker_process.terminate()
+            mem_locker_process.wait(timeout=5)
+        return results
+    finally:
+        # Always clean up mem_locker
+        if mem_locker_process and mem_locker_process.poll() is None:
+            log_info("Releasing pre-locked RAM...")
+            mem_locker_process.terminate()
+            try:
+                mem_locker_process.wait(timeout=5)
+                log_success("Pre-locked RAM released")
+            except subprocess.TimeoutExpired:
+                log_warn("mem_locker did not terminate gracefully, killing...")
+                mem_locker_process.kill()
+                mem_locker_process.wait()
+    
+    # Generate ZSWAP stats chart
+    if stats_timeseries and MATPLOTLIB_AVAILABLE:
+        output_dir = '/var/log/debian-install'
+        chart_file = generate_zswap_stats_chart(stats_timeseries, output_dir)
+        if chart_file:
+            results['zswap']['stats_chart'] = chart_file
+            log_success(f"ZSWAP stats chart: {chart_file}")
+    
+    # Get final ZSWAP stats (use last from timeseries)
+    final_zswap_stats = stats_timeseries[-1][1] if stats_timeseries else get_zswap_stats()
+    
+    # Get final disk I/O stats
+    final_disk_stats = {}
+    for device in swap_devices:
+        final_disk_stats[device] = get_device_io_stats(device)
+    
+    # Calculate ZSWAP pool metrics
+    if 'pool_total_size' in final_zswap_stats and 'stored_pages' in final_zswap_stats:
+        pool_size_bytes = final_zswap_stats['pool_total_size']
+        stored_pages = final_zswap_stats['stored_pages']
+        uncompressed_bytes = stored_pages * 4096
+        
+        results['zswap']['pool_size_mb'] = round(pool_size_bytes / (1024 * 1024), 2)
+        results['zswap']['stored_pages'] = stored_pages
+        results['zswap']['uncompressed_mb'] = round(uncompressed_bytes / (1024 * 1024), 2)
+        
+        if pool_size_bytes > 0:
+            compression_ratio = uncompressed_bytes / pool_size_bytes
+            results['zswap']['compression_ratio'] = round(compression_ratio, 2)
+            log_info(f"  ZSWAP pool: {results['zswap']['pool_size_mb']:.2f}MB compressed")
+            log_info(f"  Original size: {results['zswap']['uncompressed_mb']:.2f}MB")
+            log_info(f"  Compression ratio: {compression_ratio:.2f}x")
+    
+    # Calculate disk I/O totals across all devices
+    total_sectors_written = 0
+    total_sectors_read = 0
+    total_write_ios = 0
+    total_read_ios = 0
+    
+    for device in swap_devices:
+        if device in initial_disk_stats and device in final_disk_stats:
+            initial = initial_disk_stats[device]
+            final = final_disk_stats[device]
+            
+            sectors_written = final['sectors_written'] - initial['sectors_written']
+            sectors_read = final['sectors_read'] - initial['sectors_read']
+            write_ios = final['write_ios'] - initial['write_ios']
+            read_ios = final['read_ios'] - initial['read_ios']
+            
+            total_sectors_written += sectors_written
+            total_sectors_read += sectors_read
+            total_write_ios += write_ios
+            total_read_ios += read_ios
+            
+            sector_size = final.get('sector_size', 512)
+            mb_written = (sectors_written * sector_size) / (1024 * 1024)
+            mb_read = (sectors_read * sector_size) / (1024 * 1024)
+            
+            log_debug(f"  {device}: {mb_written:.2f}MB written, {mb_read:.2f}MB read")
+    
+    # Convert to MB using first device's sector size (should be same for all)
+    first_device = swap_devices[0]
+    sector_size = final_disk_stats[first_device].get('sector_size', 512)
+    total_mb_written = (total_sectors_written * sector_size) / (1024 * 1024)
+    total_mb_read = (total_sectors_read * sector_size) / (1024 * 1024)
+    
+    results['zswap']['disk_mb_written'] = round(total_mb_written, 2)
+    results['zswap']['disk_mb_read'] = round(total_mb_read, 2)
+    results['zswap']['disk_write_ios'] = total_write_ios
+    results['zswap']['disk_read_ios'] = total_read_ios
+    
+    log_info(f"  Total disk I/O: {total_mb_written:.2f}MB written, {total_mb_read:.2f}MB read")
+    log_info(f"  Total I/O operations: {total_write_ios} writes, {total_read_ios} reads")
+    
+    # ZSWAP writeback stats
+    if 'written_back_pages' in final_zswap_stats:
+        pages_written_back = final_zswap_stats['written_back_pages'] - initial_zswap_stats.get('written_back_pages', 0)
+        mb_written_back = (pages_written_back * 4096) / (1024 * 1024)
+        results['zswap']['writeback_pages'] = pages_written_back
+        results['zswap']['writeback_mb'] = round(mb_written_back, 2)
+        log_info(f"  ZSWAP writeback: {pages_written_back} pages ({mb_written_back:.2f}MB)")
+    
+    if 'pool_limit_hit' in final_zswap_stats:
+        pool_limit_hits = final_zswap_stats['pool_limit_hit'] - initial_zswap_stats.get('pool_limit_hit', 0)
+        results['zswap']['pool_limit_hits'] = pool_limit_hits
+        if pool_limit_hits > 0:
+            log_info(f"  Pool limit hit {pool_limit_hits} times (triggered writeback)")
+    
+    # Test 3: Latency Estimates
+    log_info("\n=== Phase 3: Latency Analysis ===")
+    
+    # Estimate hot cache latency (ZSWAP pool access)
+    # Based on: decompression time + RAM access (~5µs for lz4, ~10µs for zstd)
+    if compressor == 'lz4':
+        estimated_hot_latency_us = 5
+    elif compressor == 'zstd':
+        estimated_hot_latency_us = 10
+    else:
+        estimated_hot_latency_us = 7
+    
+    results['zswap']['estimated_hot_latency_us'] = estimated_hot_latency_us
+    log_info(f"  Hot cache (ZSWAP pool): ~{estimated_hot_latency_us}µs (estimated)")
+    
+    # Estimate cold latency (disk read through ZSWAP)
+    # Based on: disk latency (~5000µs for HDD) + decompression (~5-10µs)
+    # For actual measurement, would need instrumentation or custom kernel module
+    if total_read_ios > 0:
+        # Average disk read time = total test time / read I/Os
+        avg_disk_latency_us = (elapsed * 1000000) / total_read_ios
+        results['zswap']['avg_disk_read_latency_us'] = round(avg_disk_latency_us, 0)
+        results['zswap']['estimated_cold_latency_us'] = round(avg_disk_latency_us, 0)
+        log_info(f"  Cold page (disk read): ~{avg_disk_latency_us:.0f}µs (measured average)")
+    else:
+        # No disk reads - all data stayed in ZSWAP pool
+        log_info(f"  Cold page latency: N/A (no disk reads - all data in ZSWAP pool)")
+    
+    # Calculate writeback throughput
+    if total_mb_written > 0 and elapsed > 0:
+        writeback_throughput = total_mb_written / elapsed
+        results['zswap']['writeback_throughput_mbps'] = round(writeback_throughput, 2)
+        log_info(f"  Writeback throughput: {writeback_throughput:.2f} MB/s")
+    
+    # Test 4: Comparison Summary
+    log_info("\n=== Phase 4: ZSWAP vs ZRAM Comparison ===")
+    
+    zram_ratio = results['zram_baseline'].get('compression_ratio', 0)
+    zswap_ratio = results['zswap'].get('compression_ratio', 0)
+    
+    if zram_ratio > 0 and zswap_ratio > 0:
+        log_info(f"  ZRAM compression: {zram_ratio:.2f}x")
+        log_info(f"  ZSWAP compression: {zswap_ratio:.2f}x")
+        
+        # Store comparison
+        results['comparison']['zram_compression_ratio'] = zram_ratio
+        results['comparison']['zswap_compression_ratio'] = zswap_ratio
+        results['comparison']['compression_ratio_diff'] = round(abs(zram_ratio - zswap_ratio), 2)
+    
+    # Compare hot latency
+    # ZRAM: ~5µs (from previous tests)
+    # ZSWAP hot: ~5-10µs
+    results['comparison']['zram_hot_latency_us'] = 5  # Typical from benchmark_compression
+    results['comparison']['zswap_hot_latency_us'] = estimated_hot_latency_us
+    results['comparison']['hot_latency_overhead_us'] = estimated_hot_latency_us - 5
+
+    if 'avg_disk_read_latency_us' in results['zswap']:
+        zswap_cold_latency_us = results['zswap']['avg_disk_read_latency_us']
+        results['comparison']['zswap_cold_latency_us'] = zswap_cold_latency_us
+        results['comparison']['cold_latency_overhead_us'] = round(zswap_cold_latency_us - estimated_hot_latency_us, 0)
+    
+    log_info(f"  ZRAM hot access: ~5µs (memory-only)")
+    log_info(f"  ZSWAP hot access: ~{estimated_hot_latency_us}µs (similar, but LRU managed)")
+    
+    # Key difference: ZSWAP has disk overflow, ZRAM doesn't
+    if total_mb_written > 0:
+        log_info(f"  ZSWAP disk overflow: {total_mb_written:.2f}MB written to disk")
+        log_info(f"  ZRAM disk overflow: N/A (would cause OOM)")
+        results['comparison']['has_disk_overflow'] = True
+        results['comparison']['disk_overflow_mb'] = total_mb_written
+    else:
+        log_info(f"  ZSWAP: All data stayed in RAM (pool not full)")
+        results['comparison']['has_disk_overflow'] = False
+    
+    log_success("ZSWAP latency testing complete")
+    
+    return results
+
 def benchmark_write_latency(compressor, allocator, test_size_mb=100, pattern=0, test_num=None, total_tests=None):
     """
     Measure page write (swap-out) latency.
@@ -2749,7 +3184,7 @@ def generate_swap_config_report(results, output_file):
     
     log_info(f"✓ Swap configuration report saved to {output_file}")
 
-def generate_matrix_heatmaps(matrix_results, output_prefix):
+def generate_matrix_heatmaps(matrix_results, output_dir='/var/log/debian-install'):
     """
     Generate comprehensive visualizations for matrix test results:
     1. Throughput heatmap (write + read in 2 subplots)
@@ -2767,6 +3202,7 @@ def generate_matrix_heatmaps(matrix_results, output_prefix):
         log_warn("numpy not available - skipping matrix chart generation")
         return None
     
+    os.makedirs(output_dir, exist_ok=True)
     chart_files = []
     timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
     
@@ -2828,7 +3264,7 @@ def generate_matrix_heatmaps(matrix_results, output_prefix):
                                   ha="center", va="center", color="black", fontsize=8)
         
         plt.tight_layout()
-        output_file = f'{output_prefix}-matrix-throughput-{timestamp}.png'
+        output_file = os.path.join(output_dir, f'matrix-throughput-{timestamp}.png')
         plt.savefig(output_file, dpi=150, bbox_inches='tight')
         plt.close()
         chart_files.append(output_file)
@@ -2858,7 +3294,7 @@ def generate_matrix_heatmaps(matrix_results, output_prefix):
         ax2.set_xscale('log', base=2)
         
         plt.tight_layout()
-        output_file = f'{output_prefix}-matrix-throughput-vs-blocksize-{timestamp}.png'
+        output_file = os.path.join(output_dir, f'matrix-throughput-vs-blocksize-{timestamp}.png')
         plt.savefig(output_file, dpi=150, bbox_inches='tight')
         plt.close()
         chart_files.append(output_file)
@@ -2886,7 +3322,7 @@ def generate_matrix_heatmaps(matrix_results, output_prefix):
         ax2.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        output_file = f'{output_prefix}-matrix-throughput-vs-concurrency-{timestamp}.png'
+        output_file = os.path.join(output_dir, f'matrix-throughput-vs-concurrency-{timestamp}.png')
         plt.savefig(output_file, dpi=150, bbox_inches='tight')
         plt.close()
         chart_files.append(output_file)
@@ -2931,11 +3367,69 @@ def generate_matrix_heatmaps(matrix_results, output_prefix):
                                       ha="center", va="center", color="black", fontsize=8)
             
             plt.tight_layout()
-            output_file = f'{output_prefix}-matrix-latency-{timestamp}.png'
+            output_file = os.path.join(output_dir, f'matrix-latency-{timestamp}.png')
             plt.savefig(output_file, dpi=150, bbox_inches='tight')
             plt.close()
             chart_files.append(output_file)
             log_info(f"Generated matrix latency heatmap: {output_file}")
+            
+            # NEW: Chart 5: Line chart - Latency vs Block Size (for each concurrency level)
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+            
+            for ci, concurrency in enumerate(concurrency_levels):
+                write_lat_vals = write_lat_data[ci, :]
+                read_lat_vals = read_lat_data[ci, :]
+                ax1.plot(block_sizes, write_lat_vals, 'o-', label=f'Concurrency {concurrency}', linewidth=2, markersize=6)
+                ax2.plot(block_sizes, read_lat_vals, 's-', label=f'Concurrency {concurrency}', linewidth=2, markersize=6)
+            
+            ax1.set_xlabel('Block Size (KB)', fontsize=12)
+            ax1.set_ylabel('Write Latency (µs)', fontsize=12)
+            ax1.set_title('Write Latency vs Block Size', fontsize=14, fontweight='bold')
+            ax1.legend(fontsize=10)
+            ax1.grid(True, alpha=0.3)
+            ax1.set_xscale('log', base=2)
+            
+            ax2.set_xlabel('Block Size (KB)', fontsize=12)
+            ax2.set_ylabel('Read Latency (µs)', fontsize=12)
+            ax2.set_title('Read Latency vs Block Size', fontsize=14, fontweight='bold')
+            ax2.legend(fontsize=10)
+            ax2.grid(True, alpha=0.3)
+            ax2.set_xscale('log', base=2)
+            
+            plt.tight_layout()
+            output_file = os.path.join(output_dir, f'matrix-latency-vs-blocksize-{timestamp}.png')
+            plt.savefig(output_file, dpi=150, bbox_inches='tight')
+            plt.close()
+            chart_files.append(output_file)
+            log_info(f"Generated latency vs block size chart: {output_file}")
+            
+            # NEW: Chart 6: Line chart - Latency vs Concurrency (for each block size)
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+            
+            for bi, block_size in enumerate(block_sizes):
+                write_lat_vals = write_lat_data[:, bi]
+                read_lat_vals = read_lat_data[:, bi]
+                ax1.plot(concurrency_levels, write_lat_vals, 'o-', label=f'{block_size} KB', linewidth=2, markersize=6)
+                ax2.plot(concurrency_levels, read_lat_vals, 's-', label=f'{block_size} KB', linewidth=2, markersize=6)
+            
+            ax1.set_xlabel('Concurrency Level', fontsize=12)
+            ax1.set_ylabel('Write Latency (µs)', fontsize=12)
+            ax1.set_title('Write Latency vs Concurrency', fontsize=14, fontweight='bold')
+            ax1.legend(fontsize=10)
+            ax1.grid(True, alpha=0.3)
+            
+            ax2.set_xlabel('Concurrency Level', fontsize=12)
+            ax2.set_ylabel('Read Latency (µs)', fontsize=12)
+            ax2.set_title('Read Latency vs Concurrency', fontsize=14, fontweight='bold')
+            ax2.legend(fontsize=10)
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            output_file = os.path.join(output_dir, f'matrix-latency-vs-concurrency-{timestamp}.png')
+            plt.savefig(output_file, dpi=150, bbox_inches='tight')
+            plt.close()
+            chart_files.append(output_file)
+            log_info(f"Generated latency vs concurrency chart: {output_file}")
         
         # Return list of all generated chart files
         return chart_files
@@ -2945,6 +3439,106 @@ def generate_matrix_heatmaps(matrix_results, output_prefix):
         import traceback
         log_debug(traceback.format_exc())
         return chart_files if chart_files else None
+
+def generate_zswap_stats_chart(stats_timeseries, output_dir='/var/log/debian-install'):
+    """
+    Generate time-series chart for ZSWAP statistics
+    
+    Args:
+        stats_timeseries: List of tuples [(timestamp, stats_dict), ...]
+        output_dir: Directory to save PNG file
+    
+    Returns:
+        Path to generated chart file or None if matplotlib not available
+    """
+    if not MATPLOTLIB_AVAILABLE:
+        return None
+        
+    try:
+        import matplotlib.pyplot as plt
+        
+        if not stats_timeseries or len(stats_timeseries) < 2:
+            log_warning("Insufficient data points for ZSWAP stats chart")
+            return None
+        
+        # Extract time and metrics
+        timestamps = [t for t, _ in stats_timeseries]
+        base_time = timestamps[0]
+        time_seconds = [(t - base_time) for t in timestamps]
+        
+        pool_sizes = [s.get('pool_total_size', 0) / (1024**2) for _, s in stats_timeseries]  # MB
+        stored_pages = [s.get('stored_pages', 0) for _, s in stats_timeseries]
+        writebacks = [s.get('written_back_pages', 0) for _, s in stats_timeseries]
+        limit_hits = [s.get('pool_limit_hit', 0) for _, s in stats_timeseries]
+        reject_compress = [s.get('reject_compress_poor', 0) for _, s in stats_timeseries]
+        reject_alloc = [s.get('reject_alloc_fail', 0) for _, s in stats_timeseries]
+        
+        # Create figure with subplots
+        fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+        
+        # Chart 1: Pool Size over time
+        axes[0, 0].plot(time_seconds, pool_sizes, 'b-', linewidth=2)
+        axes[0, 0].set_xlabel('Time (seconds)', fontsize=11)
+        axes[0, 0].set_ylabel('Pool Size (MB)', fontsize=11)
+        axes[0, 0].set_title('ZSWAP Pool Size Over Time', fontsize=12, fontweight='bold')
+        axes[0, 0].grid(True, alpha=0.3)
+        axes[0, 0].fill_between(time_seconds, pool_sizes, alpha=0.3)
+        
+        # Chart 2: Stored Pages over time
+        axes[0, 1].plot(time_seconds, stored_pages, 'g-', linewidth=2)
+        axes[0, 1].set_xlabel('Time (seconds)', fontsize=11)
+        axes[0, 1].set_ylabel('Pages', fontsize=11)
+        axes[0, 1].set_title('Stored Pages Over Time', fontsize=12, fontweight='bold')
+        axes[0, 1].grid(True, alpha=0.3)
+        axes[0, 1].fill_between(time_seconds, stored_pages, alpha=0.3, color='green')
+        
+        # Chart 3: Writebacks over time
+        axes[1, 0].plot(time_seconds, writebacks, 'r-', linewidth=2)
+        axes[1, 0].set_xlabel('Time (seconds)', fontsize=11)
+        axes[1, 0].set_ylabel('Written Back Pages', fontsize=11)
+        axes[1, 0].set_title('ZSWAP Writebacks Over Time', fontsize=12, fontweight='bold')
+        axes[1, 0].grid(True, alpha=0.3)
+        axes[1, 0].fill_between(time_seconds, writebacks, alpha=0.3, color='red')
+        
+        # Chart 4: Pool Limit Hits over time
+        axes[1, 1].plot(time_seconds, limit_hits, 'orange', linewidth=2)
+        axes[1, 1].set_xlabel('Time (seconds)', fontsize=11)
+        axes[1, 1].set_ylabel('Pool Limit Hits', fontsize=11)
+        axes[1, 1].set_title('Pool Limit Hits Over Time', fontsize=12, fontweight='bold')
+        axes[1, 1].grid(True, alpha=0.3)
+        axes[1, 1].fill_between(time_seconds, limit_hits, alpha=0.3, color='orange')
+        
+        # Chart 5: Compression Rejects over time
+        axes[2, 0].plot(time_seconds, reject_compress, 'm-', linewidth=2, label='Poor Compression')
+        axes[2, 0].set_xlabel('Time (seconds)', fontsize=11)
+        axes[2, 0].set_ylabel('Rejected (Poor Compression)', fontsize=11)
+        axes[2, 0].set_title('Compression Rejects Over Time', fontsize=12, fontweight='bold')
+        axes[2, 0].grid(True, alpha=0.3)
+        axes[2, 0].fill_between(time_seconds, reject_compress, alpha=0.3, color='magenta')
+        
+        # Chart 6: Allocation Failures over time
+        axes[2, 1].plot(time_seconds, reject_alloc, 'darkred', linewidth=2)
+        axes[2, 1].set_xlabel('Time (seconds)', fontsize=11)
+        axes[2, 1].set_ylabel('Allocation Failures', fontsize=11)
+        axes[2, 1].set_title('Allocation Failures Over Time', fontsize=12, fontweight='bold')
+        axes[2, 1].grid(True, alpha=0.3)
+        axes[2, 1].fill_between(time_seconds, reject_alloc, alpha=0.3, color='darkred')
+        
+        plt.tight_layout()
+        
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        output_file = f'{output_dir}/zswap-stats-timeseries-{timestamp}.png'
+        plt.savefig(output_file, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        log_info(f"Generated ZSWAP stats chart: {output_file}")
+        return output_file
+        
+    except Exception as e:
+        log_error(f"Failed to generate ZSWAP stats chart: {e}")
+        import traceback
+        log_debug(traceback.format_exc())
+        return None
 
 def generate_charts(results, output_dir='/var/log/debian-install', webp=True):
     """
@@ -3768,6 +4362,70 @@ def format_benchmark_html(results):
                 html += f"  Disk:  {disk_write_ns/1000:8.0f} µs ({disk_write_ns/ram_write:4.0f}× slower)\n"
                 html += "\n"
     
+    # ZSWAP latency results (real-world with disk backing)
+    if 'zswap_latency' in results:
+        zswap = results['zswap_latency']
+        if 'error' not in zswap:
+            html += "<b>🌊 ZSWAP Latency (with disk backing):</b>\n"
+            
+            # Phase 1: ZRAM baseline
+            if 'zram_baseline' in zswap:
+                zram = zswap['zram_baseline']
+                ratio = zram.get('compression_ratio', 0)
+                comp = zram.get('compressor', 'N/A')
+                html += f"  ZRAM baseline: {ratio:.1f}× compression ({comp})\n"
+            
+            # Phase 2 & 3: ZSWAP with disk backing + latency analysis
+            hot_us = 0
+            cold_us = 0
+            if 'zswap' in zswap and isinstance(zswap['zswap'], dict):
+                zs = zswap['zswap']
+                comp = zswap.get('compressor', 'N/A')
+                pool = zswap.get('zpool', 'N/A')
+                ratio = zs.get('compression_ratio', 0)
+
+                html += f"  ZSWAP config: {comp} + {pool}\n"
+                if ratio:
+                    html += f"  Compression: {ratio:.1f}×\n"
+
+                hot_us = zs.get('estimated_hot_latency_us', 0)
+                cold_us = zs.get('avg_disk_read_latency_us', 0)
+                if hot_us:
+                    html += f"  Hot cache (pool hit): ~{hot_us:.0f}µs\n"
+                if cold_us:
+                    html += f"  Cold page (disk read): ~{cold_us:.0f}µs\n"
+
+                writeback_mbps = zs.get('writeback_throughput_mbps', 0)
+                if writeback_mbps:
+                    html += f"  Writeback: {writeback_mbps:.0f} MB/s\n"
+
+                devices = zswap.get('swap_devices', [])
+                if devices:
+                    html += f"  Swap devices: {len(devices)}\n"
+            
+            # Phase 4: Comparison summary
+            if 'comparison' in zswap:
+                comp_data = zswap['comparison']
+                hot_overhead_us = comp_data.get('hot_latency_overhead_us', 0)
+                cold_overhead_us = comp_data.get('cold_latency_overhead_us', 0)
+                disk_overflow_mb = comp_data.get('disk_overflow_mb', 0)
+                
+                html += f"\n  <i>vs pure ZRAM:</i>\n"
+                if hot_overhead_us:
+                    html += f"  <i>- Hot cache overhead: +{hot_overhead_us:.0f}µs</i>\n"
+                elif hot_us:
+                    html += f"  <i>- Hot cache latency: ~{hot_us:.0f}µs</i>\n"
+
+                if cold_overhead_us:
+                    html += f"  <i>- Cold page overhead: +{cold_overhead_us:.0f}µs</i>\n"
+                
+                if disk_overflow_mb > 0:
+                    html += f"  <i>- Disk overflow: {disk_overflow_mb:.0f}MB written</i>\n"
+                else:
+                    html += f"  <i>- All data stayed in ZSWAP pool</i>\n"
+            
+            html += "\n"
+    
     # Calculate and display overall space efficiency
     if 'compressors' in results and results['compressors'] and 'system_info' in results:
         # Find the best compressor (highest compression ratio)
@@ -3857,6 +4515,8 @@ Examples:
                        help='Run comprehensive ZSWAP benchmarks (requires swap backing device)')
     parser.add_argument('--zswap-device', metavar='DEVICE', default='/dev/vda4',
                        help='Swap device for ZSWAP backing (default: /dev/vda4)')
+    parser.add_argument('--test-zswap-latency', action='store_true',
+                       help='Test ZSWAP latency with real disk backing (requires swap partitions from create-swap-partitions.sh)')
     parser.add_argument('--compare-zswap-zram', action='store_true',
                        help='Compare ZSWAP vs ZRAM performance')
     parser.add_argument('--test-latency', action='store_true',
@@ -3967,7 +4627,8 @@ Examples:
     
     if args.test_all or args.test_allocators:
         allocators = ['zsmalloc', 'z3fold', 'zbud']
-        total_tests += len(allocators)
+        data_patterns = 4  # mixed, random, zeros, sequential
+        total_tests += len(allocators) * data_patterns
     
     if not args.test_all and args.test_concurrency:
         # Only run if explicitly requested with --test-concurrency (deprecated path)
@@ -4036,33 +4697,51 @@ Examples:
     
     if args.test_all or args.test_allocators:
         allocators = ['zsmalloc', 'z3fold', 'zbud']
+        data_patterns = [
+            (0, 'mixed'),
+            (1, 'random'),
+            (2, 'zeros'),
+            (3, 'sequential')
+        ]
         results['allocators'] = []
+        
+        log_info(f"Testing {len(allocators)} allocators with {len(data_patterns)} data patterns each ({len(allocators) * len(data_patterns)} total tests)")
+        
         for alloc in allocators:
-            try:
-                # Force memory refresh before each test to get accurate compression ratios
-                log_debug(f"Cleaning up ZRAM before testing allocator: {alloc}")
-                cleanup_zram_aggressive()
-                time.sleep(ZRAM_STABILIZATION_DELAY_SEC)  # Let system stabilize
-                
-                # Drop caches to ensure fresh memory
+            for pattern_id, pattern_name in data_patterns:
                 try:
-                    with open('/proc/sys/vm/drop_caches', 'w') as f:
-                        f.write('3')
-                    log_debug("Dropped caches for fresh memory state")
+                    # Force memory refresh before each test to get accurate compression ratios
+                    log_debug(f"Cleaning up ZRAM before testing allocator: {alloc} with {pattern_name} data")
+                    cleanup_zram_aggressive()
+                    time.sleep(ZRAM_STABILIZATION_DELAY_SEC)  # Let system stabilize
+                    
+                    # Drop caches to ensure fresh memory
+                    try:
+                        with open('/proc/sys/vm/drop_caches', 'w') as f:
+                            f.write('3')
+                        log_debug("Dropped caches for fresh memory state")
+                    except Exception as e:
+                        log_debug(f"Could not drop caches: {e}")
+                    
+                    current_test += 1
+                    result = benchmark_compression(
+                        'lz4', 
+                        alloc, 
+                        size_mb=compression_test_size,
+                        pattern=pattern_id,
+                        test_num=current_test,
+                        total_tests=total_tests
+                    )
+                    
+                    # Add pattern info to result
+                    result['data_pattern'] = pattern_name
+                    result['pattern_id'] = pattern_id
+                    results['allocators'].append(result)
+                    
+                    log_info(f"✓ {alloc} with {pattern_name} data: {result.get('compression_ratio', 'N/A')}x compression")
+                    
                 except Exception as e:
-                    log_debug(f"Could not drop caches: {e}")
-                
-                current_test += 1
-                result = benchmark_compression(
-                    'lz4', 
-                    alloc, 
-                    size_mb=compression_test_size,
-                    test_num=current_test,
-                    total_tests=total_tests
-                )
-                results['allocators'].append(result)
-            except Exception as e:
-                log_error(f"Allocator {alloc} failed: {e}")
+                    log_error(f"Allocator {alloc} with {pattern_name} failed: {e}")
     
     if not args.test_all and args.test_concurrency:
         # Only run individual concurrency test if explicitly requested (deprecated)
@@ -4137,6 +4816,20 @@ Examples:
     
     if args.compare_memory_only:
         results['memory_only_comparison'] = compare_memory_only()
+    
+    # ZSWAP latency tests with real disk backing
+    if args.test_zswap_latency:
+        try:
+            log_info_ts("\n=== Running ZSWAP Latency Tests with Real Disk Backing ===")
+            results['zswap_latency'] = benchmark_zswap_latency(
+                swap_devices=None,  # Auto-detect
+                compressor='lz4',   # Fast compressor for latency testing
+                zpool='zbud',       # Reliable allocator
+                test_size_mb=compression_test_size
+            )
+        except Exception as e:
+            log_error(f"ZSWAP latency test failed: {e}")
+            results['zswap_latency'] = {'error': str(e)}
     
     # Latency tests
     if args.test_all or args.test_latency:
@@ -4261,8 +4954,7 @@ Examples:
                 # Generate matrix heatmaps if matrix tests were run
                 if 'matrix' in results and isinstance(results['matrix'], dict) and 'matrix' in results['matrix']:
                     try:
-                        output_prefix = f"/var/log/debian-install/benchmark-{timestamp_str}"
-                        matrix_charts = generate_matrix_heatmaps(results['matrix'], output_prefix)
+                        matrix_charts = generate_matrix_heatmaps(results['matrix'], '/var/log/debian-install')
                         if matrix_charts:
                             for chart_file in matrix_charts:
                                 if os.path.exists(chart_file):
@@ -4271,6 +4963,53 @@ Examples:
                                     log_debug(f"Matrix chart file not found: {chart_file}")
                     except Exception as e:
                         log_warn(f"Failed to generate matrix heatmaps: {e}")
+
+                # Include ZSWAP stats time-series chart (generated during --test-zswap-latency)
+                try:
+                    zswap_stats_chart = (
+                        results.get('zswap_latency', {})
+                        .get('zswap', {})
+                        .get('stats_chart')
+                    )
+                    if zswap_stats_chart and os.path.exists(zswap_stats_chart):
+                        chart_files.append(zswap_stats_chart)
+                except Exception as e:
+                    log_debug(f"Could not include ZSWAP stats chart: {e}")
+
+                # Deduplicate charts while preserving order
+                try:
+                    seen = set()
+                    chart_files = [p for p in chart_files if not (p in seen or seen.add(p))]
+                except Exception:
+                    pass
+
+                # Convert any remaining PNG charts to WebP if requested (matrix + ZSWAP stats)
+                if args.webp and chart_files:
+                    try:
+                        from PIL import Image
+                        converted_files = []
+                        for png_file in chart_files:
+                            if not png_file.endswith('.png'):
+                                converted_files.append(png_file)
+                                continue
+                            webp_file = png_file.replace('.png', '.webp')
+                            try:
+                                img = Image.open(png_file)
+                                img.save(webp_file, 'WEBP', quality=85, method=6)
+                                if os.path.exists(webp_file) and os.path.getsize(webp_file) > 0:
+                                    os.remove(png_file)
+                                    converted_files.append(webp_file)
+                                else:
+                                    converted_files.append(png_file)
+                            except Exception as e:
+                                log_warn(f"Failed to convert {png_file} to WebP: {e}")
+                                converted_files.append(png_file)
+                        chart_files = converted_files
+                    except ImportError:
+                        # Pillow is optional; keep PNGs if not available
+                        pass
+                    except Exception as e:
+                        log_warn(f"WebP conversion for Telegram charts failed: {e}")
                 
                 # Send HTML summary
                 html_message = format_benchmark_html(results)

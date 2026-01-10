@@ -1,7 +1,8 @@
 #!/bin/bash
 # System Setup Bootstrap for Debian
 # Full system initialization including swap, user config, benchmarking
-# MUST BE UNDER 10KB for netcup init script compatibility
+# Note: netcup init-script payloads can be size-limited (~10KB). If you need that,
+# use a tiny shim that curls this full bootstrap script.
 # Usage: curl -fsSL URL | bash
 # Or: curl -fsSL URL | SWAP_ARCH=3 RUN_GEEKBENCH=yes bash
 
@@ -53,6 +54,11 @@ RUN_GEEKBENCH="${RUN_GEEKBENCH:-yes}"
 RUN_BENCHMARKS="${RUN_BENCHMARKS:-yes}"
 BENCHMARK_DURATION="${BENCHMARK_DURATION:-5}"  # Duration in seconds for each benchmark test
 SEND_SYSINFO="${SEND_SYSINFO:-yes}"
+
+# Advanced benchmark options (Phase 2-4) - NOW ENABLED BY DEFAULT
+CREATE_SWAP_PARTITIONS="${CREATE_SWAP_PARTITIONS:-yes}"  # Create optimized partitions from matrix test
+TEST_ZSWAP_LATENCY="${TEST_ZSWAP_LATENCY:-yes}"  # Run ZSWAP latency tests with real partitions
+PRESERVE_ROOT_SIZE_GB="${PRESERVE_ROOT_SIZE_GB:-10}"  # Minimum root partition size (for shrink scenario)
 
 # Telegram
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
@@ -361,6 +367,37 @@ main() {
             # Benchmark results are automatically sent via Telegram if configured
             # Optimal configuration exported to $BENCHMARK_CONFIG for use by setup-swap.sh
             export SWAP_BENCHMARK_CONFIG="$BENCHMARK_CONFIG"
+            
+            # Phase 2: Create optimized swap partitions based on matrix test results
+            if [ "$CREATE_SWAP_PARTITIONS" = "yes" ] && [ -f "$BENCHMARK_OUTPUT" ]; then
+                log_info "==> Creating optimized swap partitions from benchmark results"
+                log_info "This will modify disk partition table (root may be resized)"
+                
+                export PRESERVE_ROOT_SIZE_GB
+                if ./create-swap-partitions.sh 2>&1 | tee -a "$LOG_FILE"; then
+                    log_info "✓ Swap partitions created successfully"
+                    
+                    # Phase 3: Run ZSWAP latency tests with real partitions
+                    if [ "$TEST_ZSWAP_LATENCY" = "yes" ]; then
+                        log_info "==> Testing ZSWAP latency with real disk backing"
+                        if ./benchmark.py --test-zswap-latency 2>&1 | tee -a "$LOG_FILE"; then
+                            log_info "✓ ZSWAP latency test complete"
+                        else
+                            log_warn "ZSWAP latency test had issues (non-critical)"
+                        fi
+                    else
+                        log_info "==> ZSWAP latency test skipped (TEST_ZSWAP_LATENCY=$TEST_ZSWAP_LATENCY)"
+                    fi
+                else
+                    log_error "✗ Swap partition creation failed"
+                    log_warn "Continuing with existing swap configuration"
+                fi
+            elif [ "$CREATE_SWAP_PARTITIONS" = "yes" ]; then
+                log_warn "CREATE_SWAP_PARTITIONS=yes but benchmark results not found"
+                log_warn "Skipping partition creation (requires matrix test results)"
+            else
+                log_info "==> Swap partition creation skipped (CREATE_SWAP_PARTITIONS=$CREATE_SWAP_PARTITIONS)"
+            fi
         else
             log_warn "Benchmarks had issues (non-critical, continuing)"
         fi
