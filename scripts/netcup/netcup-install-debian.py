@@ -179,7 +179,11 @@ def load_env_file():
                     ):
                         value = value[1:-1]
 
-                    os.environ.setdefault(key.strip(), value)
+                    # In this repo, `.env` is the primary configuration source for the
+                    # installer. Prefer it over pre-set environment variables to keep
+                    # runs deterministic (CLI flags are the intended override channel).
+                    key = key.strip()
+                    os.environ[key] = value
 
 load_env_file()
 
@@ -360,6 +364,66 @@ def _tcp_port_open(host: str, port: int = 22, timeout: float = 2.0) -> bool:
             return True
     except OSError:
         return False
+
+
+_TASK_TERMINAL_STATES = {"FINISHED", "ERROR", "CANCELED", "ROLLBACK"}
+
+
+def _parse_iso_ts(ts: Optional[str]) -> Optional[datetime]:
+    if not ts or not isinstance(ts, str):
+        return None
+    try:
+        # Handle both `...Z` and `...+00:00` formats.
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return None
+
+
+def _find_active_task_for_server(client: "NetcupSCPClient", server_id: int) -> Optional[Dict[str, Any]]:
+    """Best-effort: find the most recent non-terminal task for a server."""
+    resp = client.get("/api/v1/tasks", params={"serverId": server_id, "limit": 50})
+
+    # The API is documented as returning a list, but be defensive in case a HAL-ish
+    # wrapper appears.
+    tasks: Any = resp
+    if isinstance(resp, dict):
+        embedded = resp.get("_embedded")
+        if isinstance(embedded, dict):
+            for k in ("tasks", "taskInfoMinimal", "items"):
+                if isinstance(embedded.get(k), list):
+                    tasks = embedded.get(k)
+                    break
+        for k in ("tasks", "items", "content"):
+            if isinstance(resp.get(k), list):
+                tasks = resp.get(k)
+                break
+
+    if not isinstance(tasks, list):
+        return None
+
+    active: List[Dict[str, Any]] = []
+    for t in tasks:
+        if not isinstance(t, dict):
+            continue
+        state = t.get("state")
+        if isinstance(state, str) and state in _TASK_TERMINAL_STATES:
+            continue
+        active.append(t)
+
+    if not active:
+        return None
+
+    def score(task: Dict[str, Any]) -> tuple:
+        name = (task.get("name") or "")
+        msg = (task.get("message") or "")
+        text = f"{name} {msg}".lower()
+        prefers_image = 1 if ("image" in text or "install" in text) else 0
+        started = _parse_iso_ts(task.get("startedAt")) or datetime.min
+        return (prefers_image, started)
+
+    return max(active, key=score)
 
 
 def _build_ssh_cmd_base(host: str, user: str, identity_file: Optional[str] = None) -> List[str]:
@@ -930,12 +994,55 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
                     attach_bootstrap=getattr(args, "attach_bootstrap", True),
                 )
     except requests.HTTPError as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+
+        # If the server is locked because an image installation is already running,
+        # fall back to monitoring the active task.
+        if status == 409:
+            try:
+                error_data = e.response.json() if e.response is not None else None
+            except Exception:
+                error_data = None
+
+            code = error_data.get("code") if isinstance(error_data, dict) else None
+            msg = error_data.get("message") if isinstance(error_data, dict) else None
+            if code == "server.lock.error":
+                sid = locals().get("server_id")
+                if isinstance(sid, int):
+                    active_task = _find_active_task_for_server(client, sid)
+                    if active_task and isinstance(active_task.get("uuid"), str):
+                        task_uuid = active_task["uuid"]
+                        print("⚠ Server is locked (installation already running).")
+                        print(f"✓ Monitoring existing task instead: {task_uuid}")
+
+                        if getattr(args, "monitor", False) or is_noninteractive(args):
+                            ssh_identity = getattr(args, "ssh_identity_file", None)
+                            monitor_task(
+                                client,
+                                task_uuid,
+                                poll_interval=getattr(args, "poll_interval", 5.0),
+                                ssh_host=(getattr(args, "ssh_host", None) or locals().get("ip_address")),
+                                ssh_user=getattr(args, "ssh_user", "root"),
+                                ssh_identity_file=ssh_identity,
+                                attach_bootstrap=getattr(args, "attach_bootstrap", True),
+                            )
+                            return
+
+                        print("Monitor progress with:")
+                        print(f"  python3 monitor-task.py {task_uuid}")
+                        return
+
+                print(f"❌ HTTP Error: {e}", file=sys.stderr)
+                if msg:
+                    print(f"Response: {json.dumps({'code': code, 'message': msg}, indent=2)}", file=sys.stderr)
+                sys.exit(1)
+
         print(f"❌ HTTP Error: {e}", file=sys.stderr)
-        if e.response.text:
+        if e.response is not None and e.response.text:
             try:
                 error_data = e.response.json()
                 print(f"Response: {json.dumps(error_data, indent=2)}", file=sys.stderr)
-            except:
+            except Exception:
                 print(f"Response: {e.response.text}", file=sys.stderr)
         sys.exit(1)
 
@@ -1222,31 +1329,65 @@ def main():
         # 10. Start installation
         print()
         print("Starting installation...")
-        result = client.post(f"/api/v1/servers/{server_id}/image", installation_payload)
+        try:
+            result = client.post(f"/api/v1/servers/{server_id}/image", installation_payload)
 
-        print(json.dumps(result, indent=2))
-        print()
-
-        if "uuid" in result:
-            task_uuid = result["uuid"]
-            print("=" * 70)
-            print("✓ Installation started successfully!")
-            print("=" * 70)
-            print(f"Task UUID: {task_uuid}")
+            print(json.dumps(result, indent=2))
             print()
-            print("Monitor progress with:")
-            print(f"  python3 monitor-task.py {task_uuid}")
-            if getattr(args, "monitor", False) or is_noninteractive(args):
-                ssh_identity = getattr(args, "ssh_identity_file", None)
-                monitor_task(
-                    client,
-                    task_uuid,
-                    poll_interval=getattr(args, "poll_interval", 5.0),
-                    ssh_host=(getattr(args, "ssh_host", None) or ip_address),
-                    ssh_user=getattr(args, "ssh_user", "root"),
-                    ssh_identity_file=ssh_identity,
-                    attach_bootstrap=getattr(args, "attach_bootstrap", True),
-                )
+
+            if "uuid" in result:
+                task_uuid = result["uuid"]
+                print("=" * 70)
+                print("✓ Installation started successfully!")
+                print("=" * 70)
+                print(f"Task UUID: {task_uuid}")
+                print()
+                print("Monitor progress with:")
+                print(f"  python3 monitor-task.py {task_uuid}")
+                if getattr(args, "monitor", False) or is_noninteractive(args):
+                    ssh_identity = getattr(args, "ssh_identity_file", None)
+                    monitor_task(
+                        client,
+                        task_uuid,
+                        poll_interval=getattr(args, "poll_interval", 5.0),
+                        ssh_host=(getattr(args, "ssh_host", None) or ip_address),
+                        ssh_user=getattr(args, "ssh_user", "root"),
+                        ssh_identity_file=ssh_identity,
+                        attach_bootstrap=getattr(args, "attach_bootstrap", True),
+                    )
+        except requests.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 409:
+                try:
+                    error_data = e.response.json() if e.response is not None else None
+                except Exception:
+                    error_data = None
+
+                code = error_data.get("code") if isinstance(error_data, dict) else None
+                if code == "server.lock.error":
+                    active_task = _find_active_task_for_server(client, int(server_id))
+                    if active_task and isinstance(active_task.get("uuid"), str):
+                        task_uuid = active_task["uuid"]
+                        print("⚠ Server is locked (installation already running).")
+                        print(f"✓ Monitoring existing task instead: {task_uuid}")
+
+                        if getattr(args, "monitor", False) or is_noninteractive(args):
+                            ssh_identity = getattr(args, "ssh_identity_file", None)
+                            monitor_task(
+                                client,
+                                task_uuid,
+                                poll_interval=getattr(args, "poll_interval", 5.0),
+                                ssh_host=(getattr(args, "ssh_host", None) or ip_address),
+                                ssh_user=getattr(args, "ssh_user", "root"),
+                                ssh_identity_file=ssh_identity,
+                                attach_bootstrap=getattr(args, "attach_bootstrap", True),
+                            )
+                            return
+
+                        print("Monitor progress with:")
+                        print(f"  python3 monitor-task.py {task_uuid}")
+                        return
+            raise
 
     except requests.HTTPError as e:
         print(f"❌ HTTP Error: {e}", file=sys.stderr)

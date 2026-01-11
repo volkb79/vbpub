@@ -121,6 +121,24 @@ should_reboot_after_stage1() {
     esac
 }
 
+stage1_reboot() {
+    sync || true
+
+    # IMPORTANT: When running under cloud-init/customScript, rebooting inline can
+    # strand the provider task (e.g. Netcup CloudinitWait). Instead, schedule a
+    # delayed reboot so this script can exit cleanly and cloud-init can report
+    # completion.
+    if is_cloud_init_context; then
+        local delay_seconds="${STAGE1_REBOOT_DELAY_SECONDS:-60}"
+        log_warn "Cloud-init context detected; scheduling reboot in ${delay_seconds}s (to allow cloud-init to finish)"
+        ( sleep "$delay_seconds"; systemctl reboot || reboot ) >/dev/null 2>&1 &
+        return 0
+    fi
+
+    log_warn "Rebooting now"
+    systemctl reboot || reboot
+}
+
 log_root_layout() {
     local root_part
     root_part=$(findmnt -n -o SOURCE / 2>/dev/null || echo "")
@@ -499,9 +517,8 @@ run_stage1() {
     tg_send "✅ vbpub stage1 complete on $(hostname -f 2>/dev/null || hostname). Stage2 will run automatically after reboot via systemd."
 
     if should_reboot_after_stage1; then
-        log_warn "Rebooting now to start stage2..."
-        sync
-        systemctl reboot || reboot
+        log_warn "Reboot required to start stage2..."
+        stage1_reboot
     else
         log_info "Stage1 complete. Reboot is required for stage2 (AUTO_REBOOT_AFTER_STAGE1=$AUTO_REBOOT_AFTER_STAGE1)."
     fi
