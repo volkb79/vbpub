@@ -62,6 +62,71 @@ from datetime import datetime
 from pathlib import Path
 
 
+def _normalize_ssh_public_key(public_key: str) -> str:
+    """Normalize an OpenSSH public key for comparison.
+
+    Keeps only the key type and base64 payload (drops comment).
+    """
+    parts = public_key.strip().split()
+    if len(parts) >= 2:
+        return f"{parts[0]} {parts[1]}"
+    return public_key.strip()
+
+
+def _read_public_key_for_identity(identity_file: str) -> str:
+    """Read/derive the public key for a private key identity file.
+
+    Prefers an adjacent .pub file (preserves comment), otherwise falls back to
+    `ssh-keygen -y -f` to derive the public key material.
+    """
+    identity_path = Path(identity_file).expanduser()
+    if not identity_path.exists():
+        raise FileNotFoundError(f"SSH identity file not found: {identity_path}")
+
+    pub_path = identity_path.with_suffix(identity_path.suffix + ".pub")
+    if pub_path.exists():
+        return pub_path.read_text(encoding="utf-8").strip()
+
+    result = subprocess.run(
+        ["ssh-keygen", "-y", "-f", str(identity_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    return result.stdout.strip()
+
+
+def _ensure_netcup_ssh_key_id_for_identity(
+    client: "NetcupSCPClient",
+    identity_file: str,
+) -> int:
+    """Return a netcup sshKeyId matching the given identity file.
+
+    If no matching key exists in the account, create one.
+    """
+    user_id = client.get_user_info()["id"]
+    public_key = _read_public_key_for_identity(identity_file)
+    normalized = _normalize_ssh_public_key(public_key)
+
+    ssh_keys = client.get(f"/api/v1/users/{user_id}/ssh-keys") or []
+    for key in ssh_keys:
+        existing_key = key.get("key")
+        if isinstance(existing_key, str) and _normalize_ssh_public_key(existing_key) == normalized:
+            return int(key["id"])
+
+    # Create a new SSH key in netcup SCP.
+    name_base = Path(identity_file).name
+    created = client.post(
+        f"/api/v1/users/{user_id}/ssh-keys",
+        {
+            "name": f"{name_base} (vbpub) {datetime.now().strftime('%Y%m%d-%H%M%S')}",
+            "key": public_key,
+        },
+    )
+    return int(created["id"])
+
+
 _SENSITIVE_DICT_KEYS = {
     "access_token",
     "refresh_token",
@@ -425,25 +490,15 @@ class _SSHBootstrapFollower:
             if self._stop.is_set():
                 return
 
-            # Tail multiple candidate logs. This is more robust than picking a single file,
-            # because some logs may be truncated/replaced/removed during post-install.
             tail_remote = (
                 "bash -lc 'set -euo pipefail; "
-                "shopt -s nullglob; "
-                "cands=("
-                "/root/custom_script.output "
-                "/var/log/custom_script.output "
-                "/var/log/custom-script.output "
-                "/var/log/custom_script/custom_script.output "
-                "/var/log/custom_script/custom-script.output "
-                "/var/log/netcup/custom_script.output "
-                "/var/log/scp/custom_script.output "
-                "/var/log/debian-install/custom_script.output "
-                "/var/log/debian-install/bootstrap-*.log "
-                "/var/log/cloud-init-output.log "
-                "); "
-                "echo \"[attach] Tailing candidates: ${cands[*]}\"; "
-                "tail -n 200 -F \"${cands[@]}\"'"
+                "P=/root/custom_script.output; "
+                "if [ ! -f \"$P\" ]; then "
+                "  echo \"[attach] Waiting for log to appear: $P\"; "
+                "  for i in $(seq 1 300); do [ -f \"$P\" ] && break; sleep 1; done; "
+                "fi; "
+                "echo \"[attach] Tailing: $P\"; "
+                "tail -n 200 -F \"$P\"'"
             )
 
             cmd_tail = _build_ssh_cmd_base(self.host, self.user, self.identity_file) + [tail_remote]
@@ -736,6 +791,19 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
     
     print("✓ Payload loaded successfully")
     print()
+
+    # If an SSH identity file was provided for monitoring, ensure the same key is injected
+    # by selecting/creating the matching sshKeyId in the SCP account.
+    ssh_identity = getattr(args, "ssh_identity_file", None)
+    if ssh_identity:
+        try:
+            ssh_key_id = _ensure_netcup_ssh_key_id_for_identity(client, ssh_identity)
+            installation_payload["sshKeyIds"] = [ssh_key_id]
+            print(f"✓ Using sshKeyId matching identity file: {ssh_key_id}")
+            print()
+        except Exception as e:
+            print(f"❌ ERROR: failed to resolve sshKeyId for identity file: {e}", file=sys.stderr)
+            sys.exit(1)
     
     # Extract server ID from payload or use hostname to find it
     server_id = None
@@ -806,7 +874,6 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
             print("Monitor progress with:")
             print(f"  python3 monitor-task.py {task_uuid}")
             if getattr(args, "monitor", False) or is_noninteractive(args):
-                ssh_identity = getattr(args, "ssh_identity_file", None)
                 monitor_task(
                     client,
                     task_uuid,
@@ -1047,13 +1114,22 @@ def main():
         ssh_key_names = []
         if not ssh_keys:
             print("   ⚠ WARNING: No SSH keys found!")
-            ssh_key_ids = None
         else:
             for key in ssh_keys:
                 print(f"   - ID: {key['id']:3d} | {key['name']}")
-                ssh_key_names.append(key['name'])
-            ssh_key_ids = [ssh_keys[0]["id"]]
-            print(f"   ✓ Using SSH Key ID: {ssh_key_ids[0]}")
+                ssh_key_names.append(key.get('name', ''))
+
+        ssh_identity = getattr(args, "ssh_identity_file", None)
+        if ssh_identity:
+            ssh_key_id = _ensure_netcup_ssh_key_id_for_identity(client, ssh_identity)
+            ssh_key_ids = [ssh_key_id]
+            print(f"   ✓ Using sshKeyId matching identity file: {ssh_key_id}")
+        else:
+            if not ssh_keys:
+                ssh_key_ids = None
+            else:
+                ssh_key_ids = [ssh_keys[0]["id"]]
+                print(f"   ✓ Using SSH Key ID: {ssh_key_ids[0]}")
         print()
 
         # 6. Prepare installation payload

@@ -21,6 +21,18 @@ log() {
 : "${ROOT_PARTITION:?}"
 : "${NEW_BLOCKS:?}"
 : "${PTABLE_PATH:?}"
+: "${SWAP_FIRST_NUM:?}"
+: "${SWAP_LAST_NUM:?}"
+: "${SWAP_PRIORITY:?}"
+
+part_dev() {
+  # nvme0n1p2 / mmcblk0p2 style needs 'p' separator.
+  if echo "$ROOT_DISK" | grep -q '[0-9]$'; then
+    echo "/dev/${ROOT_DISK}p$1"
+  else
+    echo "/dev/${ROOT_DISK}$1"
+  fi
+}
 
 attempts_file=/run/vbpub-offline-repartition.attempts
 attempts=0
@@ -39,7 +51,7 @@ log "Starting offline root shrink + repartition (attempt $attempts)"
 log "ROOT_PARTITION=$ROOT_PARTITION NEW_BLOCKS=$NEW_BLOCKS PTABLE_PATH=$PTABLE_PATH"
 
 # Ensure tools exist (hook should include them)
-for bin in e2fsck resize2fs sfdisk partx; do
+for bin in e2fsck resize2fs sfdisk partx mkswap blkid; do
   command -v "$bin" >/dev/null 2>&1 || { log "Missing $bin in initramfs"; exit 1; }
 done
 
@@ -61,14 +73,52 @@ sfdisk --force --no-reread "/dev/$ROOT_DISK" <"$PTABLE_PATH" >>"$LOG" 2>&1 || tr
 partx -u "/dev/$ROOT_DISK" >>"$LOG" 2>&1 || true
 sync
 
-# 5) remove marker on root fs so we don't run again
+# Wait briefly for new partition nodes.
+for i in $(seq 1 30); do
+  ok=1
+  for p in $(seq "$SWAP_FIRST_NUM" "$SWAP_LAST_NUM"); do
+    dev="$(part_dev "$p")"
+    [ -b "$dev" ] || ok=0
+  done
+  [ "$ok" -eq 1 ] && break
+  sleep 1
+done
+
+# 5) Format swap partitions and write stable PARTUUID fstab entries.
 mkdir -p /mnt 2>/dev/null || true
-if mount -o ro "$ROOT_PARTITION" /mnt 2>/dev/null; then
+if mount -o rw "$ROOT_PARTITION" /mnt 2>/dev/null; then
+  # Remove prior swap lines (best effort) to avoid duplicates.
+  if [ -f /mnt/etc/fstab ]; then
+    cp /mnt/etc/fstab "/mnt/etc/fstab.backup.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+    awk '
+      /^[[:space:]]*#/ {print; next}
+      NF>=3 && $3=="swap" {next}
+      {print}
+    ' /mnt/etc/fstab > /mnt/etc/fstab.tmp 2>/dev/null && mv /mnt/etc/fstab.tmp /mnt/etc/fstab
+  fi
+
+  for p in $(seq "$SWAP_FIRST_NUM" "$SWAP_LAST_NUM"); do
+    dev="$(part_dev "$p")"
+    if [ -b "$dev" ]; then
+      log "Formatting swap: $dev"
+      mkswap "$dev" >>"$LOG" 2>&1 || true
+      partuuid=$(blkid -s PARTUUID -o value "$dev" 2>/dev/null || true)
+      if [ -n "$partuuid" ]; then
+        echo "PARTUUID=${partuuid} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /mnt/etc/fstab
+      else
+        echo "${dev} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /mnt/etc/fstab
+      fi
+    else
+      log "Swap device missing: $dev"
+    fi
+  done
+
+  # Remove markers so we don't run again.
   rm -f /mnt/etc/vbpub/offline-repartition.conf /mnt/etc/vbpub/offline-ptable.sfdisk 2>/dev/null || true
   umount /mnt 2>/dev/null || true
-  log "Cleared marker files on root; offline repartition complete"
+  log "Wrote swap fstab entries and cleared marker files"
 else
-  log "Could not mount root to clear markers (will retry next boot)"
+  log "Could not mount root rw to update fstab (will retry next boot)"
 fi
 
 exit 0

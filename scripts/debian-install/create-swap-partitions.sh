@@ -452,11 +452,20 @@ schedule_offline_ext_shrink() {
 
     mkdir -p /etc/vbpub
     cp "$PTABLE_NEW" /etc/vbpub/offline-ptable.sfdisk
+
+    local swap_first_num
+    local swap_last_num
+    swap_first_num=$((ROOT_PART_NUM + 1))
+    swap_last_num=$((ROOT_PART_NUM + SWAP_DEVICES))
+
     cat > /etc/vbpub/offline-repartition.conf <<EOF
 ROOT_DISK=${ROOT_DISK}
 ROOT_PARTITION=${ROOT_PARTITION}
 NEW_BLOCKS=${new_blocks}
 PTABLE_PATH=/etc/vbpub/offline-ptable.sfdisk
+SWAP_FIRST_NUM=${swap_first_num}
+SWAP_LAST_NUM=${swap_last_num}
+SWAP_PRIORITY=${SWAP_PRIORITY}
 EOF
 
     mkdir -p /etc/initramfs-tools/scripts/local-premount /etc/initramfs-tools/hooks

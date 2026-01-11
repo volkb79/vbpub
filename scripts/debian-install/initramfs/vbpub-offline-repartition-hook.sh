@@ -20,6 +20,8 @@ copy_exec /sbin/e2fsck /sbin
 copy_exec /sbin/resize2fs /sbin
 copy_exec /sbin/sfdisk /sbin
 copy_exec /sbin/partx /sbin
+copy_exec /sbin/mkswap /sbin
+copy_exec /sbin/blkid /sbin
 
 # Config + partition table (optional)
 if [ -f /etc/vbpub/offline-repartition.conf ]; then

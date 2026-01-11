@@ -421,9 +421,8 @@ main() {
                         log_info "==> ZSWAP latency test skipped (TEST_ZSWAP_LATENCY=$TEST_ZSWAP_LATENCY)"
                     fi
                 elif [ "$rc" -eq 42 ]; then
-                    log_warn "Swap partitioning requires offline ext* resize. Scheduled initramfs job; rebooting now."
-                    sync
-                    reboot
+                    log_warn "Swap partitioning requires offline ext* resize. Scheduled initramfs job for next reboot."
+                    log_warn "Continuing bootstrap without forcing a reboot."
                 else
                     log_error "✗ Swap partition creation failed"
                     log_warn "Continuing with existing swap configuration"
