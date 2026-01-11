@@ -2,7 +2,7 @@
 # Create optimal swap partitions based on benchmark matrix test results
 # Layout policy:
 # - Treat root partition start as fixed
-# - Never shrink mounted root (unsafe / not supported for common filesystems)
+# - Root partition MAY be shrunk to reserve swap-at-end (accepted risk)
 # - Rewrite everything after root to a deterministic plan of equal-sized swap partitions
 # - Optionally extend root so swap sits at disk end
 # Always uses sfdisk dump-modify-write pattern
@@ -13,6 +13,8 @@ set -euo pipefail
 BENCHMARK_RESULTS="${BENCHMARK_RESULTS:-/var/log/debian-install/benchmark-results-*.json}"
 LOG_FILE="${LOG_FILE:-/var/log/debian-install/partition-creation.log}"
 SWAP_PRIORITY="${SWAP_PRIORITY:-10}"
+PRESERVE_ROOT_SIZE_GB="${PRESERVE_ROOT_SIZE_GB:-10}"
+ALLOW_ROOT_SHRINK="${ALLOW_ROOT_SHRINK:-yes}"
 
 # Colors
 RED='\033[0;31m'
@@ -223,37 +225,58 @@ log_info "Root filesystem: $FS_TYPE"
 log_step "Disabling active swap (rerun safety)..."
 swapoff -a 2>/dev/null || true
 
+align_up_2048() {
+    local v="$1"
+    echo $(( (v + 2047) / 2048 * 2048 ))
+}
+
+align_down_2048() {
+    local v="$1"
+    echo $(( (v / 2048) * 2048 ))
+}
+
 # Determine how much space is safely usable at the end of the disk for swap.
 # Keep a small tail buffer so we don't press against GPT end-of-disk structures.
 END_BUFFER_SECTORS=2048
 TOTAL_SWAP_TARGET_SECTORS=$((TOTAL_SWAP_TARGET_MIB * 2048))
 
-# Account for 1MiB alignment: swap partitions will start at the next 2048-sector boundary.
-ROOT_END_ALIGNED=$(( (ROOT_END + 2047) / 2048 * 2048 ))
-MAX_SWAP_SECTORS=$((DISK_SIZE_SECTORS - ROOT_END_ALIGNED - END_BUFFER_SECTORS))
-if [ "$MAX_SWAP_SECTORS" -lt 0 ]; then
-    MAX_SWAP_SECTORS=0
+# Minimum root size policy:
+# - Respect PRESERVE_ROOT_SIZE_GB
+# - Also ensure root stays larger than current used space (+2GiB safety)
+PRESERVE_ROOT_SECTORS=$((PRESERVE_ROOT_SIZE_GB * 1024 * 1024 * 1024 / 512))
+ROOT_USED_BYTES=$(df -B1 --output=used / 2>/dev/null | tail -n 1 | tr -d ' ' || echo 0)
+if [[ -z "${ROOT_USED_BYTES:-}" || ! "${ROOT_USED_BYTES}" =~ ^[0-9]+$ ]]; then
+    ROOT_USED_BYTES=0
+fi
+ROOT_MIN_BYTES=$((ROOT_USED_BYTES + 2 * 1024 * 1024 * 1024))
+ROOT_MIN_SECTORS=$(((ROOT_MIN_BYTES + 511) / 512))
+if [ "$ROOT_MIN_SECTORS" -lt "$PRESERVE_ROOT_SECTORS" ]; then
+    ROOT_MIN_SECTORS="$PRESERVE_ROOT_SECTORS"
+fi
+ROOT_MIN_END_ALIGNED=$(align_up_2048 $((ROOT_START + ROOT_MIN_SECTORS)))
+
+if [ "$ALLOW_ROOT_SHRINK" != "yes" ] && [ "$FREE_SECTORS" -le 0 ]; then
+    log_error "No free space after root and ALLOW_ROOT_SHRINK!=yes"
+    log_error "Set ALLOW_ROOT_SHRINK=yes to carve swap by shrinking the root partition."
+    exit 1
 fi
 
-# IMPORTANT SAFETY POLICY:
-# - Never shrink the root partition when '/' is mounted (ext* cannot shrink online).
-# - If there isn't enough free space after root, reduce swap to fit; if none fits, fail.
+MAX_SWAP_SECTORS=$((DISK_SIZE_SECTORS - END_BUFFER_SECTORS - ROOT_MIN_END_ALIGNED))
+MAX_SWAP_SECTORS=$(align_down_2048 "$MAX_SWAP_SECTORS")
 if [ "$MAX_SWAP_SECTORS" -le 0 ]; then
-    log_error "No usable free space after root for swap partitions (free=${FREE_SECTORS} sectors; buffer=${END_BUFFER_SECTORS})"
-    log_error "Refusing to shrink mounted root partition. Reinstall with unallocated tail space or perform offline shrink in rescue mode."
+    log_error "No usable space for swap after enforcing minimum root size (min_root=${PRESERVE_ROOT_SIZE_GB}GB; used_bytes=${ROOT_USED_BYTES})."
     exit 1
 fi
 
 TOTAL_SWAP_USED_SECTORS=$TOTAL_SWAP_TARGET_SECTORS
 if [ "$TOTAL_SWAP_USED_SECTORS" -gt "$MAX_SWAP_SECTORS" ]; then
-    log_warn "Insufficient free space after root for target swap (${TOTAL_SWAP_TARGET_MIB}MiB)."
-    log_warn "Capping swap to fit available tail space without shrinking root."
+    log_warn "Capping swap to fit disk after minimum root size: target=${TOTAL_SWAP_TARGET_MIB}MiB -> max=$((MAX_SWAP_SECTORS / 2048))MiB"
     TOTAL_SWAP_USED_SECTORS=$MAX_SWAP_SECTORS
 fi
 
 # Align per-device size down to 1MiB (2048 sectors) so all partitions are equal and aligned.
 PER_DEVICE_SECTORS=$((TOTAL_SWAP_USED_SECTORS / SWAP_DEVICES))
-PER_DEVICE_SECTORS=$(( (PER_DEVICE_SECTORS / 2048) * 2048 ))
+PER_DEVICE_SECTORS=$(align_down_2048 "$PER_DEVICE_SECTORS")
 
 if [ "$PER_DEVICE_SECTORS" -lt 2048 ]; then
     # Too many devices for available space; reduce device count so each gets at least 1MiB.
@@ -271,7 +294,7 @@ TOTAL_SWAP_USED_SECTORS=$((PER_DEVICE_SECTORS * SWAP_DEVICES))
 PER_DEVICE_MIB=$((PER_DEVICE_SECTORS / 2048))
 TOTAL_SWAP_USED_MIB=$((PER_DEVICE_MIB * SWAP_DEVICES))
 
-log_info "Total usable tail space for swap: $((MAX_SWAP_SECTORS / 2048))MiB"
+log_info "Total usable tail space for swap: $((MAX_SWAP_SECTORS / 2048))MiB (after min root)"
 log_info "Per-device: ${PER_DEVICE_MIB}MiB (${PER_DEVICE_SECTORS} sectors)"
 log_info "Total swap used: ${TOTAL_SWAP_USED_MIB}MiB (${TOTAL_SWAP_USED_SECTORS} sectors)"
 
@@ -298,22 +321,39 @@ SWAP_TYPE_GUID="0657FD6D-A4AB-43C4-84E5-0933C84B4F4F"  # Linux swap GUID for GPT
 
 log_step "Creating modified partition table..."
 
-# We only ever extend root (never shrink). If there is enough space, extend root so swap sits at disk end.
-# Compute a swap start that is aligned DOWN so that swap+buffer fits exactly at the end.
-NEW_ROOT_SIZE_SECTORS=$ROOT_SIZE
-if [ "$FREE_SECTORS" -gt "$TOTAL_SWAP_USED_SECTORS" ]; then
-    DESIRED_SWAP_START=$((DISK_SIZE_SECTORS - END_BUFFER_SECTORS - TOTAL_SWAP_USED_SECTORS))
-    DESIRED_SWAP_START=$(( (DESIRED_SWAP_START / 2048) * 2048 ))
-    CANDIDATE_ROOT_SIZE=$((DESIRED_SWAP_START - ROOT_START))
-    if [ "$CANDIDATE_ROOT_SIZE" -gt "$ROOT_SIZE" ]; then
-        NEW_ROOT_SIZE_SECTORS=$CANDIDATE_ROOT_SIZE
-    fi
+# Place swap at the end of the disk and resize root partition (extend OR shrink) accordingly.
+# Root start remains fixed.
+DESIRED_SWAP_START=$((DISK_SIZE_SECTORS - END_BUFFER_SECTORS - TOTAL_SWAP_USED_SECTORS))
+DESIRED_SWAP_START=$(align_down_2048 "$DESIRED_SWAP_START")
+
+if [ "$DESIRED_SWAP_START" -lt "$ROOT_MIN_END_ALIGNED" ]; then
+    # Should not happen due to MAX_SWAP_SECTORS cap, but keep it safe.
+    log_warn "Desired swap start would violate minimum root size; shrinking swap to fit minimum root"
+    DESIRED_SWAP_START="$ROOT_MIN_END_ALIGNED"
+    TOTAL_SWAP_USED_SECTORS=$((DISK_SIZE_SECTORS - END_BUFFER_SECTORS - DESIRED_SWAP_START))
+    TOTAL_SWAP_USED_SECTORS=$(align_down_2048 "$TOTAL_SWAP_USED_SECTORS")
+    PER_DEVICE_SECTORS=$((TOTAL_SWAP_USED_SECTORS / SWAP_DEVICES))
+    PER_DEVICE_SECTORS=$(align_down_2048 "$PER_DEVICE_SECTORS")
+    TOTAL_SWAP_USED_SECTORS=$((PER_DEVICE_SECTORS * SWAP_DEVICES))
+    PER_DEVICE_MIB=$((PER_DEVICE_SECTORS / 2048))
+    TOTAL_SWAP_USED_MIB=$((PER_DEVICE_MIB * SWAP_DEVICES))
 fi
+
+NEW_ROOT_SIZE_SECTORS=$((DESIRED_SWAP_START - ROOT_START))
+NEW_ROOT_SIZE_SECTORS=$(align_down_2048 "$NEW_ROOT_SIZE_SECTORS")
 
 NEW_ROOT_SIZE_GB=$((NEW_ROOT_SIZE_SECTORS / 2048 / 1024))
 log_info "New root size: ${NEW_ROOT_SIZE_GB}GB (${NEW_ROOT_SIZE_SECTORS} sectors)"
 if [ "$NEW_ROOT_SIZE_SECTORS" -gt "$ROOT_SIZE" ]; then
     log_info "Root will be extended from ${ROOT_SIZE_GB}GB to ${NEW_ROOT_SIZE_GB}GB"
+elif [ "$NEW_ROOT_SIZE_SECTORS" -lt "$ROOT_SIZE" ]; then
+    log_warn "Root partition will be SHRUNK from ${ROOT_SIZE_GB}GB to ${NEW_ROOT_SIZE_GB}GB (accepted risk)"
+    if [ "$FS_TYPE" = "ext4" ] || [ "$FS_TYPE" = "ext3" ] || [ "$FS_TYPE" = "ext2" ]; then
+        log_warn "ext* cannot shrink online; a reboot + fsck may be required. Creating /forcefsck."
+        touch /forcefsck 2>/dev/null || true
+    else
+        log_warn "Filesystem type '$FS_TYPE' may not tolerate shrink; proceed at your own risk."
+    fi
 else
     log_info "Root will remain unchanged (no shrink performed)"
 fi
@@ -507,6 +547,8 @@ case "$FS_TYPE" in
                 log_error "Failed to expand filesystem"
                 exit 1
             fi
+        elif [ "$NEW_ROOT_SIZE_SECTORS" -lt "$ROOT_SIZE" ]; then
+            log_warn "Root partition was shrunk; skipping online filesystem shrink. Reboot + fsck is recommended."
         else
             log_info "Root partition unchanged; no filesystem resize needed"
         fi
