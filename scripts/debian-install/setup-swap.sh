@@ -2161,19 +2161,33 @@ setup_swap_solution() {
             # - Always rewrite everything after root to the determined plan/layout when benchmark results exist.
             # - If benchmark results do not exist, fall back to activating existing swap partitions.
 
+            local deferred_disk_swap="no"
             if [ -x "./create-swap-partitions.sh" ]; then
                 # Only enforce when benchmark results exist (otherwise create-swap-partitions.sh will exit).
                 if ls -t /var/log/debian-install/benchmark-results-*.json >/dev/null 2>&1; then
                     log_info "Enforcing swap partition plan via create-swap-partitions.sh"
-                    ./create-swap-partitions.sh 2>&1 | tee -a "$LOG_FILE" || {
+                    set +e
+                    ./create-swap-partitions.sh 2>&1 | tee -a "$LOG_FILE"
+                    rc=${PIPESTATUS[0]}
+                    set -e
+
+                    if [ "$rc" -eq 42 ]; then
+                        log_warn "Disk swap repartition scheduled for next reboot (offline ext* resize required)."
+                        log_warn "Continuing without disk swap for now; ZSWAP/ZRAM remains active."
+                        deferred_disk_swap="yes"
+                    elif [ "$rc" -ne 0 ]; then
                         log_error "Swap partition plan enforcement failed"
                         return 1
-                    }
+                    fi
                 else
                     log_warn "No benchmark results found; skipping repartition and enabling existing swap partitions"
                 fi
             else
                 log_warn "create-swap-partitions.sh not found/executable; enabling existing swap partitions only"
+            fi
+
+            if [ "$deferred_disk_swap" = "yes" ]; then
+                return 0
             fi
 
             if enable_existing_swap_partitions; then

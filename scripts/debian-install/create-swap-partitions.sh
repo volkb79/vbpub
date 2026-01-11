@@ -425,6 +425,14 @@ schedule_offline_ext_shrink() {
     local script_dir
     script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
+    export DEBIAN_FRONTEND=noninteractive
+    # Ensure prerequisites for initramfs-based ext shrink exist.
+    if ! command -v update-initramfs >/dev/null 2>&1 || ! command -v dumpe2fs >/dev/null 2>&1; then
+        log_info "Installing prerequisites for offline ext* shrink (initramfs-tools, e2fsprogs, util-linux)..."
+        apt-get update -qq || true
+        apt-get install -y -qq initramfs-tools e2fsprogs util-linux || true
+    fi
+
     if ! command -v update-initramfs >/dev/null 2>&1; then
         log_error "update-initramfs not found; cannot schedule offline shrink automatically"
         return 1
@@ -474,7 +482,10 @@ EOF
     chmod +x /etc/initramfs-tools/scripts/local-premount/vbpub-offline-repartition /etc/initramfs-tools/hooks/vbpub-offline-repartition
 
     log_info "Updating initramfs to include resize2fs + offline repartition job..."
-    update-initramfs -u
+    if ! update-initramfs -u; then
+        log_error "update-initramfs failed; offline shrink was NOT scheduled"
+        return 1
+    fi
 
     log_warn "Offline shrink+repartition scheduled. Reboot is required."
     log_warn "If anything goes wrong, initramfs log: /run/vbpub-offline-repartition.log"

@@ -15,13 +15,24 @@ esac
 
 . /usr/share/initramfs-tools/hook-functions
 
+copy_exec_resolved() {
+  name="$1"
+  dest="$2"
+  path=$(command -v "$name" 2>/dev/null || true)
+  if [ -z "$path" ] || [ ! -x "$path" ]; then
+    echo "E: vbpub-offline-repartition: missing required binary: $name" >&2
+    exit 1
+  fi
+  copy_exec "$path" "$dest"
+}
+
 # Core tools
-copy_exec /sbin/e2fsck /sbin
-copy_exec /sbin/resize2fs /sbin
-copy_exec /sbin/sfdisk /sbin
-copy_exec /sbin/partx /sbin
-copy_exec /sbin/mkswap /sbin
-copy_exec /sbin/blkid /sbin
+copy_exec_resolved e2fsck /sbin
+copy_exec_resolved resize2fs /sbin
+copy_exec_resolved sfdisk /sbin
+copy_exec_resolved partx /sbin
+copy_exec_resolved mkswap /sbin
+copy_exec_resolved blkid /sbin
 
 # Config + partition table (optional)
 if [ -f /etc/vbpub/offline-repartition.conf ]; then
