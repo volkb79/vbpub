@@ -439,10 +439,11 @@ class _SSHBootstrapFollower:
             if self._stop.is_set():
                 return
 
-            # Prefer the netcup/cloud-init custom script output (what SCP typically captures),
-            # then fall back to our bootstrap log, then general cloud-init output.
-            remote = (
+            # Tail multiple candidate logs. This is more robust than picking a single file,
+            # because some logs may be truncated/replaced/removed during post-install.
+            tail_remote = (
                 "bash -lc 'set -euo pipefail; "
+                "shopt -s nullglob; "
                 "cands=("
                 "/root/custom_script.output "
                 "/var/log/custom_script.output "
@@ -452,31 +453,11 @@ class _SSHBootstrapFollower:
                 "/var/log/netcup/custom_script.output "
                 "/var/log/scp/custom_script.output "
                 "/var/log/debian-install/custom_script.output "
+                "/var/log/debian-install/bootstrap-*.log "
+                "/var/log/cloud-init-output.log "
                 "); "
-                "for p in \"${cands[@]}\"; do if [ -f \"$p\" ]; then echo \"$p\"; exit 0; fi; done; "
-                "LOG=$(ls -1t /var/log/debian-install/bootstrap-*.log 2>/dev/null | head -1 || true); "
-                "if [ -n \"$LOG\" ]; then echo \"$LOG\"; exit 0; fi; "
-                "echo /var/log/cloud-init-output.log'"
-            )
-            find_cmd = _build_ssh_cmd_base(self.host, self.user, self.identity_file) + [remote]
-            log_path = "/var/log/cloud-init-output.log"
-            try:
-                cp = subprocess.run(find_cmd, text=True, capture_output=True, timeout=20)
-                if cp.returncode == 0 and cp.stdout.strip():
-                    log_path = cp.stdout.strip().splitlines()[-1].strip()
-            except Exception:
-                pass
-
-            _log(f"[attach] Tailing: {log_path}", lf)
-
-            tail_remote = (
-                "bash -lc 'set -euo pipefail; "
-                f"P={json.dumps(log_path)}; "
-                "if [ ! -f \"$P\" ]; then "
-                "  echo \"[attach] Waiting for log to appear: $P\"; "
-                "  for i in $(seq 1 300); do [ -f \"$P\" ] && break; sleep 1; done; "
-                "fi; "
-                "tail -n 200 -F \"$P\"'"
+                "echo \"[attach] Tailing candidates: ${cands[*]}\"; "
+                "tail -n 200 -F \"${cands[@]}\"'"
             )
 
             cmd_tail = _build_ssh_cmd_base(self.host, self.user, self.identity_file) + [tail_remote]
