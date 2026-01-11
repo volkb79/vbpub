@@ -17,6 +17,10 @@ PRESERVE_ROOT_SIZE_GB="${PRESERVE_ROOT_SIZE_GB:-10}"
 ALLOW_ROOT_SHRINK="${ALLOW_ROOT_SHRINK:-yes}"
 OFFLINE_SHRINK_EXIT_CODE=42
 
+# Stage1 pre-shrink support (shrink root offline now; decide swap later)
+PRE_SHRINK_ONLY="${PRE_SHRINK_ONLY:-no}"  # yes/no
+PRE_SHRINK_ROOT_EXTRA_GB="${PRE_SHRINK_ROOT_EXTRA_GB:-10}"  # keep used + extra GB
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -41,6 +45,14 @@ fi
 mkdir -p "$(dirname "$LOG_FILE")"
 
 log_step "Creating Swap Partitions from Benchmark Results"
+
+for arg in "$@"; do
+    case "$arg" in
+        --pre-shrink-only)
+            PRE_SHRINK_ONLY=yes
+            ;;
+    esac
+done
 
 # Check if jq is installed
 if ! command -v jq >/dev/null 2>&1; then
@@ -79,56 +91,57 @@ select_benchmark_results_file() {
     return 1
 }
 
-# Find the most recent *complete* benchmark results file (newest that contains matrix.optimal).
-RESULTS_FILE="$(select_benchmark_results_file || true)"
-if [ -z "$RESULTS_FILE" ] || [ ! -f "$RESULTS_FILE" ]; then
-    log_error "No usable benchmark results found at: $BENCHMARK_RESULTS"
-    log_error "Need one file with: .matrix.optimal.best_*\.concurrency or .matrix.optimal.recommended_swap_stripe_width"
-    log_info "Run: sudo ./benchmark.py --test-all"
-    exit 1
+OPTIMAL_DEVICES=1
+if [ "$PRE_SHRINK_ONLY" != "yes" ]; then
+    # Find the most recent *complete* benchmark results file (newest that contains matrix.optimal).
+    RESULTS_FILE="$(select_benchmark_results_file || true)"
+    if [ -z "$RESULTS_FILE" ] || [ ! -f "$RESULTS_FILE" ]; then
+        log_error "No usable benchmark results found at: $BENCHMARK_RESULTS"
+        log_error "Need one file with: .matrix.optimal.best_*\.concurrency or .matrix.optimal.recommended_swap_stripe_width"
+        log_info "Run: sudo ./benchmark.py --test-all"
+        exit 1
+    fi
+
+    log_info "Using benchmark results: $RESULTS_FILE"
+
+    # Extract benchmark-optimal stripe width / device count.
+    OPTIMAL_DEVICES=$(jq -r '.matrix.optimal.best_combined.concurrency // .matrix.optimal.best_read.concurrency // .matrix.optimal.best_write.concurrency // empty' "$RESULTS_FILE" 2>/dev/null || true)
+    if [[ -z "$OPTIMAL_DEVICES" || "$OPTIMAL_DEVICES" = "null" ]]; then
+        OPTIMAL_DEVICES=$(jq -r '.matrix.optimal.recommended_swap_stripe_width // empty' "$RESULTS_FILE" 2>/dev/null || true)
+    fi
+
+    if [[ -z "$OPTIMAL_DEVICES" || "$OPTIMAL_DEVICES" = "null" ]]; then
+        log_error "No benchmark-optimal swap stripe width found in benchmark results"
+        log_error "Expected one of: .matrix.optimal.best_*\.concurrency or .matrix.optimal.recommended_swap_stripe_width"
+        log_error "Inspect: jq '.matrix.optimal' $RESULTS_FILE"
+        exit 1
+    fi
+
+    if [[ ! "$OPTIMAL_DEVICES" =~ ^[0-9]+$ ]] || [ "$OPTIMAL_DEVICES" -lt 1 ]; then
+        log_error "Invalid benchmark-optimal device count: '$OPTIMAL_DEVICES'"
+        log_error "Inspect: jq '.matrix.optimal' $RESULTS_FILE"
+        exit 1
+    fi
+
+    log_info "Benchmark-optimal swap device count: $OPTIMAL_DEVICES"
+else
+    log_step "Pre-shrink-only mode: reserving disk tail space; swap layout will be decided later"
 fi
-
-log_info "Using benchmark results: $RESULTS_FILE"
-
-# Extract benchmark-optimal stripe width / device count.
-OPTIMAL_DEVICES=$(jq -r '.matrix.optimal.best_combined.concurrency // .matrix.optimal.best_read.concurrency // .matrix.optimal.best_write.concurrency // empty' "$RESULTS_FILE" 2>/dev/null || true)
-if [[ -z "$OPTIMAL_DEVICES" || "$OPTIMAL_DEVICES" = "null" ]]; then
-    OPTIMAL_DEVICES=$(jq -r '.matrix.optimal.recommended_swap_stripe_width // empty' "$RESULTS_FILE" 2>/dev/null || true)
-fi
-
-if [[ -z "$OPTIMAL_DEVICES" || "$OPTIMAL_DEVICES" = "null" ]]; then
-    log_error "No benchmark-optimal swap stripe width found in benchmark results"
-    log_error "Expected one of: .matrix.optimal.best_*\.concurrency or .matrix.optimal.recommended_swap_stripe_width"
-    log_error "Inspect: jq '.matrix.optimal' $RESULTS_FILE"
-    exit 1
-fi
-
-if [[ ! "$OPTIMAL_DEVICES" =~ ^[0-9]+$ ]] || [ "$OPTIMAL_DEVICES" -lt 1 ]; then
-    log_error "Invalid benchmark-optimal device count: '$OPTIMAL_DEVICES'"
-    log_error "Inspect: jq '.matrix.optimal' $RESULTS_FILE"
-    exit 1
-fi
-
-log_info "Benchmark-optimal swap device count: $OPTIMAL_DEVICES"
 
 # Get system specifications
 RAM_TOTAL_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
 log_info "MemTotal: ${RAM_TOTAL_KB} kB"
 
 # Convert to GiB for policy decisions.
-# Use rounded GiB (not ceil) to avoid inflating values on odd-sized VMs,
-# while still treating common 8GB plans as 8GB when MemTotal is close.
 RAM_GB=$(((RAM_TOTAL_KB + 524287) / 1048576))
-TOTAL_SWAP_GB=$((RAM_GB * 2))  # 2x RAM sizing policy
 
-log_info "System RAM: ${RAM_GB}GB"
-log_info "Total swap needed: ${TOTAL_SWAP_GB}GB"
+TOTAL_SWAP_GB=$((RAM_GB * 2))  # default sizing policy
+if [ "$PRE_SHRINK_ONLY" != "yes" ]; then
+    log_info "System RAM: ${RAM_GB}GB"
+    log_info "Total swap needed: ${TOTAL_SWAP_GB}GB"
+fi
 
-# Use benchmark-optimal stripe count, but ensure equal partition sizes.
-# We compute sizes in MiB to keep totals very close to the policy target
-# while staying perfectly equal across all devices.
 SWAP_DEVICES="$OPTIMAL_DEVICES"
-
 TOTAL_SWAP_TARGET_MIB=$((TOTAL_SWAP_GB * 1024))
 
 # Guard rails for tiny systems / weird benchmark output.
@@ -149,9 +162,11 @@ fi
 
 TOTAL_SWAP_USED_MIB=$((PER_DEVICE_MIB * SWAP_DEVICES))
 
-log_info "Swap stripe width chosen: ${SWAP_DEVICES} (benchmark optimal: ${OPTIMAL_DEVICES})"
-log_info "Initial per-device swap target: ${PER_DEVICE_MIB}MiB (may be capped by available disk tail space)"
-log_info "Initial total swap target: ${TOTAL_SWAP_TARGET_MIB}MiB; initial total swap used: ${TOTAL_SWAP_USED_MIB}MiB"
+if [ "$PRE_SHRINK_ONLY" != "yes" ]; then
+    log_info "Swap stripe width chosen: ${SWAP_DEVICES} (benchmark optimal: ${OPTIMAL_DEVICES})"
+    log_info "Initial per-device swap target: ${PER_DEVICE_MIB}MiB (may be capped by available disk tail space)"
+    log_info "Initial total swap target: ${TOTAL_SWAP_TARGET_MIB}MiB; initial total swap used: ${TOTAL_SWAP_USED_MIB}MiB"
+fi
 
 # Detect root partition and disk
 ROOT_PARTITION=$(findmnt -n -o SOURCE / 2>/dev/null)
@@ -249,6 +264,97 @@ require_mib_aligned() {
 # Keep a small tail buffer so we don't press against GPT end-of-disk structures.
 END_BUFFER_SECTORS=2048
 TOTAL_SWAP_TARGET_SECTORS=$((TOTAL_SWAP_TARGET_MIB * 2048))
+
+if [ "$PRE_SHRINK_ONLY" = "yes" ]; then
+    # Pre-shrink goal: shrink root to (used + extra) GB.
+    # This is intended to be conservative and work on small disks.
+    if [[ ! "$PRE_SHRINK_ROOT_EXTRA_GB" =~ ^[0-9]+$ ]] || [ "$PRE_SHRINK_ROOT_EXTRA_GB" -lt 1 ]; then
+        log_error "Invalid PRE_SHRINK_ROOT_EXTRA_GB=$PRE_SHRINK_ROOT_EXTRA_GB"
+        exit 1
+    fi
+
+    # Refuse to run if there are partitions after root (would be destructive).
+    dump_tmp="/tmp/ptable-current-$(date +%s).dump"
+    if ! sfdisk --dump "/dev/$ROOT_DISK" > "$dump_tmp" 2>/dev/null; then
+        log_error "Failed to dump partition table"
+        exit 1
+    fi
+    # Any /dev/${disk}N entries with N > root part num indicate other partitions.
+    if grep -E "^/dev/${ROOT_DISK}(p)?[0-9]+" "$dump_tmp" | awk '{print $1}' | \
+        sed -E "s|^/dev/${ROOT_DISK}p?||" | \
+        awk -v rpn="$ROOT_PART_NUM" '$1 ~ /^[0-9]+$/ && $1 > rpn {found=1} END{exit(found?0:1)}'; then
+        log_error "Pre-shrink-only refuses to run: found partitions after root on /dev/$ROOT_DISK"
+        log_error "Run full stage2 partitioning instead (or wipe/reinstall)."
+        exit 1
+    fi
+
+    # Minimum root size policy reused.
+    PRESERVE_ROOT_SECTORS=$((PRESERVE_ROOT_SIZE_GB * 1024 * 1024 * 1024 / 512))
+    ROOT_USED_BYTES=$(df -B1 --output=used / 2>/dev/null | tail -n 1 | tr -d ' ' || echo 0)
+    if [[ -z "${ROOT_USED_BYTES:-}" || ! "${ROOT_USED_BYTES}" =~ ^[0-9]+$ ]]; then
+        ROOT_USED_BYTES=0
+    fi
+
+    extra_bytes=$((PRE_SHRINK_ROOT_EXTRA_GB * 1024 * 1024 * 1024))
+    # keep a bit of headroom for metadata/fragmentation (2GiB) in addition to the requested extra.
+    ROOT_TARGET_BYTES=$((ROOT_USED_BYTES + extra_bytes + 2 * 1024 * 1024 * 1024))
+    ROOT_TARGET_SECTORS=$(((ROOT_TARGET_BYTES + 511) / 512))
+    if [ "$ROOT_TARGET_SECTORS" -lt "$PRESERVE_ROOT_SECTORS" ]; then
+        ROOT_TARGET_SECTORS="$PRESERVE_ROOT_SECTORS"
+    fi
+
+    NEW_ROOT_END=$((ROOT_START + ROOT_TARGET_SECTORS))
+    NEW_ROOT_END=$(align_up_2048 "$NEW_ROOT_END")
+
+    # Also ensure we don't collide with the GPT tail.
+    DISK_MAX_END=$((DISK_SIZE_SECTORS - END_BUFFER_SECTORS))
+    DISK_MAX_END=$(align_down_2048 "$DISK_MAX_END")
+    if [ "$NEW_ROOT_END" -gt "$DISK_MAX_END" ]; then
+        log_warn "Pre-shrink target exceeds disk size; skipping shrink"
+        exit 0
+    fi
+
+    NEW_ROOT_SIZE_SECTORS=$((NEW_ROOT_END - ROOT_START))
+    NEW_ROOT_SIZE_SECTORS=$(align_down_2048 "$NEW_ROOT_SIZE_SECTORS")
+    require_mib_aligned "New root size" "$NEW_ROOT_SIZE_SECTORS"
+
+    if [ "$NEW_ROOT_SIZE_SECTORS" -ge "$ROOT_SIZE" ]; then
+        log_info "Root already small enough (no pre-shrink needed)"
+        exit 0
+    fi
+
+    NEW_ROOT_SIZE_GB=$((NEW_ROOT_SIZE_SECTORS / 2048 / 1024))
+    log_info "Pre-shrink target: root ${ROOT_SIZE_GB}GB -> ${NEW_ROOT_SIZE_GB}GB (used=$((${ROOT_USED_BYTES} / 1024 / 1024 / 1024))GB + ${PRE_SHRINK_ROOT_EXTRA_GB}GB)"
+
+    # Create modified partition table: only change root size.
+    PTABLE_NEW="/tmp/ptable-pre-shrink-$(date +%s).dump"
+    awk -v rp="$ROOT_PARTITION" -v ns="$NEW_ROOT_SIZE_SECTORS" '
+      $1==rp {
+        line=$0
+        if (line ~ /size=/) {
+          sub(/size=[[:space:]]*[0-9]+/, "size=" ns, line)
+        }
+        print line
+        next
+      }
+      {print}
+    ' "$dump_tmp" > "$PTABLE_NEW"
+
+    # Schedule offline ext* shrink (shrink-only mode).
+    if [ "$FS_TYPE" = "ext4" ] || [ "$FS_TYPE" = "ext3" ] || [ "$FS_TYPE" = "ext2" ]; then
+        # Reuse scheduler with MODE=shrink-only and no swaps.
+        MODE=shrink-only
+        SWAP_DEVICES=0
+        if schedule_offline_ext_shrink; then
+            exit "$OFFLINE_SHRINK_EXIT_CODE"
+        fi
+        log_error "Failed to schedule offline ext* shrink"
+        exit 1
+    fi
+
+    log_error "Pre-shrink-only currently supports only ext2/3/4 root filesystem (found: $FS_TYPE)"
+    exit 1
+fi
 
 # Minimum root size policy:
 # - Respect PRESERVE_ROOT_SIZE_GB
@@ -420,6 +526,8 @@ fi
 log_success "Modified partition table created: $PTABLE_NEW"
 
 schedule_offline_ext_shrink() {
+    local mode
+    mode=${MODE:-swap}
     # Prepare one-shot initramfs task that will:
     #   e2fsck -f -y -> resize2fs to NEW_BLOCKS -> e2fsck -f -y -> sfdisk apply ptable
     local script_dir
@@ -463,10 +571,16 @@ schedule_offline_ext_shrink() {
 
     local swap_first_num
     local swap_last_num
-    swap_first_num=$((ROOT_PART_NUM + 1))
-    swap_last_num=$((ROOT_PART_NUM + SWAP_DEVICES))
+    if [ "$mode" = "swap" ]; then
+        swap_first_num=$((ROOT_PART_NUM + 1))
+        swap_last_num=$((ROOT_PART_NUM + SWAP_DEVICES))
+    else
+        swap_first_num=0
+        swap_last_num=0
+    fi
 
     cat > /etc/vbpub/offline-repartition.conf <<EOF
+MODE=${mode}
 ROOT_DISK=${ROOT_DISK}
 ROOT_PARTITION=${ROOT_PARTITION}
 NEW_BLOCKS=${new_blocks}
@@ -480,6 +594,83 @@ EOF
     cp "$script_dir/initramfs/vbpub-offline-repartition-premount.sh" /etc/initramfs-tools/scripts/local-premount/vbpub-offline-repartition
     cp "$script_dir/initramfs/vbpub-offline-repartition-hook.sh" /etc/initramfs-tools/hooks/vbpub-offline-repartition
     chmod +x /etc/initramfs-tools/scripts/local-premount/vbpub-offline-repartition /etc/initramfs-tools/hooks/vbpub-offline-repartition
+
+    if [ "$mode" = "swap" ]; then
+        # Install a one-shot finalizer that formats/enables swap partitions and updates /etc/fstab
+        # on the next successful boot. This is important because cloud-init is often disabled after
+        # first boot, and the initramfs stage may not be able to mount the root FS read-write.
+        mkdir -p /usr/local/sbin /etc/systemd/system
+        cat > /usr/local/sbin/vbpub-finalize-swap <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+CONF=/etc/vbpub/offline-repartition.conf
+PT=/etc/vbpub/offline-ptable.sfdisk
+
+if [ ! -f "$CONF" ] || [ ! -f "$PT" ]; then
+    exit 0
+fi
+
+# shellcheck disable=SC1090
+source "$CONF"
+
+SWAP_PRIORITY=${SWAP_PRIORITY:-10}
+SWAP_FIRST_NUM=${SWAP_FIRST_NUM:-0}
+SWAP_LAST_NUM=${SWAP_LAST_NUM:-0}
+
+if [ -z "${ROOT_DISK:-}" ] || [ -z "${SWAP_FIRST_NUM:-}" ] || [ -z "${SWAP_LAST_NUM:-}" ]; then
+    echo "vbpub-finalize-swap: missing required config values" >&2
+    exit 0
+fi
+
+part_path() {
+    local disk="$1" num="$2"
+    if [[ "$disk" =~ nvme ]]; then
+        echo "/dev/${disk}p${num}"
+    else
+        echo "/dev/${disk}${num}"
+    fi
+}
+
+for n in $(seq "$SWAP_FIRST_NUM" "$SWAP_LAST_NUM"); do
+    p=$(part_path "$ROOT_DISK" "$n")
+    [ -b "$p" ] || continue
+    t=$(blkid -s TYPE -o value "$p" 2>/dev/null || true)
+    if [ "$t" != "swap" ]; then
+        mkswap "$p" >/dev/null 2>&1 || true
+    fi
+    swapon -p "$SWAP_PRIORITY" "$p" >/dev/null 2>&1 || true
+
+    pu=$(blkid -s PARTUUID -o value "$p" 2>/dev/null || true)
+    if [ -n "$pu" ]; then
+        grep -q "^PARTUUID=${pu}\\b" /etc/fstab 2>/dev/null || echo "PARTUUID=${pu} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+    else
+        grep -q "^${p}\\b" /etc/fstab 2>/dev/null || echo "${p} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+    fi
+done
+
+rm -f "$CONF" "$PT" || true
+exit 0
+EOF
+        chmod +x /usr/local/sbin/vbpub-finalize-swap
+
+        cat > /etc/systemd/system/vbpub-finalize-swap.service <<'EOF'
+[Unit]
+Description=vbpub: finalize swap after offline repartition
+After=local-fs.target
+ConditionPathExists=/etc/vbpub/offline-repartition.conf
+ConditionPathExists=/etc/vbpub/offline-ptable.sfdisk
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vbpub-finalize-swap
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable vbpub-finalize-swap.service 2>/dev/null || true
+    fi
 
     log_info "Updating initramfs to include resize2fs + offline repartition job..."
     if ! update-initramfs -u; then

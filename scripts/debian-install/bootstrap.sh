@@ -24,6 +24,16 @@ SCRIPT_DIR="${CLONE_DIR}/scripts/debian-install"
 LOG_DIR="${LOG_DIR:-/var/log/debian-install}"
 LOG_FILE="${LOG_DIR}/bootstrap-$(date +%Y%m%d-%H%M%S).log"
 
+# Stage control
+# - stage1: minimal setup + schedule stage2, then reboot
+# - stage2: heavy tasks (benchmarks/swap/geekbench/etc) and resume-safe
+# - full: legacy one-shot behavior (runs everything now)
+BOOTSTRAP_STAGE="${BOOTSTRAP_STAGE:-auto}"  # auto, stage1, stage2, full
+AUTO_REBOOT_AFTER_STAGE1="${AUTO_REBOOT_AFTER_STAGE1:-auto}"  # auto, yes, no
+
+STATE_DIR="${STATE_DIR:-/var/lib/vbpub/bootstrap}"
+ENV_FILE="${ENV_FILE:-/etc/vbpub/bootstrap.env}"
+
 # Swap configuration (NEW NAMING CONVENTION)
 # RAM-based swap
 SWAP_RAM_SOLUTION="${SWAP_RAM_SOLUTION:-auto}"  # zram, zswap, none (auto-detected if not set)
@@ -60,6 +70,10 @@ CREATE_SWAP_PARTITIONS="${CREATE_SWAP_PARTITIONS:-yes}"  # Create optimized part
 TEST_ZSWAP_LATENCY="${TEST_ZSWAP_LATENCY:-yes}"  # Run ZSWAP latency tests with real partitions
 PRESERVE_ROOT_SIZE_GB="${PRESERVE_ROOT_SIZE_GB:-10}"  # Minimum root partition size (for shrink scenario)
 
+# Stage1 pre-shrink (offline ext*) before stage2 benchmarks/partitioning
+PRE_SHRINK_ONLY="${PRE_SHRINK_ONLY:-auto}"  # auto/yes/no
+PRE_SHRINK_ROOT_EXTRA_GB="${PRE_SHRINK_ROOT_EXTRA_GB:-10}"
+
 # Telegram
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
@@ -74,6 +88,37 @@ log_debug() {
     if [ "$DEBUG_MODE" = "yes" ]; then
         echo "[DEBUG] $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"
     fi
+}
+
+is_cloud_init_context() {
+    # Best-effort detection. Netcup "customScript" is not always cloud-init, but on NoCloud it is.
+    [ -d /run/cloud-init ] || [ -f /var/lib/cloud/instance/boot-finished ]
+}
+
+state_has() { [ -f "${STATE_DIR}/$1" ]; }
+state_set() {
+    mkdir -p "$STATE_DIR"
+    : > "${STATE_DIR}/$1"
+}
+
+should_reboot_after_stage1() {
+    case "$AUTO_REBOOT_AFTER_STAGE1" in
+        yes) return 0 ;;
+        no) return 1 ;;
+        auto)
+            if is_cloud_init_context; then
+                return 0
+            fi
+            return 1
+            ;;
+        *)
+            log_warn "Unknown AUTO_REBOOT_AFTER_STAGE1=$AUTO_REBOOT_AFTER_STAGE1 (treating as auto)"
+            if is_cloud_init_context; then
+                return 0
+            fi
+            return 1
+            ;;
+    esac
 }
 
 log_root_layout() {
@@ -195,30 +240,35 @@ get_system_summary() {
 }
 
 # Install essential packages early
-install_essential_packages() {
-    log_info "==> Installing essential packages"
-    
+apt_install_packages() {
+    local description="$1"; shift
+    local packages="$*"
+
     export DEBIAN_FRONTEND=noninteractive
-    
-    # Core utilities (including python3 which is needed for telegram and benchmarks)
-    local core_packages="ca-certificates gnupg lsb-release curl wget git vim less jq bash-completion man-db python3 python3-pip python3-requests"
-    
-    # Network tools
-    local network_packages="netcat-traditional iputils-ping dnsutils iproute2"
-    
-    # Additional useful tools
-    local additional_packages="ripgrep fd-find tree fzf httpie"
-    
-    # Benchmark/system tools
-    local system_packages="fio sysstat python3-matplotlib"
-    
-    log_info "Installing core packages..."
+    log_info "$description"
     apt-get update -qq
-    apt-get install -y -qq $core_packages $network_packages $system_packages || log_warn "Some core packages failed to install"
-    
-    log_info "Installing additional packages..."
-    apt-get install -y -qq $additional_packages 2>/dev/null || log_warn "Some additional packages unavailable (non-critical)"
-    
+    # shellcheck disable=SC2086
+    apt-get install -y -qq $packages || log_warn "Package install had issues (continuing)"
+}
+
+install_stage1_packages() {
+    log_info "==> Installing stage1 packages (minimal)"
+    local base_packages="ca-certificates gnupg lsb-release curl wget git jq bash-completion python3 python3-requests"
+    local network_packages="iproute2 iputils-ping dnsutils"
+    apt_install_packages "Installing base packages..." "$base_packages $network_packages"
+    log_info "✓ Stage1 packages installed"
+}
+
+install_stage2_packages() {
+    log_info "==> Installing stage2 packages (tools + benchmarks)"
+
+    local core_packages="vim less man-db python3-pip"
+    local additional_packages="ripgrep fd-find tree fzf httpie netcat-traditional"
+    local system_packages="fio sysstat python3-matplotlib"
+
+    apt_install_packages "Installing core + benchmark packages..." "$core_packages $system_packages"
+    apt_install_packages "Installing additional tools..." "$additional_packages"
+
     # Install yq (go-based, not the old Python version)
     if ! command -v yq >/dev/null 2>&1; then
         log_info "Installing yq (go-based) from GitHub..."
@@ -229,28 +279,359 @@ install_essential_packages() {
             log_warn "Failed to install yq"
         fi
     fi
-    
-    # Install tldr with proper setup
+
+    # Install tldr with proper setup (optional)
     if ! command -v tldr >/dev/null 2>&1; then
         log_info "Installing tldr (Python-based) system-wide..."
         if pip3 install --system tldr 2>/dev/null || pip3 install tldr; then
-            # Update tldr cache for immediate use
             log_info "Updating tldr cache..."
-            if tldr --update 2>/dev/null; then
-                log_info "✓ tldr installed and cache updated"
-            else
-                log_warn "tldr installed but cache update failed (run 'tldr --update' manually)"
-            fi
+            tldr --update 2>/dev/null || log_warn "tldr installed but cache update failed"
         else
             log_warn "Failed to install tldr"
         fi
     else
-        # Update cache if tldr already exists
         log_info "Updating tldr cache..."
         tldr --update 2>/dev/null || log_warn "Failed to update tldr cache"
     fi
-    
-    log_info "✓ Essential packages installed"
+
+    log_info "✓ Stage2 packages installed"
+}
+
+install_stage2_systemd_unit() {
+    log_info "==> Installing stage2 systemd unit"
+
+    mkdir -p /etc/vbpub
+    mkdir -p /usr/local/sbin
+
+    # Persist key variables for stage2. Keep it shell-safe and minimal.
+    cat > "$ENV_FILE" <<EOF
+REPO_URL="${REPO_URL}"
+REPO_BRANCH="${REPO_BRANCH}"
+CLONE_DIR="${CLONE_DIR}"
+LOG_DIR="${LOG_DIR}"
+DEBUG_MODE="${DEBUG_MODE}"
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID}"
+
+# Preserve bootstrap choices
+RUN_USER_CONFIG="${RUN_USER_CONFIG}"
+RUN_APT_CONFIG="${RUN_APT_CONFIG}"
+RUN_JOURNALD_CONFIG="${RUN_JOURNALD_CONFIG}"
+RUN_DOCKER_INSTALL="${RUN_DOCKER_INSTALL}"
+RUN_SSH_SETUP="${RUN_SSH_SETUP}"
+RUN_GEEKBENCH="${RUN_GEEKBENCH}"
+RUN_BENCHMARKS="${RUN_BENCHMARKS}"
+BENCHMARK_DURATION="${BENCHMARK_DURATION}"
+
+CREATE_SWAP_PARTITIONS="${CREATE_SWAP_PARTITIONS}"
+TEST_ZSWAP_LATENCY="${TEST_ZSWAP_LATENCY}"
+PRESERVE_ROOT_SIZE_GB="${PRESERVE_ROOT_SIZE_GB}"
+
+# Swap parameters
+SWAP_RAM_SOLUTION="${SWAP_RAM_SOLUTION}"
+SWAP_RAM_TOTAL_GB="${SWAP_RAM_TOTAL_GB}"
+ZRAM_COMPRESSOR="${ZRAM_COMPRESSOR}"
+ZRAM_ALLOCATOR="${ZRAM_ALLOCATOR}"
+ZRAM_PRIORITY="${ZRAM_PRIORITY}"
+ZSWAP_COMPRESSOR="${ZSWAP_COMPRESSOR}"
+ZSWAP_ZPOOL="${ZSWAP_ZPOOL}"
+SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE}"
+SWAP_DISK_TOTAL_GB="${SWAP_DISK_TOTAL_GB}"
+SWAP_STRIPE_WIDTH="${SWAP_STRIPE_WIDTH}"
+SWAP_PRIORITY="${SWAP_PRIORITY}"
+EXTEND_ROOT="${EXTEND_ROOT}"
+ZFS_POOL="${ZFS_POOL}"
+EOF
+
+    cat > /usr/local/sbin/vbpub-bootstrap-stage2 <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+ENV_FILE=/etc/vbpub/bootstrap.env
+if [ -f "$ENV_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+fi
+
+REPO_URL="${REPO_URL:-https://github.com/volkb79/vbpub.git}"
+REPO_BRANCH="${REPO_BRANCH:-main}"
+CLONE_DIR="${CLONE_DIR:-/opt/vbpub}"
+
+export REPO_URL REPO_BRANCH CLONE_DIR
+
+if ! command -v git >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq git ca-certificates curl
+fi
+
+if [ -d "$CLONE_DIR/.git" ]; then
+  cd "$CLONE_DIR" && git fetch origin && git reset --hard "origin/$REPO_BRANCH"
+else
+  rm -rf "$CLONE_DIR" && git clone -b "$REPO_BRANCH" "$REPO_URL" "$CLONE_DIR"
+fi
+
+exec "$CLONE_DIR/scripts/debian-install/bootstrap.sh" --stage=stage2
+EOF
+
+    chmod +x /usr/local/sbin/vbpub-bootstrap-stage2
+
+    cat > /etc/systemd/system/vbpub-bootstrap-stage2.service <<EOF
+[Unit]
+Description=vbpub bootstrap (stage2)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=${STATE_DIR}/stage1_done
+ConditionPathExists=!${STATE_DIR}/stage2_done
+
+[Service]
+Type=oneshot
+EnvironmentFile=-${ENV_FILE}
+ExecStart=/usr/local/sbin/vbpub-bootstrap-stage2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable vbpub-bootstrap-stage2.service 2>/dev/null || true
+    log_info "✓ Stage2 service installed and enabled"
+}
+
+parse_stage_from_args() {
+    local stage_arg=""
+    for arg in "$@"; do
+        case "$arg" in
+            --stage=*) stage_arg="${arg#--stage=}" ;;
+        esac
+    done
+
+    if [ -n "$stage_arg" ]; then
+        BOOTSTRAP_STAGE="$stage_arg"
+    fi
+
+    case "$BOOTSTRAP_STAGE" in
+        auto)
+            # In cloud-init contexts, default to a fast stage1 + reboot.
+            if is_cloud_init_context; then
+                BOOTSTRAP_STAGE="stage1"
+            else
+                BOOTSTRAP_STAGE="full"
+            fi
+            ;;
+        1|stage1) BOOTSTRAP_STAGE="stage1" ;;
+        2|stage2) BOOTSTRAP_STAGE="stage2" ;;
+        full|stage1|stage2) : ;;
+        *)
+            log_warn "Unknown BOOTSTRAP_STAGE=$BOOTSTRAP_STAGE; using full"
+            BOOTSTRAP_STAGE="full"
+            ;;
+    esac
+}
+
+run_stage1() {
+    if state_has stage1_done; then
+        log_info "Stage1 already done; skipping"
+        return 0
+    fi
+
+    log_info "==> Running stage1 (minimal cloud-init friendly)"
+
+    # Configure APT repositories BEFORE installing packages
+    if [ "$RUN_APT_CONFIG" = "yes" ]; then
+        log_info "==> Configuring APT repositories (before package installation)"
+        if ./configure-apt.sh 2>&1 | tee -a "$LOG_FILE"; then
+            log_info "✓ APT configured"
+        else
+            log_warn "APT config had issues (non-critical, continuing)"
+        fi
+    else
+        log_info "==> APT configuration skipped (RUN_APT_CONFIG=$RUN_APT_CONFIG)"
+    fi
+
+    install_stage1_packages
+
+    # User configuration (aliases etc)
+    if [ "$RUN_USER_CONFIG" = "yes" ]; then
+        log_info "==> Configuring users (stage1)"
+        ./configure-users.sh 2>&1 | tee -a "$LOG_FILE" || log_warn "User config had issues"
+    fi
+
+    # Journald config
+    if [ "$RUN_JOURNALD_CONFIG" = "yes" ]; then
+        log_info "==> Configuring journald (stage1)"
+        ./configure-journald.sh 2>&1 | tee -a "$LOG_FILE" || log_warn "Journald config had issues"
+    fi
+
+    # Docker in stage1 (allowed; keeps base system ready ASAP)
+    if [ "$RUN_DOCKER_INSTALL" = "yes" ]; then
+        log_info "==> Installing Docker (stage1)"
+        ./install-docker.sh 2>&1 | tee -a "$LOG_FILE" || log_warn "Docker installation had issues"
+    fi
+
+    # Schedule offline pre-shrink so the stage1->stage2 reboot can apply it.
+    local do_presh
+    do_presh="$PRE_SHRINK_ONLY"
+    if [ "$do_presh" = "auto" ]; then
+        do_presh=yes
+    fi
+    if [ "$do_presh" = "yes" ]; then
+        log_info "==> Scheduling offline pre-shrink (stage1)"
+        export PRESERVE_ROOT_SIZE_GB PRE_SHRINK_ROOT_EXTRA_GB
+        set +e
+        ./create-swap-partitions.sh --pre-shrink-only 2>&1 | tee -a "$LOG_FILE"
+        rc=${PIPESTATUS[0]}
+        set -e
+        if [ "$rc" -eq 42 ]; then
+            log_warn "Offline pre-shrink scheduled via initramfs for next reboot"
+        elif [ "$rc" -eq 0 ]; then
+            log_info "No pre-shrink needed"
+        else
+            log_warn "Pre-shrink scheduling failed (rc=$rc); continuing without it"
+        fi
+    else
+        log_info "==> Pre-shrink skipped (PRE_SHRINK_ONLY=$PRE_SHRINK_ONLY)"
+    fi
+
+    install_stage2_systemd_unit
+    state_set stage1_done
+
+    tg_send "✅ vbpub stage1 complete on $(hostname -f 2>/dev/null || hostname). Stage2 will run automatically after reboot via systemd."
+
+    if should_reboot_after_stage1; then
+        log_warn "Rebooting now to start stage2..."
+        sync
+        systemctl reboot || reboot
+    else
+        log_info "Stage1 complete. Reboot is required for stage2 (AUTO_REBOOT_AFTER_STAGE1=$AUTO_REBOOT_AFTER_STAGE1)."
+    fi
+}
+
+run_stage2() {
+    if state_has stage2_done; then
+        log_info "Stage2 already done; skipping"
+        return 0
+    fi
+
+    log_info "==> Running stage2 (long-running / resume-safe)"
+
+    install_stage2_packages
+
+    # Export all config (new naming convention)
+    export SWAP_RAM_SOLUTION SWAP_RAM_TOTAL_GB
+    export ZRAM_COMPRESSOR ZRAM_ALLOCATOR ZRAM_PRIORITY
+    export ZSWAP_COMPRESSOR ZSWAP_ZPOOL
+    export SWAP_DISK_TOTAL_GB SWAP_BACKING_TYPE SWAP_STRIPE_WIDTH
+    export SWAP_PRIORITY EXTEND_ROOT
+    export ZFS_POOL
+    export TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID LOG_FILE
+    export DEBUG_MODE
+    export PRESERVE_ROOT_SIZE_GB
+
+    # Benchmarks
+    if [ "$RUN_BENCHMARKS" = "yes" ] && ! state_has benchmarks_done; then
+        log_info "==> Running system benchmarks (stage2)"
+        BENCHMARK_OUTPUT="/tmp/benchmark-results-$(date +%Y%m%d-%H%M%S).json"
+        BENCHMARK_CONFIG="/tmp/benchmark-optimal-config.sh"
+
+        if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            BENCHMARK_ARGS="--test-all --duration $BENCHMARK_DURATION --output $BENCHMARK_OUTPUT --shell-config $BENCHMARK_CONFIG --telegram"
+        else
+            BENCHMARK_ARGS="--test-all --duration $BENCHMARK_DURATION --output $BENCHMARK_OUTPUT --shell-config $BENCHMARK_CONFIG"
+        fi
+
+        if ./benchmark.py $BENCHMARK_ARGS 2>&1 | tee -a "$LOG_FILE"; then
+            log_info "✓ Benchmarks complete"
+            export SWAP_BENCHMARK_CONFIG="$BENCHMARK_CONFIG"
+            state_set benchmarks_done
+        else
+            log_warn "Benchmarks had issues (non-critical, continuing)"
+            state_set benchmarks_failed
+        fi
+    else
+        log_info "==> Benchmarks skipped (RUN_BENCHMARKS=$RUN_BENCHMARKS or already done)"
+    fi
+
+    # Partition creation (may schedule offline resize + require reboot)
+    if [ "$CREATE_SWAP_PARTITIONS" = "yes" ] && ! state_has partitions_done && ! state_has partitions_failed; then
+        log_info "==> Creating optimized swap partitions (stage2)"
+        log_root_layout
+
+        set +e
+        ./create-swap-partitions.sh 2>&1 | tee -a "$LOG_FILE"
+        rc=${PIPESTATUS[0]}
+        set -e
+
+        if [ "$rc" -eq 0 ]; then
+            log_info "✓ Swap partitions created successfully"
+            state_set partitions_done
+            log_root_layout
+        elif [ "$rc" -eq 42 ]; then
+            log_warn "Offline ext* resize required; rebooting to continue stage2"
+            state_set partitions_reboot_scheduled
+            sync
+            systemctl reboot || reboot
+            return 0
+        else
+            log_error "✗ Swap partition creation failed (rc=$rc)"
+            state_set partitions_failed
+        fi
+    fi
+
+    # Swap setup
+    if ! state_has swap_done; then
+        log_info "==> Configuring swap (stage2)"
+        if ./setup-swap.sh 2>&1 | tee -a "$LOG_FILE"; then
+            log_info "✓ Swap configured"
+            state_set swap_done
+        else
+            log_error "✗ Swap config failed"
+            exit 1
+        fi
+    fi
+
+    # Docker installation
+    if [ "$RUN_DOCKER_INSTALL" = "yes" ] && ! state_has docker_done; then
+        log_info "==> Installing Docker (stage2)"
+        ./install-docker.sh 2>&1 | tee -a "$LOG_FILE" || log_warn "Docker installation had issues"
+        state_set docker_done
+    fi
+
+    # SSH key generation and setup
+    if [ "$RUN_SSH_SETUP" = "yes" ] && ! state_has ssh_done; then
+        log_info "==> Generating SSH key for root user (stage2)"
+        export HOME="/root"
+        export NONINTERACTIVE="yes"
+
+        if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            python3 ../ssh-keygen-deploy.py --user root --send-private --non-interactive 2>&1 | tee -a "$LOG_FILE" || log_warn "SSH key generation had issues"
+        else
+            python3 ../ssh-keygen-deploy.py --user root --non-interactive 2>&1 | tee -a "$LOG_FILE" || log_warn "SSH key generation had issues"
+        fi
+        state_set ssh_done
+    fi
+
+    # Geekbench
+    if [ "$RUN_GEEKBENCH" = "yes" ] && ! state_has geekbench_done; then
+        log_info "==> Running Geekbench (stage2)"
+        set +e
+        if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            ./sysinfo-notify.py --geekbench --notify 2>&1 | tee -a "$LOG_FILE"
+        else
+            ./sysinfo-notify.py --geekbench-only 2>&1 | tee -a "$LOG_FILE"
+        fi
+        set -e
+        state_set geekbench_done
+    fi
+
+    # Summary + completion messages
+    print_bootstrap_summary
+    state_set stage2_done
+
+    tg_send "🎉 vbpub stage2 complete on $(hostname -f 2>/dev/null || hostname)."
+    if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -f "$LOG_FILE" ]; then
+        tg_send_file "$LOG_FILE" "📋 Stage2 Complete - Full Log"
+    fi
 }
 
 print_bootstrap_summary() {
@@ -307,6 +688,8 @@ main() {
     log_info "Debian System Setup Bootstrap"
     log_info "Log: $LOG_FILE"
 
+    parse_stage_from_args "$@"
+
     # Send system summary
     log_info "==> Collecting system summary"
     SYSTEM_SUMMARY=$(get_system_summary)
@@ -343,6 +726,23 @@ main() {
         ./sysinfo-notify.py --notify --caption "📊 System Info (BEFORE setup)" 2>&1 | tee -a "$LOG_FILE" || true
     fi
     
+    # Staged execution
+    case "$BOOTSTRAP_STAGE" in
+        stage1)
+            run_stage1
+            return 0
+            ;;
+        stage2)
+            run_stage2
+            return 0
+            ;;
+        full)
+            log_info "==> Running full (one-shot) bootstrap"
+            ;;
+    esac
+
+    # Legacy full run continues below
+
     # Configure APT repositories BEFORE installing packages
     if [ "$RUN_APT_CONFIG" = "yes" ]; then
         log_info "==> Configuring APT repositories (before package installation)"
@@ -354,9 +754,10 @@ main() {
     else
         log_info "==> APT configuration skipped (RUN_APT_CONFIG=$RUN_APT_CONFIG)"
     fi
-    
-    # Install essential packages early (after APT configuration)
-    install_essential_packages
+
+    # Install packages for full bootstrap
+    install_stage1_packages
+    install_stage2_packages
     
     # Export all config (new naming convention)
     export SWAP_RAM_SOLUTION SWAP_RAM_TOTAL_GB

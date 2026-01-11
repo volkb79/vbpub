@@ -24,6 +24,12 @@ For complete system initialization on new Debian installations:
 # Basic setup with swap configuration
 curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | bash
 
+# Two-stage (recommended for cloud-init):
+# - stage1: fast baseline setup + schedule stage2 + reboot
+# - stage2: benchmarks/swap partitioning/geekbench/etc (runs via systemd on next boot)
+curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | \
+  BOOTSTRAP_STAGE=stage1 AUTO_REBOOT_AFTER_STAGE1=yes bash
+
 # Full setup with user config, geekbench, and Telegram notifications
 curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | \
   SWAP_ARCH=3 SWAP_TOTAL_GB=16 RUN_GEEKBENCH=yes \

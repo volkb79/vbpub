@@ -897,9 +897,35 @@ disable_existing_swap() {
 }
 
 enable_existing_swap_partitions() {
-    # Enable existing swap partitions (FSTYPE=swap) and ensure /etc/fstab contains PARTUUID entries.
+    # Enable existing swap partitions and ensure /etc/fstab contains PARTUUID entries.
+    #
+    # Important: GPT swap partitions can exist without a swap signature (FSTYPE blank).
+    # In that case, initialize them with mkswap first.
     local found=0
     local part
+
+    local swap_gpt_guid="0657fd6d-a4ab-43c4-84e5-0933c84b4f4f"
+
+    # First pass: initialize any partitions marked as GPT-swap but not yet formatted.
+    while IFS= read -r part; do
+        [[ -z "$part" ]] && continue
+        found=1
+
+        local type
+        type=$(blkid -s TYPE -o value "$part" 2>/dev/null || true)
+        if [[ "$type" != "swap" ]]; then
+            log_info "Initializing swap signature on: $part"
+            mkswap "$part" >/dev/null 2>&1 || {
+                log_warn "Failed to mkswap $part"
+                continue
+            }
+        fi
+    done < <(
+        lsblk -rno PATH,TYPE,PARTTYPE | \
+            awk -v g="$swap_gpt_guid" '$2=="part" {pt=tolower($3); if (pt==g) print $1}'
+    )
+
+    # Second pass: activate swap partitions (by FSTYPE=swap) and persist in fstab.
     while IFS= read -r part; do
         [[ -z "$part" ]] && continue
         found=1

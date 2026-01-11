@@ -226,6 +226,9 @@ FIO_TEST_FILE_SIZE = '1G'  # Test file size for fio benchmarks
 RAM_TIER_LOW_GB = 4    # Systems below this use ZRAM
 RAM_TIER_HIGH_GB = 16  # Systems above this use ZSWAP (but so do medium tier)
 
+# If mem_locker triggers OOM kills, disable it for the remainder of the run.
+DISABLE_MEM_LOCKER = False
+
 def format_timestamp():
     """Return formatted timestamp for logging"""
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -871,7 +874,9 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         # Calculate how much memory to lock
         test_alloc_mb, lock_mb, available_mb = calculate_memory_distribution(size_mb)
         
-        if lock_mb > 100 and mem_locker_path.exists():
+        global DISABLE_MEM_LOCKER
+
+        if (not DISABLE_MEM_LOCKER) and lock_mb > 100 and mem_locker_path.exists():
             # Only use mem_locker if we have significant memory to lock (>100MB)
             try:
                 log_info_ts(f"Starting mem_locker to reserve {lock_mb}MB of free RAM...")
@@ -896,6 +901,8 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
                 mem_locker_proc = None
         elif lock_mb <= 100:
             log_debug_ts(f"Skipping mem_locker (only {lock_mb}MB would be locked)")
+        elif DISABLE_MEM_LOCKER:
+            log_warn_ts("Skipping mem_locker (disabled due to earlier OOM-kill)")
         
         # Create memory pressure to force actual swapping to ZRAM
         # The key is to allocate MORE than available RAM to force the kernel to swap
@@ -967,6 +974,22 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
             return results
         
         log_info("Memory pressure test completed successfully")
+
+        # Make kernel OOM-kill of mem_locker visible in the benchmark log (it won't show up
+        # in stdout/stderr otherwise). If this happens, disable mem_locker for subsequent tests.
+        if mem_locker_proc is not None and mem_locker_proc.poll() is not None:
+            DISABLE_MEM_LOCKER = True
+            pid = mem_locker_proc.pid
+            log_warn_ts(f"mem_locker (PID: {pid}) was killed during memory pressure (likely OOM). Disabling mem_locker for remaining tests.")
+            results['warning'] = 'mem_locker OOM-killed; disabled for remainder'
+            try:
+                dmesg = subprocess.run(['dmesg', '-T'], capture_output=True, text=True, timeout=5)
+                if dmesg.returncode == 0 and dmesg.stdout:
+                    lines = [ln for ln in dmesg.stdout.splitlines() if f"Killed process {pid} (mem_locker)" in ln or f"pid={pid}" in ln]
+                    for ln in lines[-3:]:
+                        log_warn_ts(f"kernel: {ln.strip()}")
+            except Exception:
+                pass
         
         duration = time.time() - start_time
         
@@ -2992,14 +3015,40 @@ def export_shell_config(results, output_file):
             f.write(f"# NOTE: zbud often works better with ZSWAP (z3fold can fail to load)\n")
             f.write(f"ZRAM_ALLOCATOR={best_alloc['allocator']}\n\n")
         
-        # Optimal file count
-        if 'concurrency' in results and results['concurrency']:
-            best_concur = max(results['concurrency'], 
-                            key=lambda x: x.get('write_mb_per_sec', 0) + x.get('read_mb_per_sec', 0))
-            f.write(f"# Optimal swap file count (stripe width): {best_concur['num_files']}\n")
-            f.write(f"# (Write: {best_concur.get('write_mb_per_sec', 0)} MB/s, ")
-            f.write(f"Read: {best_concur.get('read_mb_per_sec', 0)} MB/s)\n")
-            f.write(f"SWAP_STRIPE_WIDTH={best_concur['num_files']}\n")
+        # Optimal stripe width
+        # Prefer matrix-derived concurrency (modern path) over deprecated standalone concurrency test.
+        stripe_width = None
+        try:
+            matrix_opt = None
+            if isinstance(results.get('matrix'), dict):
+                matrix_opt = (results['matrix'].get('optimal') or {})
+            if isinstance(matrix_opt, dict):
+                for k in ('best_combined', 'best_read', 'best_write'):
+                    v = (matrix_opt.get(k) or {}).get('concurrency')
+                    if isinstance(v, int) and v > 0:
+                        stripe_width = v
+                        break
+                if stripe_width is None:
+                    v = matrix_opt.get('recommended_swap_stripe_width')
+                    if isinstance(v, int) and v > 0:
+                        stripe_width = v
+        except Exception:
+            stripe_width = None
+
+        if stripe_width is None and 'concurrency' in results and results['concurrency']:
+            best_concur = max(
+                results['concurrency'],
+                key=lambda x: x.get('write_mb_per_sec', 0) + x.get('read_mb_per_sec', 0),
+            )
+            stripe_width = best_concur.get('num_files')
+            if stripe_width:
+                f.write(f"# Optimal swap stripe width (deprecated concurrency test): {stripe_width}\n")
+                f.write(f"# (Write: {best_concur.get('write_mb_per_sec', 0)} MB/s, ")
+                f.write(f"Read: {best_concur.get('read_mb_per_sec', 0)} MB/s)\n")
+
+        if isinstance(stripe_width, int) and stripe_width > 0:
+            f.write(f"# Optimal swap stripe width (devices): {stripe_width}\n")
+            f.write(f"SWAP_STRIPE_WIDTH={stripe_width}\n")
     
     log_info(f"Configuration saved to {output_file}")
 
