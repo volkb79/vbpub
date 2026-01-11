@@ -37,17 +37,6 @@ mkdir -p "$(dirname "$LOG_FILE")"
 
 log_step "Creating Swap Partitions from Benchmark Results"
 
-# Find the most recent benchmark results file
-RESULTS_FILE=$(ls -t $BENCHMARK_RESULTS 2>/dev/null | head -1)
-
-if [ -z "$RESULTS_FILE" ] || [ ! -f "$RESULTS_FILE" ]; then
-    log_error "No benchmark results found at: $BENCHMARK_RESULTS"
-    log_info "Run: sudo ./benchmark.py --test-all"
-    exit 1
-fi
-
-log_info "Using benchmark results: $RESULTS_FILE"
-
 # Check if jq is installed
 if ! command -v jq >/dev/null 2>&1; then
     log_error "jq is required but not installed"
@@ -55,20 +44,67 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 1
 fi
 
-# Extract optimal device count from matrix test results
-if ! OPTIMAL_DEVICES=$(jq -r '.matrix.optimal.best_combined.concurrency // empty' "$RESULTS_FILE" 2>/dev/null); then
-    log_error "Failed to extract optimal concurrency from benchmark results"
-    log_error "Matrix test may not have completed successfully"
+select_benchmark_results_file() {
+    local candidate
+    local value
+    local chosen=""
+
+    # Walk newest -> oldest and pick the newest file that contains the matrix/optimal output.
+    while IFS= read -r candidate; do
+        [ -z "$candidate" ] && continue
+        [ -f "$candidate" ] || continue
+
+        # Prefer the concurrency-derived optimal device count.
+        value=$(jq -r '.matrix.optimal.best_combined.concurrency // .matrix.optimal.best_read.concurrency // .matrix.optimal.best_write.concurrency // empty' "$candidate" 2>/dev/null || true)
+        if [[ -n "$value" && "$value" != "null" && "$value" =~ ^[0-9]+$ && "$value" -gt 0 ]]; then
+            chosen="$candidate"
+            echo "$chosen"
+            return 0
+        fi
+
+        # Fallback: some result formats export a recommended stripe width.
+        value=$(jq -r '.matrix.optimal.recommended_swap_stripe_width // empty' "$candidate" 2>/dev/null || true)
+        if [[ -n "$value" && "$value" != "null" && "$value" =~ ^[0-9]+$ && "$value" -gt 0 ]]; then
+            chosen="$candidate"
+            echo "$chosen"
+            return 0
+        fi
+    done < <(ls -t $BENCHMARK_RESULTS 2>/dev/null || true)
+
+    return 1
+}
+
+# Find the most recent *complete* benchmark results file (newest that contains matrix.optimal).
+RESULTS_FILE="$(select_benchmark_results_file || true)"
+if [ -z "$RESULTS_FILE" ] || [ ! -f "$RESULTS_FILE" ]; then
+    log_error "No usable benchmark results found at: $BENCHMARK_RESULTS"
+    log_error "Need one file with: .matrix.optimal.best_*\.concurrency or .matrix.optimal.recommended_swap_stripe_width"
+    log_info "Run: sudo ./benchmark.py --test-all"
     exit 1
 fi
 
-if [ -z "$OPTIMAL_DEVICES" ] || [ "$OPTIMAL_DEVICES" = "null" ]; then
-    log_error "No optimal device count found in benchmark results"
-    log_error "Ensure matrix test completed: jq '.matrix' $RESULTS_FILE"
+log_info "Using benchmark results: $RESULTS_FILE"
+
+# Extract benchmark-optimal stripe width / device count.
+OPTIMAL_DEVICES=$(jq -r '.matrix.optimal.best_combined.concurrency // .matrix.optimal.best_read.concurrency // .matrix.optimal.best_write.concurrency // empty' "$RESULTS_FILE" 2>/dev/null || true)
+if [[ -z "$OPTIMAL_DEVICES" || "$OPTIMAL_DEVICES" = "null" ]]; then
+    OPTIMAL_DEVICES=$(jq -r '.matrix.optimal.recommended_swap_stripe_width // empty' "$RESULTS_FILE" 2>/dev/null || true)
+fi
+
+if [[ -z "$OPTIMAL_DEVICES" || "$OPTIMAL_DEVICES" = "null" ]]; then
+    log_error "No benchmark-optimal swap stripe width found in benchmark results"
+    log_error "Expected one of: .matrix.optimal.best_*\.concurrency or .matrix.optimal.recommended_swap_stripe_width"
+    log_error "Inspect: jq '.matrix.optimal' $RESULTS_FILE"
     exit 1
 fi
 
-log_info "Optimal swap device count from benchmark: $OPTIMAL_DEVICES"
+if [[ ! "$OPTIMAL_DEVICES" =~ ^[0-9]+$ ]] || [ "$OPTIMAL_DEVICES" -lt 1 ]; then
+    log_error "Invalid benchmark-optimal device count: '$OPTIMAL_DEVICES'"
+    log_error "Inspect: jq '.matrix.optimal' $RESULTS_FILE"
+    exit 1
+fi
+
+log_info "Benchmark-optimal swap device count: $OPTIMAL_DEVICES"
 
 # Get system specifications
 RAM_TOTAL_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')

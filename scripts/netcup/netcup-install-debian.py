@@ -58,6 +58,34 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 from pathlib import Path
 
+
+_SENSITIVE_DICT_KEYS = {
+    "access_token",
+    "refresh_token",
+    "rootPassword",
+    "password",
+    "token",
+    "authorization",
+    "Authorization",
+    "cloudInitResultBase64Encoded",
+}
+
+
+def _redact_for_log(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: Dict[str, Any] = {}
+        for k, v in value.items():
+            if k in _SENSITIVE_DICT_KEYS:
+                redacted[k] = "***REDACTED***"
+            elif k == "customScript" and isinstance(v, str):
+                redacted[k] = f"***REDACTED customScript (len={len(v)})***"
+            else:
+                redacted[k] = _redact_for_log(v)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_for_log(v) for v in value]
+    return value
+
 # Load .env file if it exists
 def load_env_file():
     """Load environment variables from .env file"""
@@ -327,8 +355,9 @@ def save_payload_with_comments(
 
 
 class NetcupSCPClient:
-    def __init__(self, access_token: str):
+    def __init__(self, access_token: str, refresh_token: Optional[str] = None):
         self.base_url = BASE_URL
+        self.refresh_token = refresh_token
         self.session = requests.Session()
         self.session.headers.update({
             "Authorization": f"Bearer {access_token}",
@@ -336,34 +365,52 @@ class NetcupSCPClient:
             "Content-Type": "application/json",
         })
 
+    def refresh_access_token(self) -> None:
+        if not self.refresh_token:
+            raise RuntimeError("No refresh token available for access token refresh")
+        new_access_token = get_access_token(self.refresh_token)
+        self.session.headers.update({"Authorization": f"Bearer {new_access_token}"})
+
     def get(self, endpoint: str, params: Optional[Dict] = None) -> Any:
         """Make GET request to API"""
         url = f"{self.base_url}{endpoint}"
         log_debug(f"GET {url} {params or ''}")
-        response = self.session.get(url, params=params)
+        response = self.session.get(url, params=params, timeout=30)
+        if response.status_code == 401 and self.refresh_token:
+            log_debug("401 Unauthorized; refreshing token and retrying once")
+            self.refresh_access_token()
+            response = self.session.get(url, params=params, timeout=30)
         response.raise_for_status()
         result = response.json()
-        log_debug(f"Response: {json.dumps(result, indent=2)}")
+        log_debug(f"Response: {json.dumps(_redact_for_log(result), indent=2)}")
         return result
 
     def post(self, endpoint: str, data: Dict) -> Any:
         """Make POST request to API"""
         url = f"{self.base_url}{endpoint}"
         log_debug(f"POST {url}")
-        log_debug(f"Payload: {json.dumps(data, indent=2)}")
-        response = self.session.post(url, json=data)
+        log_debug(f"Payload: {json.dumps(_redact_for_log(data), indent=2)}")
+        response = self.session.post(url, json=data, timeout=30)
+        if response.status_code == 401 and self.refresh_token:
+            log_debug("401 Unauthorized; refreshing token and retrying once")
+            self.refresh_access_token()
+            response = self.session.post(url, json=data, timeout=30)
         response.raise_for_status()
         result = response.json()
-        log_debug(f"Response: {json.dumps(result, indent=2)}")
+        log_debug(f"Response: {json.dumps(_redact_for_log(result), indent=2)}")
         return result
 
     def get_user_info(self) -> Dict:
         """Get user information from OIDC userinfo endpoint"""
         log_debug(f"GET {KEYCLOAK_URL}/userinfo")
-        response = self.session.get(f"{KEYCLOAK_URL}/userinfo")
+        response = self.session.get(f"{KEYCLOAK_URL}/userinfo", timeout=30)
+        if response.status_code == 401 and self.refresh_token:
+            log_debug("401 Unauthorized; refreshing token and retrying once")
+            self.refresh_access_token()
+            response = self.session.get(f"{KEYCLOAK_URL}/userinfo", timeout=30)
         response.raise_for_status()
         result = response.json()
-        log_debug(f"Response: {json.dumps(result, indent=2)}")
+        log_debug(f"Response: {json.dumps(_redact_for_log(result), indent=2)}")
         return result
 
 
@@ -479,7 +526,7 @@ def main():
         print(f"❌ Failed to get access token:  {e}", file=sys.stderr)
         sys.exit(1)
 
-    client = NetcupSCPClient(access_token)
+    client = NetcupSCPClient(access_token, refresh_token=refresh_token)
     
     # If payload file is provided, use direct installation mode
     if args.payload:

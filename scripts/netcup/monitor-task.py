@@ -29,6 +29,32 @@ BASE_URL = "https://www.servercontrolpanel.de/scp-core"
 KEYCLOAK_URL = "https://www.servercontrolpanel.de/realms/scp/protocol/openid-connect"
 
 
+_SENSITIVE_DICT_KEYS = {
+    "access_token",
+    "refresh_token",
+    "rootPassword",
+    "password",
+    "token",
+    "authorization",
+    "Authorization",
+    "cloudInitResultBase64Encoded",
+}
+
+
+def _redact(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for k, v in value.items():
+            if k in _SENSITIVE_DICT_KEYS:
+                out[k] = "***REDACTED***"
+            else:
+                out[k] = _redact(v)
+        return out
+    if isinstance(value, list):
+        return [_redact(v) for v in value]
+    return value
+
+
 def load_env_file() -> None:
     env_file = Path(__file__).resolve().parent / ".env"
     if not env_file.exists():
@@ -61,7 +87,8 @@ def get_access_token(refresh_token: str) -> str:
 
 
 class NetcupSCPClient:
-    def __init__(self, access_token: str):
+    def __init__(self, access_token: str, refresh_token: Optional[str] = None):
+        self.refresh_token = refresh_token
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -71,9 +98,18 @@ class NetcupSCPClient:
             }
         )
 
+    def refresh_access_token(self) -> None:
+        if not self.refresh_token:
+            raise RuntimeError("No refresh token available")
+        access_token = get_access_token(self.refresh_token)
+        self.session.headers.update({"Authorization": f"Bearer {access_token}"})
+
     def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Any:
         url = f"{BASE_URL}{endpoint}"
         r = self.session.get(url, params=params, timeout=30)
+        if r.status_code == 401 and self.refresh_token:
+            self.refresh_access_token()
+            r = self.session.get(url, params=params, timeout=30)
         r.raise_for_status()
         return r.json()
 
@@ -83,6 +119,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("uuid", help="Task UUID")
     p.add_argument("--poll", type=float, default=5.0, help="Poll interval seconds (default: 5)")
     p.add_argument("--json", action="store_true", help="Print full task JSON and exit")
+    p.add_argument("--raw", action="store_true", help="With --json: print raw JSON (includes secrets like rootPassword)")
     return p.parse_args()
 
 
@@ -96,7 +133,7 @@ def main() -> None:
         sys.exit(2)
 
     access_token = get_access_token(refresh_token)
-    client = NetcupSCPClient(access_token)
+    client = NetcupSCPClient(access_token, refresh_token=refresh_token)
 
     last_state = None
     last_progress = None
@@ -104,7 +141,10 @@ def main() -> None:
     while True:
         task: Dict[str, Any] = client.get(f"/api/v1/tasks/{args.uuid}")
         if args.json:
-            print(json.dumps(task, indent=2))
+            if args.raw:
+                print(json.dumps(task, indent=2))
+            else:
+                print(json.dumps(_redact(task), indent=2))
             return
 
         state = task.get("state")
