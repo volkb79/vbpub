@@ -133,7 +133,7 @@ INSTALLATION_CONFIG = {
     "locale": "en_US.UTF-8",
     "timezone": "Europe/Berlin",
     "customScript":  f"curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | DEBUG_MODE=yes TELEGRAM_BOT_TOKEN={TELEGRAM_BOT_TOKEN} TELEGRAM_CHAT_ID={TELEGRAM_CHAT_ID} bash",
-    "rootPartitionFullDiskSize": False,
+    "rootPartitionFullDiskSize": True,
     "sshPasswordAuthentication": False,
     "emailToExecutingUser": True,
 }
@@ -302,6 +302,33 @@ def _build_ssh_cmd_base(host: str, user: str, identity_file: Optional[str] = Non
     return cmd
 
 
+def _server_short_name_from_details(server_details: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(server_details, dict):
+        return None
+    for key in ("nickname", "hostname", "name"):
+        val = server_details.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip().split(".")[0]
+    return None
+
+
+def _default_ssh_identity_for_server(server_short_name: Optional[str]) -> Optional[str]:
+    """Best-effort local identity selection.
+
+    We intentionally keep this conservative: only check the standard
+    per-server key name used by our workflow.
+    """
+    if not server_short_name:
+        return None
+    candidate = Path.home() / ".ssh" / f"server-access-{server_short_name}-ed25519"
+    try:
+        if candidate.is_file():
+            return str(candidate)
+    except Exception:
+        return None
+    return None
+
+
 class _SSHBootstrapFollower:
     def __init__(
         self,
@@ -310,12 +337,16 @@ class _SSHBootstrapFollower:
         user: str,
         identity_file: Optional[str],
         poll_interval: float,
+        initial_delay: float = 10.0,
+        max_wait_seconds: float = 300.0,
     ) -> None:
         self.task_uuid = task_uuid
         self.host = host
         self.user = user
         self.identity_file = identity_file
         self.poll_interval = max(1.0, float(poll_interval))
+        self.initial_delay = max(0.0, float(initial_delay))
+        self.max_wait_seconds = max(5.0, float(max_wait_seconds))
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._proc: Optional[subprocess.Popen[str]] = None
@@ -340,81 +371,129 @@ class _SSHBootstrapFollower:
 
     def _run(self) -> None:
         banner = f"SSH ATTACH: {self.user}@{self.host}"
-        print("=" * 70)
-        print(banner)
-        print("=" * 70)
-        print(f"[attach] Local capture: {self.local_log_path}")
+        identity_hint = self.identity_file or "(default ssh identities)"
 
-        # Wait for SSH to become reachable and usable.
-        while not self._stop.is_set():
-            if not _tcp_port_open(self.host, 22, timeout=2.0):
-                time.sleep(self.poll_interval)
-                continue
-
-            cmd = _build_ssh_cmd_base(self.host, self.user, self.identity_file) + ["true"]
-            try:
-                r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-                if r.returncode == 0:
-                    break
-            except Exception:
-                pass
-            time.sleep(self.poll_interval)
-
-        if self._stop.is_set():
-            return
-
-        # Prefer the netcup/cloud-init custom script output (what SCP typically captures),
-        # then fall back to our bootstrap log, then general cloud-init output.
-        remote = (
-            "bash -lc 'set -euo pipefail; "
-            "cands=("
-            "/root/custom_script.output "
-            "/var/log/custom_script.output "
-            "/var/log/custom-script.output "
-            "/var/log/debian-install/custom_script.output "
-            "); "
-            "for p in \"${cands[@]}\"; do if [ -f \"$p\" ]; then echo \"$p\"; exit 0; fi; done; "
-            "LOG=$(ls -1t /var/log/debian-install/bootstrap-*.log 2>/dev/null | head -1 || true); "
-            "if [ -n \"$LOG\" ]; then echo \"$LOG\"; exit 0; fi; "
-            "echo /var/log/cloud-init-output.log'"
-        )
-        find_cmd = _build_ssh_cmd_base(self.host, self.user, self.identity_file) + [remote]
-        log_path = "/var/log/cloud-init-output.log"
+        # Always create the local capture file immediately so users have
+        # something to inspect even if SSH isn't reachable/auth fails.
         try:
-            cp = subprocess.run(find_cmd, text=True, capture_output=True, timeout=20)
-            if cp.returncode == 0 and cp.stdout.strip():
-                log_path = cp.stdout.strip().splitlines()[-1].strip()
+            self.local_log_path.parent.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
 
-        print(f"[attach] Tailing: {log_path}")
+        def _log(line: str, lf: Optional[Any] = None) -> None:
+            print(line)
+            if lf is not None:
+                try:
+                    lf.write(line + "\n")
+                    lf.flush()
+                except Exception:
+                    pass
 
-        tail_remote = (
-            "bash -lc 'set -euo pipefail; "
-            f"P={json.dumps(log_path)}; "
-            "if [ ! -f \"$P\" ]; then "
-            "  echo \"[attach] Waiting for log to appear: $P\"; "
-            "  for i in $(seq 1 300); do [ -f \"$P\" ] && break; sleep 1; done; "
-            "fi; "
-            "tail -n 200 -F \"$P\"'"
-        )
+        with open(self.local_log_path, "a", encoding="utf-8") as lf:
+            _log("=" * 70, lf)
+            _log(banner, lf)
+            _log("=" * 70, lf)
+            _log(f"[attach] Local capture: {self.local_log_path}", lf)
+            _log(f"[attach] Identity: {identity_hint}", lf)
 
-        cmd = _build_ssh_cmd_base(self.host, self.user, self.identity_file) + [tail_remote]
-        try:
-            self._proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
+            if self.initial_delay > 0:
+                _log(f"[attach] Waiting {self.initial_delay:.0f}s before first SSH probe...", lf)
+                time.sleep(self.initial_delay)
+
+            # Wait for SSH to become reachable and usable (up to max_wait_seconds).
+            last_reason = None
+            start = time.monotonic()
+            while not self._stop.is_set():
+                if (time.monotonic() - start) > self.max_wait_seconds:
+                    _log(f"[attach] Giving up after {self.max_wait_seconds:.0f}s without SSH becoming usable.", lf)
+                    return
+                if not _tcp_port_open(self.host, 22, timeout=2.0):
+                    time.sleep(self.poll_interval)
+                    continue
+
+                cmd_probe = _build_ssh_cmd_base(self.host, self.user, self.identity_file) + ["true"]
+                try:
+                    r = subprocess.run(cmd_probe, text=True, capture_output=True, timeout=10)
+                    if r.returncode == 0:
+                        _log("[attach] SSH reachable; starting remote tail.", lf)
+                        break
+
+                    reason = (r.stderr or "").strip().splitlines()[-1:]  # last line only
+                    reason_txt = reason[0] if reason else f"ssh exit={r.returncode}"
+                    if reason_txt != last_reason:
+                        last_reason = reason_txt
+                        _log(f"[attach] SSH not ready/auth failed: {reason_txt}", lf)
+                        if not self.identity_file:
+                            _log(
+                                "[attach] Hint: pass --ssh-identity-file or set NETCUP_SSH_IDENTITY_FILE if this is a key auth issue.",
+                                lf,
+                            )
+                except Exception as e:
+                    reason_txt = f"{type(e).__name__}: {e}"
+                    if reason_txt != last_reason:
+                        last_reason = reason_txt
+                        _log(f"[attach] SSH probe error: {reason_txt}", lf)
+
+                time.sleep(self.poll_interval)
+
+            if self._stop.is_set():
+                return
+
+            # Prefer the netcup/cloud-init custom script output (what SCP typically captures),
+            # then fall back to our bootstrap log, then general cloud-init output.
+            remote = (
+                "bash -lc 'set -euo pipefail; "
+                "cands=("
+                "/root/custom_script.output "
+                "/var/log/custom_script.output "
+                "/var/log/custom-script.output "
+                "/var/log/custom_script/custom_script.output "
+                "/var/log/custom_script/custom-script.output "
+                "/var/log/netcup/custom_script.output "
+                "/var/log/scp/custom_script.output "
+                "/var/log/debian-install/custom_script.output "
+                "); "
+                "for p in \"${cands[@]}\"; do if [ -f \"$p\" ]; then echo \"$p\"; exit 0; fi; done; "
+                "LOG=$(ls -1t /var/log/debian-install/bootstrap-*.log 2>/dev/null | head -1 || true); "
+                "if [ -n \"$LOG\" ]; then echo \"$LOG\"; exit 0; fi; "
+                "echo /var/log/cloud-init-output.log'"
             )
-        except Exception as e:
-            print(f"[attach] Failed to start SSH tail: {e}")
-            return
+            find_cmd = _build_ssh_cmd_base(self.host, self.user, self.identity_file) + [remote]
+            log_path = "/var/log/cloud-init-output.log"
+            try:
+                cp = subprocess.run(find_cmd, text=True, capture_output=True, timeout=20)
+                if cp.returncode == 0 and cp.stdout.strip():
+                    log_path = cp.stdout.strip().splitlines()[-1].strip()
+            except Exception:
+                pass
 
-        assert self._proc.stdout is not None
-        try:
-            with open(self.local_log_path, "a", encoding="utf-8") as lf:
+            _log(f"[attach] Tailing: {log_path}", lf)
+
+            tail_remote = (
+                "bash -lc 'set -euo pipefail; "
+                f"P={json.dumps(log_path)}; "
+                "if [ ! -f \"$P\" ]; then "
+                "  echo \"[attach] Waiting for log to appear: $P\"; "
+                "  for i in $(seq 1 300); do [ -f \"$P\" ] && break; sleep 1; done; "
+                "fi; "
+                "tail -n 200 -F \"$P\"'"
+            )
+
+            cmd_tail = _build_ssh_cmd_base(self.host, self.user, self.identity_file) + [tail_remote]
+            try:
+                self._proc = subprocess.Popen(
+                    cmd_tail,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+            except Exception as e:
+                _log(f"[attach] Failed to start SSH tail: {e}", lf)
+                return
+
+            assert self._proc.stdout is not None
+            try:
                 for line in self._proc.stdout:
                     if self._stop.is_set():
                         break
@@ -423,14 +502,14 @@ class _SSHBootstrapFollower:
                     sys.stdout.flush()
                     lf.write(out_line)
                     lf.flush()
-        except Exception as e:
-            print(f"[attach] Failed while capturing remote output: {e}")
+            except Exception as e:
+                _log(f"[attach] Failed while capturing remote output: {e}", lf)
 
-        try:
-            if self._proc and self._proc.poll() is None:
-                self._proc.terminate()
-        except Exception:
-            pass
+            try:
+                if self._proc and self._proc.poll() is None:
+                    self._proc.terminate()
+            except Exception:
+                pass
 
 
 def monitor_task(
@@ -458,6 +537,21 @@ def monitor_task(
     print(f"MONITORING TASK {task_uuid}")
     print("=" * 70)
     print(f"Monitor capture: {monitor_log_path}")
+
+    # Start attach early (about 10s after installation kickoff) and retry until SSH becomes usable.
+    # This avoids relying on SCP step names / Cloudinit timing.
+    if attach_bootstrap and not attach_started and ssh_host:
+        attach_started = True
+        follower = _SSHBootstrapFollower(
+            task_uuid=task_uuid,
+            host=ssh_host,
+            user=ssh_user,
+            identity_file=ssh_identity_file,
+            poll_interval=poll_interval,
+            initial_delay=10.0,
+            max_wait_seconds=300.0,
+        )
+        follower.start()
 
     while True:
         task = client.get(f"/api/v1/tasks/{task_uuid}")
@@ -488,22 +582,7 @@ def monitor_task(
                         last_step_states[suuid] = sstate
                         step_lines.append(f"  - {sstate:12s} {sname}")
 
-        # Once cloud-init starts, try attaching via SSH to stream bootstrap logs.
-        if (
-            attach_bootstrap
-            and not attach_started
-            and ssh_host
-            and cloudinit_seen
-        ):
-            attach_started = True
-            follower = _SSHBootstrapFollower(
-                task_uuid=task_uuid,
-                host=ssh_host,
-                user=ssh_user,
-                identity_file=ssh_identity_file,
-                poll_interval=poll_interval,
-            )
-            follower.start()
+        # (Attach is started early outside the polling loop.)
 
         changed = False
         if state != last_state:
@@ -754,13 +833,16 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
             print("Monitor progress with:")
             print(f"  python3 monitor-task.py {task_uuid}")
             if getattr(args, "monitor", False) or is_noninteractive(args):
+                ssh_identity = getattr(args, "ssh_identity_file", None)
+                if not ssh_identity:
+                    ssh_identity = _default_ssh_identity_for_server(_server_short_name_from_details(server_details))
                 monitor_task(
                     client,
                     task_uuid,
                     poll_interval=getattr(args, "poll_interval", 5.0),
                     ssh_host=(getattr(args, "ssh_host", None) or ip_address),
                     ssh_user=getattr(args, "ssh_user", "root"),
-                    ssh_identity_file=getattr(args, "ssh_identity_file", None),
+                    ssh_identity_file=ssh_identity,
                     attach_bootstrap=getattr(args, "attach_bootstrap", True),
                 )
     except requests.HTTPError as e:
@@ -1062,13 +1144,16 @@ def main():
             print("Monitor progress with:")
             print(f"  python3 monitor-task.py {task_uuid}")
             if getattr(args, "monitor", False) or is_noninteractive(args):
+                ssh_identity = getattr(args, "ssh_identity_file", None)
+                if not ssh_identity:
+                    ssh_identity = _default_ssh_identity_for_server(_server_short_name_from_details(server_details))
                 monitor_task(
                     client,
                     task_uuid,
                     poll_interval=getattr(args, "poll_interval", 5.0),
                     ssh_host=(getattr(args, "ssh_host", None) or ip_address),
                     ssh_user=getattr(args, "ssh_user", "root"),
-                    ssh_identity_file=getattr(args, "ssh_identity_file", None),
+                    ssh_identity_file=ssh_identity,
                     attach_bootstrap=getattr(args, "attach_bootstrap", True),
                 )
 
