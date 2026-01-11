@@ -164,8 +164,21 @@ def load_env_file():
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     key, value = line.split("=", 1)
-                    # Remove quotes if present
-                    value = value.strip().strip('"').strip("'")
+                    value = value.strip()
+
+                    # If the value is unquoted, allow trailing inline comments.
+                    # Example: SERVER_NAME=v1001  # prod
+                    if value and not (value.startswith('"') or value.startswith("'")):
+                        if "#" in value:
+                            value = value.split("#", 1)[0].rstrip()
+
+                    # Remove surrounding quotes if present.
+                    if (len(value) >= 2) and (
+                        (value.startswith('"') and value.endswith('"'))
+                        or (value.startswith("'") and value.endswith("'"))
+                    ):
+                        value = value[1:-1]
+
                     os.environ.setdefault(key.strip(), value)
 
 load_env_file()
