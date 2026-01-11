@@ -305,11 +305,13 @@ def _build_ssh_cmd_base(host: str, user: str, identity_file: Optional[str] = Non
 class _SSHBootstrapFollower:
     def __init__(
         self,
+        task_uuid: str,
         host: str,
         user: str,
         identity_file: Optional[str],
         poll_interval: float,
     ) -> None:
+        self.task_uuid = task_uuid
         self.host = host
         self.user = user
         self.identity_file = identity_file
@@ -317,6 +319,8 @@ class _SSHBootstrapFollower:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._proc: Optional[subprocess.Popen[str]] = None
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.local_log_path = Path.cwd() / f"ssh-tail-{task_uuid}-{ts}.log"
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -339,6 +343,7 @@ class _SSHBootstrapFollower:
         print("=" * 70)
         print(banner)
         print("=" * 70)
+        print(f"[attach] Local capture: {self.local_log_path}")
 
         # Wait for SSH to become reachable and usable.
         while not self._stop.is_set():
@@ -358,11 +363,20 @@ class _SSHBootstrapFollower:
         if self._stop.is_set():
             return
 
-        # Prefer the bootstrap log if it exists; otherwise fall back to cloud-init output.
+        # Prefer the netcup/cloud-init custom script output (what SCP typically captures),
+        # then fall back to our bootstrap log, then general cloud-init output.
         remote = (
             "bash -lc 'set -euo pipefail; "
+            "cands=("
+            "/root/custom_script.output "
+            "/var/log/custom_script.output "
+            "/var/log/custom-script.output "
+            "/var/log/debian-install/custom_script.output "
+            "); "
+            "for p in \"${cands[@]}\"; do if [ -f \"$p\" ]; then echo \"$p\"; exit 0; fi; done; "
             "LOG=$(ls -1t /var/log/debian-install/bootstrap-*.log 2>/dev/null | head -1 || true); "
-            "if [ -n \"$LOG\" ]; then echo \"$LOG\"; else echo /var/log/cloud-init-output.log; fi'"
+            "if [ -n \"$LOG\" ]; then echo \"$LOG\"; exit 0; fi; "
+            "echo /var/log/cloud-init-output.log'"
         )
         find_cmd = _build_ssh_cmd_base(self.host, self.user, self.identity_file) + [remote]
         log_path = "/var/log/cloud-init-output.log"
@@ -399,12 +413,18 @@ class _SSHBootstrapFollower:
             return
 
         assert self._proc.stdout is not None
-        for line in self._proc.stdout:
-            if self._stop.is_set():
-                break
-            # Prefix to make interleaving with task polling readable.
-            sys.stdout.write(f"[remote] {line}")
-            sys.stdout.flush()
+        try:
+            with open(self.local_log_path, "a", encoding="utf-8") as lf:
+                for line in self._proc.stdout:
+                    if self._stop.is_set():
+                        break
+                    out_line = f"[remote] {line}"
+                    sys.stdout.write(out_line)
+                    sys.stdout.flush()
+                    lf.write(out_line)
+                    lf.flush()
+        except Exception as e:
+            print(f"[attach] Failed while capturing remote output: {e}")
 
         try:
             if self._proc and self._proc.poll() is None:
@@ -431,9 +451,13 @@ def monitor_task(
     follower: Optional[_SSHBootstrapFollower] = None
     attach_started = False
 
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    monitor_log_path = Path.cwd() / f"task-monitor-{task_uuid}-{ts}.log"
+
     print("=" * 70)
     print(f"MONITORING TASK {task_uuid}")
     print("=" * 70)
+    print(f"Monitor capture: {monitor_log_path}")
 
     while True:
         task = client.get(f"/api/v1/tasks/{task_uuid}")
@@ -473,6 +497,7 @@ def monitor_task(
         ):
             attach_started = True
             follower = _SSHBootstrapFollower(
+                task_uuid=task_uuid,
                 host=ssh_host,
                 user=ssh_user,
                 identity_file=ssh_identity_file,
@@ -491,15 +516,25 @@ def monitor_task(
         if changed:
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             ptxt = f"{progress:.0f}%" if isinstance(progress, (int, float)) else "?%"
-            print(f"[{now}] {state} {ptxt}  {name or ''}".rstrip())
+            out_lines: List[str] = []
+            out_lines.append(f"[{now}] {state} {ptxt}  {name or ''}".rstrip())
             if msg:
-                print(f"  message: {msg}")
+                out_lines.append(f"  message: {msg}")
             if started_at:
-                print(f"  started:  {_fmt_ts(started_at)}")
+                out_lines.append(f"  started:  {_fmt_ts(started_at)}")
             if finished_at:
-                print(f"  finished: {_fmt_ts(finished_at)}")
-            for ln in step_lines:
+                out_lines.append(f"  finished: {_fmt_ts(finished_at)}")
+            out_lines.extend(step_lines)
+
+            for ln in out_lines:
                 print(ln)
+
+            try:
+                with open(monitor_log_path, "a", encoding="utf-8") as mf:
+                    for ln in out_lines:
+                        mf.write(ln + "\n")
+            except Exception:
+                pass
 
             last_state = state
             last_progress = progress
