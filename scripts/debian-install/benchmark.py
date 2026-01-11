@@ -364,6 +364,15 @@ def get_memory_info():
     
     return info
 
+
+def set_oom_score_adj(value: int) -> None:
+    """Best-effort: make current process more likely to be OOM-killed (positive) or protected (negative)."""
+    try:
+        with open('/proc/self/oom_score_adj', 'w') as f:
+            f.write(str(int(value)))
+    except Exception:
+        pass
+
 def calculate_memory_distribution(test_size_mb):
     """
     Calculate memory distribution for tests.
@@ -381,21 +390,26 @@ def calculate_memory_distribution(test_size_mb):
     
     log_debug_ts(f"Memory: Total={total_mb}MB, Available={available_mb}MB")
     
-    # Safety buffer for system
-    SAFETY_BUFFER_MB = 500
-    
     # On high-RAM systems, lock more memory to force swapping
     system_info = get_system_info()
     ram_gb = system_info.get('ram_gb', 8)
+
+    # Safety buffer for system
+    # On small-RAM systems, keep more headroom to avoid killing SSH/VNC/systemd.
+    SAFETY_BUFFER_MB = 1024 if ram_gb <= 8 else 500
     
-    if ram_gb >= 8:
-        # Lock 85% instead of default to force more swapping
+    aggressive = os.environ.get('BENCHMARK_AGGRESSIVE', '').lower() == 'yes'
+    if aggressive and ram_gb >= 16:
+        # Aggressive mode on larger boxes only
         lock_percent = 0.85
         lock_size_mb = max(0, int(available_mb * lock_percent) - test_size_mb)
     else:
-        # Calculate how much we can lock normally
-        # We want to lock everything except: test_size + safety_buffer
-        lock_size_mb = max(0, available_mb - test_size_mb - SAFETY_BUFFER_MB)
+        # Conservative default: never try to lock the world
+        lock_percent = 0.50
+        lock_size_mb = max(0, int(available_mb * lock_percent) - test_size_mb)
+
+    # Hard cap: ensure safety buffer remains available
+    lock_size_mb = min(lock_size_mb, max(0, available_mb - test_size_mb - SAFETY_BUFFER_MB))
     
     log_info_ts(f"Memory distribution: Test={test_size_mb}MB, Lock={lock_size_mb}MB, Buffer={SAFETY_BUFFER_MB}MB")
     
@@ -451,7 +465,8 @@ def get_system_info():
         for line in f:
             if 'MemTotal' in line:
                 info['ram_kb'] = int(line.split()[1])
-                info['ram_gb'] = info['ram_kb'] // 1024 // 1024
+                # Convert MemTotal to GiB for reporting/policy decisions (rounded)
+                info['ram_gb'] = (info['ram_kb'] + 524287) // (1024 * 1024)
                 break
     
     # Available memory
@@ -864,7 +879,8 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
                     [str(mem_locker_path), str(lock_mb)],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    text=True
+                    text=True,
+                    preexec_fn=lambda: set_oom_score_adj(1000)
                 )
                 # Give it a moment to allocate and lock memory
                 time.sleep(2)
@@ -1550,6 +1566,31 @@ def get_device_io_stats(device_path):
     
     return stats
 
+
+def get_zswap_stats():
+    """Read ZSWAP stats from debugfs if available."""
+    stats = {}
+    debugfs_path = '/sys/kernel/debug/zswap'
+
+    if os.path.exists(debugfs_path):
+        try:
+            for stat_file in [
+                'pool_total_size',
+                'stored_pages',
+                'pool_limit_hit',
+                'written_back_pages',
+                'reject_compress_poor',
+                'reject_alloc_fail',
+            ]:
+                stat_path = os.path.join(debugfs_path, stat_file)
+                if os.path.exists(stat_path):
+                    with open(stat_path, 'r') as f:
+                        stats[stat_file] = int(f.read().strip())
+        except Exception as e:
+            log_debug(f"Could not read debugfs stats: {e}")
+
+    return stats
+
 def benchmark_zswap_comprehensive(swap_device='/dev/vda4', test_size_mb=256, compressor='lz4', zpool='z3fold', max_pool_percent=20):
     """
     Comprehensive ZSWAP benchmarking using same methodology as ZRAM tests:
@@ -1653,22 +1694,6 @@ def benchmark_zswap_comprehensive(swap_device='/dev/vda4', test_size_mb=256, com
         log_debug(f"Initial device stats: {initial_device_stats}")
         
         # Step 6: Get initial ZSWAP stats
-        def get_zswap_stats():
-            stats = {}
-            debugfs_path = '/sys/kernel/debug/zswap'
-            
-            if os.path.exists(debugfs_path):
-                try:
-                    for stat_file in ['pool_total_size', 'stored_pages', 'pool_limit_hit', 'written_back_pages', 'reject_compress_poor', 'reject_alloc_fail']:
-                        stat_path = os.path.join(debugfs_path, stat_file)
-                        if os.path.exists(stat_path):
-                            with open(stat_path, 'r') as f:
-                                stats[stat_file] = int(f.read().strip())
-                except Exception as e:
-                    log_debug(f"Could not read debugfs stats: {e}")
-            
-            return stats
-        
         initial_zswap_stats = get_zswap_stats()
         log_debug(f"Initial ZSWAP stats: {initial_zswap_stats}")
         
@@ -1712,8 +1737,10 @@ def benchmark_zswap_comprehensive(swap_device='/dev/vda4', test_size_mb=256, com
                     mem_available_kb = int(line.split()[1])
                     break
             
-            # Allocate more than available to force swapping
-            alloc_size_mb = max(test_size_mb, (mem_available_kb // 1024) + test_size_mb)
+            # Allocate slightly more than available to encourage swapping, but cap to avoid OOM storms.
+            mem_available_mb = mem_available_kb // 1024
+            extra_alloc_cap = 256 if get_system_info().get('ram_gb', 0) <= 8 else 1024
+            alloc_size_mb = max(test_size_mb, mem_available_mb + min(test_size_mb, extra_alloc_cap))
             log_info(f"Allocating {alloc_size_mb}MB to force swapping...")
         except:
             alloc_size_mb = test_size_mb
@@ -3223,11 +3250,16 @@ def generate_swap_config_report(results, output_file):
 
 def generate_matrix_heatmaps(matrix_results, output_dir='/var/log/debian-install'):
     """
-    Generate comprehensive visualizations for matrix test results:
-    1. Throughput heatmap (write + read in 2 subplots)
-    2. Line charts: Throughput vs Block Size (for each concurrency)
-    3. Line charts: Throughput vs Concurrency (for each block size)
-    4. Latency heatmaps (write + read in 2 subplots)
+    Generate visualizations for matrix test results.
+
+    Note: Heatmaps were removed because they tend to be hard to read in Telegram
+    and add little compared to line charts.
+
+    Generates:
+    1. Line charts: Throughput vs Block Size (for each concurrency)
+    2. Line charts: Throughput vs Concurrency (for each block size)
+    3. (If latency data available) Line charts: Latency vs Block Size
+    4. (If latency data available) Line charts: Latency vs Concurrency
     """
     if not MATPLOTLIB_AVAILABLE:
         log_warn("matplotlib not available - skipping matrix chart generation")
@@ -3264,50 +3296,7 @@ def generate_matrix_heatmaps(matrix_results, output_dir='/var/log/debian-install
         read_lat_data[ci, bi] = result.get('read_latency_us', 0)
     
     try:
-        # Chart 1: Throughput heatmap (existing)
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-        
-        im1 = ax1.imshow(write_data, cmap='YlOrRd', aspect='auto')
-        ax1.set_title('Write Throughput (MB/s)', fontsize=14, fontweight='bold')
-        ax1.set_xlabel('Block Size (KB)')
-        ax1.set_ylabel('Concurrency Level')
-        ax1.set_xticks(range(len(block_sizes)))
-        ax1.set_xticklabels(block_sizes)
-        ax1.set_yticks(range(len(concurrency_levels)))
-        ax1.set_yticklabels(concurrency_levels)
-        plt.colorbar(im1, ax=ax1)
-        
-        # Annotate cells with values
-        for i in range(len(concurrency_levels)):
-            for j in range(len(block_sizes)):
-                if write_data[i, j] > 0:
-                    text = ax1.text(j, i, f'{write_data[i, j]:.0f}',
-                                  ha="center", va="center", color="black", fontsize=8)
-        
-        im2 = ax2.imshow(read_data, cmap='YlGnBu', aspect='auto')
-        ax2.set_title('Read Throughput (MB/s)', fontsize=14, fontweight='bold')
-        ax2.set_xlabel('Block Size (KB)')
-        ax2.set_ylabel('Concurrency Level')
-        ax2.set_xticks(range(len(block_sizes)))
-        ax2.set_xticklabels(block_sizes)
-        ax2.set_yticks(range(len(concurrency_levels)))
-        ax2.set_yticklabels(concurrency_levels)
-        plt.colorbar(im2, ax=ax2)
-        
-        for i in range(len(concurrency_levels)):
-            for j in range(len(block_sizes)):
-                if read_data[i, j] > 0:
-                    text = ax2.text(j, i, f'{read_data[i, j]:.0f}',
-                                  ha="center", va="center", color="black", fontsize=8)
-        
-        plt.tight_layout()
-        output_file = os.path.join(output_dir, f'matrix-throughput-{timestamp}.png')
-        plt.savefig(output_file, dpi=150, bbox_inches='tight')
-        plt.close()
-        chart_files.append(output_file)
-        log_info(f"Generated matrix throughput heatmap: {output_file}")
-        
-        # Chart 2: Line chart - Throughput vs Block Size (for each concurrency level)
+        # Chart 1: Line chart - Throughput vs Block Size (for each concurrency level)
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
         
         for ci, concurrency in enumerate(concurrency_levels):
@@ -3337,7 +3326,7 @@ def generate_matrix_heatmaps(matrix_results, output_dir='/var/log/debian-install
         chart_files.append(output_file)
         log_info(f"Generated throughput vs block size chart: {output_file}")
         
-        # Chart 3: Line chart - Throughput vs Concurrency (for each block size)
+        # Chart 2: Line chart - Throughput vs Concurrency (for each block size)
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
         
         for bi, block_size in enumerate(block_sizes):
@@ -3365,52 +3354,10 @@ def generate_matrix_heatmaps(matrix_results, output_dir='/var/log/debian-install
         chart_files.append(output_file)
         log_info(f"Generated throughput vs concurrency chart: {output_file}")
         
-        # Chart 4: Latency heatmaps (if latency data available)
+        # Optional latency line charts (if latency data available)
         has_latency = np.any(write_lat_data > 0) or np.any(read_lat_data > 0)
         if has_latency:
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-            
-            im1 = ax1.imshow(write_lat_data, cmap='RdYlGn_r', aspect='auto')
-            ax1.set_title('Write Latency (µs)', fontsize=14, fontweight='bold')
-            ax1.set_xlabel('Block Size (KB)')
-            ax1.set_ylabel('Concurrency Level')
-            ax1.set_xticks(range(len(block_sizes)))
-            ax1.set_xticklabels(block_sizes)
-            ax1.set_yticks(range(len(concurrency_levels)))
-            ax1.set_yticklabels(concurrency_levels)
-            plt.colorbar(im1, ax=ax1, label='Latency (µs)')
-            
-            # Annotate cells with values
-            for i in range(len(concurrency_levels)):
-                for j in range(len(block_sizes)):
-                    if write_lat_data[i, j] > 0:
-                        text = ax1.text(j, i, f'{write_lat_data[i, j]:.1f}',
-                                      ha="center", va="center", color="black", fontsize=8)
-            
-            im2 = ax2.imshow(read_lat_data, cmap='RdYlGn_r', aspect='auto')
-            ax2.set_title('Read Latency (µs)', fontsize=14, fontweight='bold')
-            ax2.set_xlabel('Block Size (KB)')
-            ax2.set_ylabel('Concurrency Level')
-            ax2.set_xticks(range(len(block_sizes)))
-            ax2.set_xticklabels(block_sizes)
-            ax2.set_yticks(range(len(concurrency_levels)))
-            ax2.set_yticklabels(concurrency_levels)
-            plt.colorbar(im2, ax=ax2, label='Latency (µs)')
-            
-            for i in range(len(concurrency_levels)):
-                for j in range(len(block_sizes)):
-                    if read_lat_data[i, j] > 0:
-                        text = ax2.text(j, i, f'{read_lat_data[i, j]:.1f}',
-                                      ha="center", va="center", color="black", fontsize=8)
-            
-            plt.tight_layout()
-            output_file = os.path.join(output_dir, f'matrix-latency-{timestamp}.png')
-            plt.savefig(output_file, dpi=150, bbox_inches='tight')
-            plt.close()
-            chart_files.append(output_file)
-            log_info(f"Generated matrix latency heatmap: {output_file}")
-            
-            # NEW: Chart 5: Line chart - Latency vs Block Size (for each concurrency level)
+            # Chart 3: Line chart - Latency vs Block Size (for each concurrency level)
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
             
             for ci, concurrency in enumerate(concurrency_levels):
@@ -3440,7 +3387,7 @@ def generate_matrix_heatmaps(matrix_results, output_dir='/var/log/debian-install
             chart_files.append(output_file)
             log_info(f"Generated latency vs block size chart: {output_file}")
             
-            # NEW: Chart 6: Line chart - Latency vs Concurrency (for each block size)
+            # Chart 4: Line chart - Latency vs Concurrency (for each block size)
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
             
             for bi, block_size in enumerate(block_sizes):
@@ -3761,107 +3708,7 @@ def generate_charts(results, output_dir='/var/log/debian-install', webp=True):
                 chart_files.append(chart_file)
                 log_info(f"Generated compression chart: {chart_file}")
         
-        # Chart 5: Read Latency Heatmap
-        if 'latency_comparison' in results and 'read_latency' in results['latency_comparison']:
-            read_latencies = results['latency_comparison']['read_latency']
-            valid_reads = [r for r in read_latencies if 'error' not in r and 'avg_read_us' in r]
-            
-            if valid_reads:
-                # Create a matrix for heatmap: compressor × allocator
-                compressors = sorted(list(set(r['compressor'] for r in valid_reads)))
-                allocators = sorted(list(set(r['allocator'] for r in valid_reads)))
-                patterns = sorted(list(set(r.get('access_pattern', 'unknown') for r in valid_reads)))
-                
-                if len(patterns) > 1:
-                    # Multiple patterns - create subplots
-                    fig, axes = plt.subplots(1, len(patterns), figsize=(6*len(patterns), 5))
-                    if len(patterns) == 1:
-                        axes = [axes]
-                    
-                    for idx, pattern in enumerate(patterns):
-                        pattern_data = [r for r in valid_reads if r.get('access_pattern') == pattern]
-                        
-                        # Build matrix
-                        matrix = []
-                        for comp in compressors:
-                            row = []
-                            for alloc in allocators:
-                                matching = [r for r in pattern_data if r['compressor'] == comp and r['allocator'] == alloc]
-                                if matching:
-                                    row.append(matching[0]['avg_read_us'])
-                                else:
-                                    row.append(0)
-                            matrix.append(row)
-                        
-                        im = axes[idx].imshow(matrix, cmap='RdYlGn_r', aspect='auto')
-                        axes[idx].set_xticks(range(len(allocators)))
-                        axes[idx].set_yticks(range(len(compressors)))
-                        axes[idx].set_xticklabels(allocators, rotation=45, ha='right')
-                        axes[idx].set_yticklabels(compressors)
-                        axes[idx].set_title(f'Read Latency (µs) - {pattern}', fontweight='bold')
-                        
-                        # Add text annotations
-                        for i in range(len(compressors)):
-                            for j in range(len(allocators)):
-                                if matrix[i][j] > 0:
-                                    text = axes[idx].text(j, i, f'{matrix[i][j]:.1f}',
-                                                   ha="center", va="center", color="black", fontsize=9)
-                        
-                        plt.colorbar(im, ax=axes[idx], label='Latency (µs)')
-                    
-                    chart_file = f"{output_dir}/benchmark-read-latency-{timestamp}.png"
-                    plt.tight_layout()
-                    plt.savefig(chart_file, dpi=150)
-                    plt.close()
-                    chart_files.append(chart_file)
-                    log_info(f"Generated read latency chart: {chart_file}")
-        
-        # Chart 6: Write Latency Heatmap
-        if 'latency_comparison' in results and 'write_latency' in results['latency_comparison']:
-            write_latencies = results['latency_comparison']['write_latency']
-            valid_writes = [w for w in write_latencies if 'error' not in w and 'avg_write_us' in w]
-            
-            if valid_writes:
-                compressors = sorted(list(set(w['compressor'] for w in valid_writes)))
-                allocators = sorted(list(set(w['allocator'] for w in valid_writes)))
-                
-                # Build matrix
-                matrix = []
-                for comp in compressors:
-                    row = []
-                    for alloc in allocators:
-                        matching = [w for w in valid_writes if w['compressor'] == comp and w['allocator'] == alloc]
-                        if matching:
-                            row.append(matching[0]['avg_write_us'])
-                        else:
-                            row.append(0)
-                    matrix.append(row)
-                
-                fig, ax = plt.subplots(figsize=(8, 6))
-                im = ax.imshow(matrix, cmap='RdYlGn_r', aspect='auto')
-                ax.set_xticks(range(len(allocators)))
-                ax.set_yticks(range(len(compressors)))
-                ax.set_xticklabels(allocators, rotation=45, ha='right')
-                ax.set_yticklabels(compressors)
-                ax.set_title('Write Latency (µs) - Compressor × Allocator', fontsize=14, fontweight='bold')
-                
-                # Add text annotations
-                for i in range(len(compressors)):
-                    for j in range(len(allocators)):
-                        if matrix[i][j] > 0:
-                            text = ax.text(j, i, f'{matrix[i][j]:.1f}',
-                                       ha="center", va="center", color="black", fontsize=10)
-                
-                plt.colorbar(im, ax=ax, label='Latency (µs)')
-                
-                chart_file = f"{output_dir}/benchmark-write-latency-{timestamp}.png"
-                plt.tight_layout()
-                plt.savefig(chart_file, dpi=150)
-                plt.close()
-                chart_files.append(chart_file)
-                log_info(f"Generated write latency chart: {chart_file}")
-        
-        # Chart 7: Latency Distribution (Box Plot)
+        # Chart 5: Latency Distribution (Box Plot)
         if 'latency_comparison' in results:
             comp = results['latency_comparison']
             has_read = 'read_latency' in comp and any('p50_read_us' in r for r in comp['read_latency'] if 'error' not in r)
@@ -3869,63 +3716,106 @@ def generate_charts(results, output_dir='/var/log/debian-install', webp=True):
             
             if has_read or has_write:
                 fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+                def _fmt_latency_us(value_us: float) -> str:
+                    try:
+                        v = float(value_us)
+                    except Exception:
+                        return "?"
+                    if v >= 1000:
+                        return f"{v/1000:.1f}ms"
+                    return f"{v:.0f}µs"
+
+                def _build_bxp_stats(min_us: float, med_us: float, p95_us: float, max_us: float):
+                    # We don't have true quartiles; approximate Q1 between min and median.
+                    q1 = med_us - (med_us - min_us) * 0.5
+                    q3 = p95_us
+                    # Use p95 as upper whisker to keep plot readable; max becomes an annotated label.
+                    return {
+                        'whislo': min_us,
+                        'q1': q1,
+                        'med': med_us,
+                        'q3': q3,
+                        'whishi': p95_us,
+                        'fliers': [],
+                    }
                 
                 # Read latency distribution
                 if has_read:
                     read_data = comp['read_latency']
                     valid_reads = [r for r in read_data if 'error' not in r and 'p50_read_us' in r]
-                    
+
                     labels = []
-                    box_data = []
+                    stats = []
+                    outlier_max = []
                     for r in valid_reads:
                         label = f"{r['compressor']}\n{r['allocator']}\n{r.get('access_pattern', '')}"
                         labels.append(label)
-                        # Approximate box plot from percentiles
-                        box_data.append([
-                            r.get('min_read_us', 0),
-                            r.get('p50_read_us', 0) - (r.get('p50_read_us', 0) - r.get('min_read_us', 0)) * 0.5,
-                            r.get('p50_read_us', 0),
-                            r.get('p95_read_us', 0),
-                            r.get('max_read_us', 0)
-                        ])
-                    
-                    axes[0].boxplot(box_data, tick_labels=labels, patch_artist=True)
+
+                        min_us = float(r.get('min_read_us', 0) or 0)
+                        med_us = float(r.get('p50_read_us', 0) or 0)
+                        p95_us = float(r.get('p95_read_us', 0) or 0)
+                        max_us = float(r.get('max_read_us', 0) or 0)
+                        stats.append(_build_bxp_stats(min_us, med_us, p95_us, max_us))
+                        outlier_max.append(max_us)
+
+                    axes[0].bxp(stats, showfliers=False, patch_artist=True)
+                    axes[0].set_xticklabels(labels)
                     axes[0].set_ylabel('Latency (µs)', fontsize=12)
                     axes[0].set_title('Read Latency Distribution', fontsize=12, fontweight='bold')
                     axes[0].tick_params(axis='x', rotation=45)
                     axes[0].grid(True, alpha=0.3, axis='y')
+
+                    # Scale to whiskers/p95 so boxes are readable, annotate outlier max values.
+                    y_top = max((s['whishi'] for s in stats), default=1.0)
+                    y_top = max(y_top * 1.35, 1.0)
+                    axes[0].set_ylim(0, y_top)
+                    for i, (s, m) in enumerate(zip(stats, outlier_max), start=1):
+                        if m > (s['whishi'] * 1.05) and m > 0:
+                            axes[0].text(i, y_top * 0.98, f"max { _fmt_latency_us(m) }",
+                                         ha='center', va='top', fontsize=8)
                 
                 # Write latency distribution
                 if has_write:
                     write_data = comp['write_latency']
                     valid_writes = [w for w in write_data if 'error' not in w and 'p50_write_us' in w]
-                    
+
                     labels = []
-                    box_data = []
+                    stats = []
+                    outlier_max = []
                     for w in valid_writes:
                         label = f"{w['compressor']}\n{w['allocator']}"
                         labels.append(label)
-                        box_data.append([
-                            w.get('min_write_us', 0),
-                            w.get('p50_write_us', 0) - (w.get('p50_write_us', 0) - w.get('min_write_us', 0)) * 0.5,
-                            w.get('p50_write_us', 0),
-                            w.get('p95_write_us', 0),
-                            w.get('max_write_us', 0)
-                        ])
-                    
-                    axes[1].boxplot(box_data, tick_labels=labels, patch_artist=True)
+
+                        min_us = float(w.get('min_write_us', 0) or 0)
+                        med_us = float(w.get('p50_write_us', 0) or 0)
+                        p95_us = float(w.get('p95_write_us', 0) or 0)
+                        max_us = float(w.get('max_write_us', 0) or 0)
+                        stats.append(_build_bxp_stats(min_us, med_us, p95_us, max_us))
+                        outlier_max.append(max_us)
+
+                    axes[1].bxp(stats, showfliers=False, patch_artist=True)
+                    axes[1].set_xticklabels(labels)
                     axes[1].set_ylabel('Latency (µs)', fontsize=12)
                     axes[1].set_title('Write Latency Distribution', fontsize=12, fontweight='bold')
                     axes[1].tick_params(axis='x', rotation=45)
                     axes[1].grid(True, alpha=0.3, axis='y')
+
+                    y_top = max((s['whishi'] for s in stats), default=1.0)
+                    y_top = max(y_top * 1.35, 1.0)
+                    axes[1].set_ylim(0, y_top)
+                    for i, (s, m) in enumerate(zip(stats, outlier_max), start=1):
+                        if m > (s['whishi'] * 1.05) and m > 0:
+                            axes[1].text(i, y_top * 0.98, f"max { _fmt_latency_us(m) }",
+                                         ha='center', va='top', fontsize=8)
                 
                 # Add explanatory legend for box plot components
                 # Create a text box with explanation
                 legend_text = 'Box Plot Legend:\n' \
-                             '• Box: Q1-Q3 (25th-75th percentile)\n' \
-                             '• Line in box: Median (50th percentile)\n' \
-                             '• Whiskers: 1.5×IQR (Interquartile Range)\n' \
-                             '• Circles: Outliers beyond whiskers'
+                             '• Box: Q1-Q3 (approx)\n' \
+                             '• Line in box: Median (p50)\n' \
+                             '• Whiskers: min..p95 (for readable scaling)\n' \
+                             '• Outliers: max shown as label (no points)'
                 
                 # Place legend below the subplots
                 fig.text(0.5, -0.05, legend_text, ha='center', va='top', 

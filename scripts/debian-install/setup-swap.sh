@@ -188,7 +188,8 @@ detect_system() {
     
     # RAM in GB
     RAM_TOTAL_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-    RAM_GB=$((RAM_TOTAL_KB / 1024 / 1024))
+    # Use MemTotal directly and convert to GiB for policy decisions (rounded).
+    RAM_GB=$(((RAM_TOTAL_KB + 524287) / 1048576))
     log_info "RAM: ${RAM_GB}GB"
     
     # Disk space - get both available space and total capacity
@@ -871,11 +872,16 @@ disable_existing_swap() {
         log_info "Disabling active swap devices..."
         swapoff -a || log_warn "Some swap devices may not have been disabled"
         
-        # Remove from fstab
+        # Remove managed swap entries from fstab (do NOT delete swap partitions by PARTUUID)
         if grep -q "swap" /etc/fstab; then
-            log_info "Backing up and cleaning /etc/fstab..."
+            log_info "Backing up and cleaning managed swap entries in /etc/fstab..."
             cp /etc/fstab /etc/fstab.backup.$(date +%Y%m%d_%H%M%S)
-            sed -i '/swap/d' /etc/fstab
+            # Remove only swapfiles we create under SWAP_DIR (default /var/swap) and zram0 lines.
+            # Keep PARTUUID-based swap partitions so they survive reboots.
+            awk -v swap_dir="$SWAP_DIR" '
+                !($1 ~ "^" swap_dir "/swapfile[0-9]+$" && $3 == "swap") &&
+                !($1 == "/dev/zram0" && $3 == "swap")
+            ' /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
         fi
         
         # Remove old swap files
@@ -888,6 +894,38 @@ disable_existing_swap() {
     else
         log_info "No existing swap devices found"
     fi
+}
+
+enable_existing_swap_partitions() {
+    # Enable existing swap partitions (FSTYPE=swap) and ensure /etc/fstab contains PARTUUID entries.
+    local found=0
+    local part
+    while IFS= read -r part; do
+        [[ -z "$part" ]] && continue
+        found=1
+
+        if ! swapon --noheadings --show=NAME 2>/dev/null | awk '{print $1}' | grep -qx "$part"; then
+            log_info "Enabling existing swap partition: $part"
+            swapon -p "$SWAP_PRIORITY" "$part" || {
+                log_warn "Failed to swapon $part"
+                continue
+            }
+        fi
+
+        local partuuid
+        partuuid=$(blkid -s PARTUUID -o value "$part" 2>/dev/null || true)
+        if [[ -n "$partuuid" ]]; then
+            if ! grep -q "^PARTUUID=${partuuid}\\b" /etc/fstab 2>/dev/null; then
+                echo "PARTUUID=${partuuid} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+            fi
+        else
+            if ! grep -q "^${part}\\b" /etc/fstab 2>/dev/null; then
+                echo "${part} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+            fi
+        fi
+    done < <(lsblk -rno PATH,TYPE,FSTYPE | awk '$2=="part" && $3=="swap" {print $1}')
+
+    [[ "$found" -eq 1 ]]
 }
 
 # Setup ZRAM
@@ -2118,10 +2156,32 @@ setup_swap_solution() {
             ;;
         partitions_swap)
             log_info "Setting up native swap partitions"
-            if ! create_swap_partition; then
-                log_warn "Swap partition setup failed (often due to in-use root disk). Falling back to swap files in root."
-                SWAP_BACKING_TYPE="files_in_root"
-                create_swap_files
+            # Policy:
+            # - Always treat the root partition start as fixed.
+            # - Always rewrite everything after root to the determined plan/layout when benchmark results exist.
+            # - If benchmark results do not exist, fall back to activating existing swap partitions.
+
+            if [ -x "./create-swap-partitions.sh" ]; then
+                # Only enforce when benchmark results exist (otherwise create-swap-partitions.sh will exit).
+                if ls -t /var/log/debian-install/benchmark-results-*.json >/dev/null 2>&1; then
+                    log_info "Enforcing swap partition plan via create-swap-partitions.sh"
+                    ./create-swap-partitions.sh 2>&1 | tee -a "$LOG_FILE" || {
+                        log_error "Swap partition plan enforcement failed"
+                        return 1
+                    }
+                else
+                    log_warn "No benchmark results found; skipping repartition and enabling existing swap partitions"
+                fi
+            else
+                log_warn "create-swap-partitions.sh not found/executable; enabling existing swap partitions only"
+            fi
+
+            if enable_existing_swap_partitions; then
+                log_info "Swap partitions activated"
+            else
+                log_error "No swap partitions detected (FSTYPE=swap)."
+                log_error "Run create-swap-partitions.sh (requires benchmark results) or set SWAP_BACKING_TYPE=files_in_root."
+                return 1
             fi
             ;;
         partitions_zvol)

@@ -1,7 +1,7 @@
 # Benchmark Report Review & Recommendations
 
 **Date**: 2026-01-10  
-**System**: v1001.vxxu.de (7GB RAM, 4 CPU cores)  
+**System**: v1001.vxxu.de (~8GB RAM, 4 CPU cores)  
 **Context**: Analyzing Telegram benchmark results against chat-merged.md guidelines
 
 ---
@@ -26,6 +26,8 @@
   Recommended:
   SWAP_PAGE_CLUSTER=5  ← ⚠️ PROBLEM
   SWAP_STRIPE_WIDTH=8
+
+Note: Heatmaps were removed from chart output (lines-only) to improve readability in Telegram.
 ```
 
 ---

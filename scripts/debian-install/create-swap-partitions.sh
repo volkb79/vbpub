@@ -71,21 +71,46 @@ fi
 log_info "Optimal swap device count from benchmark: $OPTIMAL_DEVICES"
 
 # Get system specifications
-RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
+RAM_TOTAL_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+log_info "MemTotal: ${RAM_TOTAL_KB} kB"
+
+# Convert to GiB for policy decisions.
+# Use rounded GiB (not ceil) to avoid inflating values on odd-sized VMs,
+# while still treating common 8GB plans as 8GB when MemTotal is close.
+RAM_GB=$(((RAM_TOTAL_KB + 524287) / 1048576))
 TOTAL_SWAP_GB=$((RAM_GB * 2))  # 2x RAM sizing policy
 
 log_info "System RAM: ${RAM_GB}GB"
 log_info "Total swap needed: ${TOTAL_SWAP_GB}GB"
 
-# Calculate per-device size
-PER_DEVICE_GB=$((TOTAL_SWAP_GB / OPTIMAL_DEVICES))
-if [ "$PER_DEVICE_GB" -lt 1 ]; then
-    PER_DEVICE_GB=1
-    log_warn "Per-device size < 1GB, using 1GB minimum"
+# Use benchmark-optimal stripe count, but ensure equal partition sizes.
+# We compute sizes in MiB to keep totals very close to the policy target
+# while staying perfectly equal across all devices.
+SWAP_DEVICES="$OPTIMAL_DEVICES"
+
+TOTAL_SWAP_TARGET_MIB=$((TOTAL_SWAP_GB * 1024))
+
+# Guard rails for tiny systems / weird benchmark output.
+if [ "$SWAP_DEVICES" -lt 1 ]; then
+    SWAP_DEVICES=1
 fi
 
-log_info "Per-device swap size: ${PER_DEVICE_GB}GB"
-log_info "Will create ${OPTIMAL_DEVICES} swap partitions of ${PER_DEVICE_GB}GB each"
+# Ensure we can allocate at least 1MiB per device.
+if [ "$TOTAL_SWAP_TARGET_MIB" -lt "$SWAP_DEVICES" ]; then
+    SWAP_DEVICES="$TOTAL_SWAP_TARGET_MIB"
+    [ "$SWAP_DEVICES" -lt 1 ] && SWAP_DEVICES=1
+fi
+
+PER_DEVICE_MIB=$((TOTAL_SWAP_TARGET_MIB / SWAP_DEVICES))
+if [ "$PER_DEVICE_MIB" -lt 1 ]; then
+    PER_DEVICE_MIB=1
+fi
+
+TOTAL_SWAP_USED_MIB=$((PER_DEVICE_MIB * SWAP_DEVICES))
+
+log_info "Swap stripe width chosen: ${SWAP_DEVICES} (benchmark optimal: ${OPTIMAL_DEVICES})"
+log_info "Per-device swap size: ${PER_DEVICE_MIB}MiB"
+log_info "Total swap target: ${TOTAL_SWAP_TARGET_MIB}MiB; total swap used: ${TOTAL_SWAP_USED_MIB}MiB"
 
 # Detect root partition and disk
 ROOT_PARTITION=$(findmnt -n -o SOURCE / 2>/dev/null)
@@ -152,9 +177,10 @@ FREE_GB=$((FREE_SECTORS / 2048 / 1024))
 log_info "Free space after root: ${FREE_GB}GB (${FREE_SECTORS} sectors)"
 
 # Determine disk layout scenario
-TOTAL_SWAP_SECTORS=$((TOTAL_SWAP_GB * 1024 * 2048))
+TOTAL_SWAP_TARGET_SECTORS=$((TOTAL_SWAP_TARGET_MIB * 2048))
+TOTAL_SWAP_USED_SECTORS=$((TOTAL_SWAP_USED_MIB * 2048))
 
-if [ "$FREE_SECTORS" -gt "$TOTAL_SWAP_SECTORS" ]; then
+if [ "$FREE_SECTORS" -gt "$TOTAL_SWAP_USED_SECTORS" ]; then
     DISK_LAYOUT="minimal_root"
     log_info "Disk layout: MINIMAL ROOT (sufficient free space available)"
 else
@@ -199,12 +225,11 @@ fi
 log_success "Partition table backed up to: $BACKUP_FILE"
 
 # Calculate partition sizes
-PER_DEVICE_MIB=$((PER_DEVICE_GB * 1024))
 PER_DEVICE_SECTORS=$((PER_DEVICE_MIB * 2048))
-TOTAL_SWAP_MIB=$((PER_DEVICE_MIB * OPTIMAL_DEVICES))
 
 log_info "Per-device: ${PER_DEVICE_MIB}MiB (${PER_DEVICE_SECTORS} sectors)"
-log_info "Total swap: ${TOTAL_SWAP_MIB}MiB (${TOTAL_SWAP_SECTORS} sectors)"
+log_info "Total swap target: ${TOTAL_SWAP_TARGET_MIB}MiB (${TOTAL_SWAP_TARGET_SECTORS} sectors)"
+log_info "Total swap used:   ${TOTAL_SWAP_USED_MIB}MiB (${TOTAL_SWAP_USED_SECTORS} sectors)"
 
 # Create modified partition table
 PTABLE_NEW="/tmp/ptable-new-$(date +%s).dump"
@@ -214,7 +239,7 @@ log_step "Creating modified partition table..."
 
 if [ "$DISK_LAYOUT" = "minimal_root" ]; then
     # Scenario 1: MINIMAL ROOT - extend root to use most of disk, place swap at end
-    NEW_ROOT_SIZE_SECTORS=$((DISK_SIZE_SECTORS - ROOT_START - TOTAL_SWAP_SECTORS - 2048))
+    NEW_ROOT_SIZE_SECTORS=$((DISK_SIZE_SECTORS - ROOT_START - TOTAL_SWAP_USED_SECTORS - 2048))
     NEW_ROOT_SIZE_GB=$((NEW_ROOT_SIZE_SECTORS / 2048 / 1024))
     
     log_info "New root size: ${NEW_ROOT_SIZE_GB}GB (${NEW_ROOT_SIZE_SECTORS} sectors)"
@@ -227,6 +252,8 @@ if [ "$DISK_LAYOUT" = "minimal_root" ]; then
         echo ""
         
         # Process existing partitions
+        # Policy: keep partitions strictly before root (e.g. EFI), keep root,
+        # and DROP anything after root so the disk is fully rewritten to the new plan.
         while IFS= read -r line; do
             if [[ "$line" =~ ^/dev/ ]]; then
                 PART_NUM=$(echo "$line" | grep -oE '[0-9]+' | head -1)
@@ -234,15 +261,18 @@ if [ "$DISK_LAYOUT" = "minimal_root" ]; then
                     # Extend root partition
                     echo "$line" | sed -E "s/size= *[0-9]+/size=${NEW_ROOT_SIZE_SECTORS}/"
                 else
-                    # Keep other partitions
-                    echo "$line"
+                    # Keep only partitions that start before the root partition start.
+                    PART_START=$(echo "$line" | sed -E 's/.*start= *([0-9]+).*/\1/' | tr -d ' ')
+                    if [[ -n "$PART_START" ]] && [ "$PART_START" -lt "$ROOT_START" ]; then
+                        echo "$line"
+                    fi
                 fi
             fi
         done < "$BACKUP_FILE"
         
         # Add swap partitions
         SWAP_START=$((ROOT_START + NEW_ROOT_SIZE_SECTORS))
-        for i in $(seq 1 "$OPTIMAL_DEVICES"); do
+        for i in $(seq 1 "$SWAP_DEVICES"); do
             SWAP_PART_NUM=$((ROOT_PART_NUM + i))
             if [[ "$ROOT_DISK" =~ nvme ]]; then
                 PART_NAME="/dev/${ROOT_DISK}p${SWAP_PART_NUM}"
@@ -257,7 +287,7 @@ if [ "$DISK_LAYOUT" = "minimal_root" ]; then
     
 else
     # Scenario 2: FULL ROOT - shrink root, add swap at end
-    NEW_ROOT_SIZE_SECTORS=$((DISK_SIZE_SECTORS - ROOT_START - TOTAL_SWAP_SECTORS - 2048))
+    NEW_ROOT_SIZE_SECTORS=$((DISK_SIZE_SECTORS - ROOT_START - TOTAL_SWAP_USED_SECTORS - 2048))
     NEW_ROOT_SIZE_GB=$((NEW_ROOT_SIZE_SECTORS / 2048 / 1024))
     
     log_info "New root size: ${NEW_ROOT_SIZE_GB}GB (${NEW_ROOT_SIZE_SECTORS} sectors)"
@@ -276,6 +306,8 @@ else
         echo ""
         
         # Process existing partitions
+        # Policy: keep partitions strictly before root (e.g. EFI), keep root,
+        # and DROP anything after root so the disk is fully rewritten to the new plan.
         while IFS= read -r line; do
             if [[ "$line" =~ ^/dev/ ]]; then
                 PART_NUM=$(echo "$line" | grep -oE '[0-9]+' | head -1)
@@ -283,15 +315,18 @@ else
                     # Shrink root partition
                     echo "$line" | sed -E "s/size= *[0-9]+/size=${NEW_ROOT_SIZE_SECTORS}/"
                 else
-                    # Keep other partitions
-                    echo "$line"
+                    # Keep only partitions that start before the root partition start.
+                    PART_START=$(echo "$line" | sed -E 's/.*start= *([0-9]+).*/\1/' | tr -d ' ')
+                    if [[ -n "$PART_START" ]] && [ "$PART_START" -lt "$ROOT_START" ]; then
+                        echo "$line"
+                    fi
                 fi
             fi
         done < "$BACKUP_FILE"
         
         # Add swap partitions
         SWAP_START=$((ROOT_START + NEW_ROOT_SIZE_SECTORS))
-        for i in $(seq 1 "$OPTIMAL_DEVICES"); do
+        for i in $(seq 1 "$SWAP_DEVICES"); do
             SWAP_PART_NUM=$((ROOT_PART_NUM + i))
             if [[ "$ROOT_DISK" =~ nvme ]]; then
                 PART_NAME="/dev/${ROOT_DISK}p${SWAP_PART_NUM}"
@@ -310,7 +345,7 @@ log_success "Modified partition table created: $PTABLE_NEW"
 # Show changes
 log_info "Partition table changes:"
 log_info "  Root partition: ${ROOT_SIZE_GB}GB -> ${NEW_ROOT_SIZE_GB}GB"
-log_info "  New swap partitions: ${OPTIMAL_DEVICES} × ${PER_DEVICE_GB}GB"
+log_info "  New swap partitions: ${SWAP_DEVICES} × ${PER_DEVICE_MIB}MiB (total ${TOTAL_SWAP_USED_MIB}MiB; target ${TOTAL_SWAP_TARGET_MIB}MiB)"
 
 # Write modified partition table
 log_step "Writing modified partition table to disk..."
@@ -346,7 +381,7 @@ fi
 
 # Swap partition entries check
 missing=0
-for i in $(seq 1 "$OPTIMAL_DEVICES"); do
+for i in $(seq 1 "$SWAP_DEVICES"); do
     SWAP_PART_NUM=$((ROOT_PART_NUM + i))
     if [[ "$ROOT_DISK" =~ nvme ]]; then
         EXPECTED_PART="/dev/${ROOT_DISK}p${SWAP_PART_NUM}"
@@ -400,7 +435,7 @@ log_info "Waiting for device nodes to appear..."
 sleep 1
 
 log_info "Waiting for kernel to expose new partitions..."
-expected_last_num=$((ROOT_PART_NUM + OPTIMAL_DEVICES))
+expected_last_num=$((ROOT_PART_NUM + SWAP_DEVICES))
 if [[ "$ROOT_DISK" =~ nvme ]]; then
     expected_last_name="${ROOT_DISK}p${expected_last_num}"
 else
@@ -490,7 +525,7 @@ esac
 # Format and enable swap partitions
 log_step "Formatting and enabling swap partitions..."
 
-for i in $(seq 1 "$OPTIMAL_DEVICES"); do
+for i in $(seq 1 "$SWAP_DEVICES"); do
     SWAP_PART_NUM=$((ROOT_PART_NUM + i))
     
     if [[ "$ROOT_DISK" =~ nvme ]]; then
@@ -499,7 +534,7 @@ for i in $(seq 1 "$OPTIMAL_DEVICES"); do
         SWAP_PARTITION="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
     fi
     
-    log_info "Processing swap partition ${i}/${OPTIMAL_DEVICES}: ${SWAP_PARTITION}"
+    log_info "Processing swap partition ${i}/${SWAP_DEVICES}: ${SWAP_PARTITION}"
     
     # Wait for device node
     for retry in {1..10}; do
@@ -566,8 +601,7 @@ log_info "/etc/fstab swap entries:"
 grep "swap" /etc/fstab | tee -a "$LOG_FILE"
 
 log_success "Swap partition creation complete!"
-log_info "Created ${OPTIMAL_DEVICES} swap partitions of ${PER_DEVICE_GB}GB each"
-log_info "Total swap: ${TOTAL_SWAP_GB}GB"
+log_info "Created ${SWAP_DEVICES} swap partitions totaling ${TOTAL_SWAP_USED_MIB}MiB (target ${TOTAL_SWAP_TARGET_MIB}MiB)"
 log_info "Backup partition table: $BACKUP_FILE"
 log_info "Log file: $LOG_FILE"
 

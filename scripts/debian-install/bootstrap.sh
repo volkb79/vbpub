@@ -486,20 +486,21 @@ main() {
     # SSH key generation and setup
     if [ "$RUN_SSH_SETUP" = "yes" ]; then
         log_info "==> Generating SSH key for root user"
-        
-        # Generate SSH key and send private key via Telegram if configured
-        SSH_ARGS="--user root --send-private --non-interactive"
-        
+
+        # Use the unified Python tool in server mode (local install + optional Telegram delivery)
+        export HOME="/root"
+        export NONINTERACTIVE="yes"
+
         if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
             log_info "Telegram configured - will send private key via Telegram"
-            if ./generate-ssh-key-pair.sh $SSH_ARGS 2>&1 | tee -a "$LOG_FILE"; then
+            if python3 ../ssh-keygen-deploy.py --user root --send-private --non-interactive 2>&1 | tee -a "$LOG_FILE"; then
                 log_info "✓ SSH key generated and private key sent via Telegram"
             else
                 log_warn "SSH key generation had issues"
             fi
         else
             log_warn "Telegram not configured - SSH key will be generated but not sent"
-            if ./generate-ssh-key-pair.sh --user root --non-interactive 2>&1 | tee -a "$LOG_FILE"; then
+            if python3 ../ssh-keygen-deploy.py --user root --non-interactive 2>&1 | tee -a "$LOG_FILE"; then
                 log_info "✓ SSH key generated (no Telegram delivery)"
             else
                 log_warn "SSH key generation had issues"

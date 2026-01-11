@@ -54,7 +54,7 @@ import json
 import socket
 import argparse
 import requests
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 from pathlib import Path
 
@@ -170,10 +170,129 @@ These can be set in a .env file in the current directory.
         metavar="FILE",
         help="Path to JSON payload file for direct installation (skips interactive gathering)"
     )
+
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Run non-interactively (auto-confirm prompts). Also enabled automatically when stdin is not a TTY."
+    )
+    parser.add_argument(
+        "--monitor",
+        action="store_true",
+        help="After starting an installation, poll /api/v1/tasks/{uuid} until finished."
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=5.0,
+        help="Polling interval in seconds for --monitor (default: 5)."
+    )
     return parser.parse_args()
 
 
-def save_payload_with_comments(payload: Dict, filepath: str, server_name: str, image_name: str, user_id: int, ssh_key_names: list = None, hostname_method: str = None):
+def is_noninteractive(args: argparse.Namespace) -> bool:
+    # Treat non-tty execution as non-interactive to prevent blocking in automation.
+    if getattr(args, "yes", False):
+        return True
+    try:
+        return not sys.stdin.isatty()
+    except Exception:
+        return True
+
+
+def _fmt_ts(ts: Optional[str]) -> str:
+    if not ts:
+        return ""
+    return ts
+
+
+def monitor_task(client: "NetcupSCPClient", task_uuid: str, poll_interval: float = 5.0) -> Dict[str, Any]:
+    """Poll task endpoint until it reaches a terminal state."""
+    last_progress = None
+    last_state = None
+    last_step_states = {}
+
+    print("=" * 70)
+    print(f"MONITORING TASK {task_uuid}")
+    print("=" * 70)
+
+    while True:
+        task = client.get(f"/api/v1/tasks/{task_uuid}")
+        state = task.get("state")
+        name = task.get("name")
+        msg = task.get("message")
+        started_at = task.get("startedAt")
+        finished_at = task.get("finishedAt")
+        progress = None
+        tp = task.get("taskProgress") or {}
+        if isinstance(tp, dict):
+            progress = tp.get("progressInPercent")
+
+        # Steps (optional)
+        steps = task.get("steps") or []
+        step_lines = []
+        if isinstance(steps, list):
+            for s in steps:
+                sname = s.get("name")
+                sstate = s.get("state")
+                suuid = s.get("uuid")
+                if sname and sstate:
+                    prev = last_step_states.get(suuid)
+                    if prev != sstate:
+                        last_step_states[suuid] = sstate
+                        step_lines.append(f"  - {sstate:12s} {sname}")
+
+        changed = False
+        if state != last_state:
+            changed = True
+        if progress != last_progress:
+            changed = True
+        if step_lines:
+            changed = True
+
+        if changed:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ptxt = f"{progress:.0f}%" if isinstance(progress, (int, float)) else "?%"
+            print(f"[{now}] {state} {ptxt}  {name or ''}".rstrip())
+            if msg:
+                print(f"  message: {msg}")
+            if started_at:
+                print(f"  started:  {_fmt_ts(started_at)}")
+            if finished_at:
+                print(f"  finished: {_fmt_ts(finished_at)}")
+            for ln in step_lines:
+                print(ln)
+
+            last_state = state
+            last_progress = progress
+
+        if state in ("FINISHED", "ERROR", "CANCELED", "ROLLBACK"):
+            # Print responseError if present
+            resp_err = task.get("responseError")
+            if resp_err:
+                print("=" * 70)
+                print("TASK RESPONSE ERROR")
+                print(json.dumps(resp_err, indent=2))
+            return task
+
+        # Sleep
+        try:
+            import time
+            time.sleep(max(0.5, float(poll_interval)))
+        except KeyboardInterrupt:
+            print("\nInterrupted; task continues server-side.")
+            return task
+
+
+def save_payload_with_comments(
+    payload: Dict[str, Any],
+    filepath: str,
+    server_name: str,
+    image_name: str,
+    user_id: int,
+    ssh_key_names: Optional[List[str]] = None,
+    hostname_method: Optional[str] = None,
+):
     """Save installation payload to JSONC file with helpful comments"""
     with open(filepath, "w") as f:
         f.write("{\n")
@@ -300,13 +419,16 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
     print(json.dumps(installation_payload, indent=2))
     print()
     
-    # Ask for confirmation
-    print("=" * 70)
-    response = input("Do you want to start the installation now? (y/n): ")
-    
-    if response.lower() not in ("y", "yes"):
-        print("Installation cancelled.")
-        return
+    # Ask for confirmation (unless non-interactive)
+    if not is_noninteractive(args):
+        print("=" * 70)
+        response = input("Do you want to start the installation now? (y/n): ")
+        if response.lower() not in ("y", "yes"):
+            print("Installation cancelled.")
+            return
+    else:
+        print("=" * 70)
+        print("Non-interactive mode: starting installation without prompt")
     
     # Start installation
     print()
@@ -325,8 +447,9 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
             print(f"Task UUID: {task_uuid}")
             print()
             print("Monitor progress with:")
-            print(f"  export NETCUP_REFRESH_TOKEN='...'")
             print(f"  python3 monitor-task.py {task_uuid}")
+            if getattr(args, "monitor", False) or is_noninteractive(args):
+                monitor_task(client, task_uuid, poll_interval=getattr(args, "poll_interval", 5.0))
     except requests.HTTPError as e:
         print(f"❌ HTTP Error: {e}", file=sys.stderr)
         if e.response.text:
@@ -339,6 +462,7 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
 
 
 def main():
+    global args
     args = parse_args()
     
     # Check for refresh token
@@ -602,13 +726,16 @@ def main():
         print("✓ Installation payload saved to:  install-debian.json")
         print()
 
-        # 9. Ask for confirmation
-        print("=" * 70)
-        response = input("Do you want to start the installation now? (y/n): ")
-
-        if response.lower() not in ("y", "yes"):
-            print("Installation cancelled.")
-            return
+        # 9. Ask for confirmation (unless non-interactive)
+        if not is_noninteractive(args):
+            print("=" * 70)
+            response = input("Do you want to start the installation now? (y/n): ")
+            if response.lower() not in ("y", "yes"):
+                print("Installation cancelled.")
+                return
+        else:
+            print("=" * 70)
+            print("Non-interactive mode: starting installation without prompt")
 
         # 10. Start installation
         print()
@@ -626,8 +753,9 @@ def main():
             print(f"Task UUID: {task_uuid}")
             print()
             print("Monitor progress with:")
-            print(f"  export NETCUP_REFRESH_TOKEN='...'")
             print(f"  python3 monitor-task.py {task_uuid}")
+            if getattr(args, "monitor", False) or is_noninteractive(args):
+                monitor_task(client, task_uuid, poll_interval=getattr(args, "poll_interval", 5.0))
 
     except requests.HTTPError as e:
         print(f"❌ HTTP Error: {e}", file=sys.stderr)
