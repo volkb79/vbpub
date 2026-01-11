@@ -15,6 +15,7 @@ LOG_FILE="${LOG_FILE:-/var/log/debian-install/partition-creation.log}"
 SWAP_PRIORITY="${SWAP_PRIORITY:-10}"
 PRESERVE_ROOT_SIZE_GB="${PRESERVE_ROOT_SIZE_GB:-10}"
 ALLOW_ROOT_SHRINK="${ALLOW_ROOT_SHRINK:-yes}"
+OFFLINE_SHRINK_EXIT_CODE=42
 
 # Colors
 RED='\033[0;31m'
@@ -349,8 +350,7 @@ if [ "$NEW_ROOT_SIZE_SECTORS" -gt "$ROOT_SIZE" ]; then
 elif [ "$NEW_ROOT_SIZE_SECTORS" -lt "$ROOT_SIZE" ]; then
     log_warn "Root partition will be SHRUNK from ${ROOT_SIZE_GB}GB to ${NEW_ROOT_SIZE_GB}GB (accepted risk)"
     if [ "$FS_TYPE" = "ext4" ] || [ "$FS_TYPE" = "ext3" ] || [ "$FS_TYPE" = "ext2" ]; then
-        log_warn "ext* cannot shrink online; a reboot + fsck may be required. Creating /forcefsck."
-        touch /forcefsck 2>/dev/null || true
+        log_warn "ext* cannot shrink online. Scheduling an OFFLINE shrink+repartition in initramfs is required to avoid boot failure."
     else
         log_warn "Filesystem type '$FS_TYPE' may not tolerate shrink; proceed at your own risk."
     fi
@@ -399,10 +399,74 @@ fi
 
 log_success "Modified partition table created: $PTABLE_NEW"
 
+schedule_offline_ext_shrink() {
+    # Prepare one-shot initramfs task that will:
+    #   e2fsck -f -y -> resize2fs to NEW_BLOCKS -> e2fsck -f -y -> sfdisk apply ptable
+    local script_dir
+    script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+    if ! command -v update-initramfs >/dev/null 2>&1; then
+        log_error "update-initramfs not found; cannot schedule offline shrink automatically"
+        return 1
+    fi
+    if ! command -v dumpe2fs >/dev/null 2>&1; then
+        log_error "dumpe2fs not found; cannot compute ext block size"
+        return 1
+    fi
+
+    # Compute target filesystem block count for the new partition boundary.
+    local block_size
+    block_size=$(dumpe2fs -h "$ROOT_PARTITION" 2>/dev/null | awk -F: '/Block size/ {gsub(/ /,"",$2); print $2; exit}')
+    if [[ -z "${block_size:-}" || ! "$block_size" =~ ^[0-9]+$ || "$block_size" -le 0 ]]; then
+        log_error "Failed to determine ext block size via dumpe2fs"
+        return 1
+    fi
+    local new_bytes
+    new_bytes=$((NEW_ROOT_SIZE_SECTORS * 512))
+    local new_blocks
+    new_blocks=$((new_bytes / block_size))
+    if [ "$new_blocks" -le 0 ]; then
+        log_error "Computed NEW_BLOCKS is invalid: $new_blocks"
+        return 1
+    fi
+
+    mkdir -p /etc/vbpub
+    cp "$PTABLE_NEW" /etc/vbpub/offline-ptable.sfdisk
+    cat > /etc/vbpub/offline-repartition.conf <<EOF
+ROOT_DISK=${ROOT_DISK}
+ROOT_PARTITION=${ROOT_PARTITION}
+NEW_BLOCKS=${new_blocks}
+PTABLE_PATH=/etc/vbpub/offline-ptable.sfdisk
+EOF
+
+    mkdir -p /etc/initramfs-tools/scripts/local-premount /etc/initramfs-tools/hooks
+    cp "$script_dir/initramfs/vbpub-offline-repartition-premount.sh" /etc/initramfs-tools/scripts/local-premount/vbpub-offline-repartition
+    cp "$script_dir/initramfs/vbpub-offline-repartition-hook.sh" /etc/initramfs-tools/hooks/vbpub-offline-repartition
+    chmod +x /etc/initramfs-tools/scripts/local-premount/vbpub-offline-repartition /etc/initramfs-tools/hooks/vbpub-offline-repartition
+
+    log_info "Updating initramfs to include resize2fs + offline repartition job..."
+    update-initramfs -u
+
+    log_warn "Offline shrink+repartition scheduled. Reboot is required."
+    log_warn "If anything goes wrong, initramfs log: /run/vbpub-offline-repartition.log"
+    touch /forcefsck 2>/dev/null || true
+    return 0
+}
+
 # Show changes
 log_info "Partition table changes:"
 log_info "  Root partition: ${ROOT_SIZE_GB}GB -> ${NEW_ROOT_SIZE_GB}GB"
 log_info "  New swap partitions: ${SWAP_DEVICES} × ${PER_DEVICE_MIB}MiB (total ${TOTAL_SWAP_USED_MIB}MiB; target ${TOTAL_SWAP_TARGET_MIB}MiB)"
+
+# If we are shrinking an ext* filesystem, do not apply the smaller partition table online.
+# Instead, schedule an initramfs one-shot that shrinks the filesystem FIRST, then applies the table.
+if [ "$NEW_ROOT_SIZE_SECTORS" -lt "$ROOT_SIZE" ] && { [ "$FS_TYPE" = "ext4" ] || [ "$FS_TYPE" = "ext3" ] || [ "$FS_TYPE" = "ext2" ]; }; then
+    if schedule_offline_ext_shrink; then
+        exit "$OFFLINE_SHRINK_EXIT_CODE"
+    fi
+    log_error "Failed to schedule offline ext* shrink; refusing to shrink partition online"
+    exit 1
+fi
 
 # Write modified partition table
 log_step "Writing modified partition table to disk..."

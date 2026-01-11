@@ -398,7 +398,12 @@ main() {
                 log_root_layout
                 
                 export PRESERVE_ROOT_SIZE_GB
-                if ./create-swap-partitions.sh 2>&1 | tee -a "$LOG_FILE"; then
+                set +e
+                ./create-swap-partitions.sh 2>&1 | tee -a "$LOG_FILE"
+                rc=${PIPESTATUS[0]}
+                set -e
+
+                if [ "$rc" -eq 0 ]; then
                     log_info "✓ Swap partitions created successfully"
 
                     log_info "==> Root layout AFTER repartitioning"
@@ -415,6 +420,10 @@ main() {
                     else
                         log_info "==> ZSWAP latency test skipped (TEST_ZSWAP_LATENCY=$TEST_ZSWAP_LATENCY)"
                     fi
+                elif [ "$rc" -eq 42 ]; then
+                    log_warn "Swap partitioning requires offline ext* resize. Scheduled initramfs job; rebooting now."
+                    sync
+                    reboot
                 else
                     log_error "✗ Swap partition creation failed"
                     log_warn "Continuing with existing swap configuration"
