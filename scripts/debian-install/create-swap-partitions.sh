@@ -218,6 +218,11 @@ log_info "Free space after root: ${FREE_GB}GB (${FREE_SECTORS} sectors)"
 FS_TYPE=$(findmnt -n -o FSTYPE /)
 log_info "Root filesystem: $FS_TYPE"
 
+# If this script is re-run, swap may already be active on partitions we are about to recreate.
+# Turn it off early to reduce partition-table update friction.
+log_step "Disabling active swap (rerun safety)..."
+swapoff -a 2>/dev/null || true
+
 # Determine how much space is safely usable at the end of the disk for swap.
 # Keep a small tail buffer so we don't press against GPT end-of-disk structures.
 END_BUFFER_SECTORS=2048
