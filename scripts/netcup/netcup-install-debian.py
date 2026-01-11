@@ -286,9 +286,13 @@ def _tcp_port_open(host: str, port: int = 22, timeout: float = 2.0) -> bool:
 
 
 def _build_ssh_cmd_base(host: str, user: str, identity_file: Optional[str] = None) -> List[str]:
+    if not identity_file:
+        raise ValueError("ssh identity_file is required (refusing to use default ssh identities)")
+
     cmd = [
         "ssh",
         "-o", "BatchMode=yes",
+        "-o", "IdentitiesOnly=yes",
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "ConnectTimeout=5",
@@ -296,8 +300,7 @@ def _build_ssh_cmd_base(host: str, user: str, identity_file: Optional[str] = Non
         "-o", "ServerAliveCountMax=3",
         "-o", "LogLevel=ERROR",
     ]
-    if identity_file:
-        cmd += ["-i", identity_file]
+    cmd += ["-i", identity_file]
     cmd.append(f"{user}@{host}")
     return cmd
 
@@ -309,23 +312,6 @@ def _server_short_name_from_details(server_details: Optional[Dict[str, Any]]) ->
         val = server_details.get(key)
         if isinstance(val, str) and val.strip():
             return val.strip().split(".")[0]
-    return None
-
-
-def _default_ssh_identity_for_server(server_short_name: Optional[str]) -> Optional[str]:
-    """Best-effort local identity selection.
-
-    We intentionally keep this conservative: only check the standard
-    per-server key name used by our workflow.
-    """
-    if not server_short_name:
-        return None
-    candidate = Path.home() / ".ssh" / f"server-access-{server_short_name}-ed25519"
-    try:
-        if candidate.is_file():
-            return str(candidate)
-    except Exception:
-        return None
     return None
 
 
@@ -371,7 +357,7 @@ class _SSHBootstrapFollower:
 
     def _run(self) -> None:
         banner = f"SSH ATTACH: {self.user}@{self.host}"
-        identity_hint = self.identity_file or "(default ssh identities)"
+        identity_hint = self.identity_file or "(missing identity file)"
 
         # Always create the local capture file immediately so users have
         # something to inspect even if SSH isn't reachable/auth fails.
@@ -518,6 +504,12 @@ def monitor_task(
     print(f"MONITORING TASK {task_uuid}")
     print("=" * 70)
     print(f"Monitor capture: {monitor_log_path}")
+
+    if attach_bootstrap and not ssh_identity_file:
+        raise ValueError(
+            "--ssh-identity-file (or $NETCUP_SSH_IDENTITY_FILE) is required when attach_bootstrap is enabled; "
+            "refusing to use default ssh identities"
+        )
 
     # Start attach early (about 10s after installation kickoff) and retry until SSH becomes usable.
     # This avoids relying on SCP step names / Cloudinit timing.
@@ -815,8 +807,6 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
             print(f"  python3 monitor-task.py {task_uuid}")
             if getattr(args, "monitor", False) or is_noninteractive(args):
                 ssh_identity = getattr(args, "ssh_identity_file", None)
-                if not ssh_identity:
-                    ssh_identity = _default_ssh_identity_for_server(_server_short_name_from_details(server_details))
                 monitor_task(
                     client,
                     task_uuid,
@@ -1126,8 +1116,6 @@ def main():
             print(f"  python3 monitor-task.py {task_uuid}")
             if getattr(args, "monitor", False) or is_noninteractive(args):
                 ssh_identity = getattr(args, "ssh_identity_file", None)
-                if not ssh_identity:
-                    ssh_identity = _default_ssh_identity_for_server(_server_short_name_from_details(server_details))
                 monitor_task(
                     client,
                     task_uuid,
