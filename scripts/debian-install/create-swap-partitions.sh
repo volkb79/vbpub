@@ -1,8 +1,10 @@
 #!/bin/bash
 # Create optimal swap partitions based on benchmark matrix test results
-# Supports two disk layouts:
-# 1. MINIMAL ROOT: Extend root and place swap at end
-# 2. FULL ROOT: Shrink root and place swap at end
+# Layout policy:
+# - Treat root partition start as fixed
+# - Never shrink mounted root (unsafe / not supported for common filesystems)
+# - Rewrite everything after root to a deterministic plan of equal-sized swap partitions
+# - Optionally extend root so swap sits at disk end
 # Always uses sfdisk dump-modify-write pattern
 
 set -euo pipefail
@@ -145,8 +147,8 @@ fi
 TOTAL_SWAP_USED_MIB=$((PER_DEVICE_MIB * SWAP_DEVICES))
 
 log_info "Swap stripe width chosen: ${SWAP_DEVICES} (benchmark optimal: ${OPTIMAL_DEVICES})"
-log_info "Per-device swap size: ${PER_DEVICE_MIB}MiB"
-log_info "Total swap target: ${TOTAL_SWAP_TARGET_MIB}MiB; total swap used: ${TOTAL_SWAP_USED_MIB}MiB"
+log_info "Initial per-device swap target: ${PER_DEVICE_MIB}MiB (may be capped by available disk tail space)"
+log_info "Initial total swap target: ${TOTAL_SWAP_TARGET_MIB}MiB; initial total swap used: ${TOTAL_SWAP_USED_MIB}MiB"
 
 # Detect root partition and disk
 ROOT_PARTITION=$(findmnt -n -o SOURCE / 2>/dev/null)
@@ -212,45 +214,66 @@ FREE_GB=$((FREE_SECTORS / 2048 / 1024))
 
 log_info "Free space after root: ${FREE_GB}GB (${FREE_SECTORS} sectors)"
 
-# Determine disk layout scenario
-TOTAL_SWAP_TARGET_SECTORS=$((TOTAL_SWAP_TARGET_MIB * 2048))
-TOTAL_SWAP_USED_SECTORS=$((TOTAL_SWAP_USED_MIB * 2048))
-
-if [ "$FREE_SECTORS" -gt "$TOTAL_SWAP_USED_SECTORS" ]; then
-    DISK_LAYOUT="minimal_root"
-    log_info "Disk layout: MINIMAL ROOT (sufficient free space available)"
-else
-    DISK_LAYOUT="full_root"
-    log_info "Disk layout: FULL ROOT (need to shrink root partition)"
-fi
-
 # Get filesystem type
 FS_TYPE=$(findmnt -n -o FSTYPE /)
 log_info "Root filesystem: $FS_TYPE"
 
-# Validate filesystem type for shrinking (if needed)
-if [ "$DISK_LAYOUT" = "full_root" ]; then
-    case "$FS_TYPE" in
-        btrfs)
-            log_info "Filesystem supports online shrinking: $FS_TYPE"
-            ;;
-        ext4|ext3|ext2)
-            log_warn "FULL ROOT on $FS_TYPE: will shrink partition end only (no online filesystem shrink)"
-            log_warn "Assumption: filesystem has free space at the end; this is NOT validated here"
-            log_warn "Expected follow-up: reboot and let fsck reconcile filesystem/partition size"
-            ;;
-        xfs)
-            log_error "XFS does not support shrinking - cannot proceed with full_root layout"
-            log_info "Options:"
-            log_info "  1. Reinstall with smaller root partition"
-            log_info "  2. Use file-based swap instead of partitions"
-            exit 1
-            ;;
-        *)
-            log_warn "Unknown filesystem type: $FS_TYPE - proceeding with caution"
-            ;;
-    esac
+# Determine how much space is safely usable at the end of the disk for swap.
+# Keep a small tail buffer so we don't press against GPT end-of-disk structures.
+END_BUFFER_SECTORS=2048
+TOTAL_SWAP_TARGET_SECTORS=$((TOTAL_SWAP_TARGET_MIB * 2048))
+
+# Account for 1MiB alignment: swap partitions will start at the next 2048-sector boundary.
+ROOT_END_ALIGNED=$(( (ROOT_END + 2047) / 2048 * 2048 ))
+MAX_SWAP_SECTORS=$((DISK_SIZE_SECTORS - ROOT_END_ALIGNED - END_BUFFER_SECTORS))
+if [ "$MAX_SWAP_SECTORS" -lt 0 ]; then
+    MAX_SWAP_SECTORS=0
 fi
+
+# IMPORTANT SAFETY POLICY:
+# - Never shrink the root partition when '/' is mounted (ext* cannot shrink online).
+# - If there isn't enough free space after root, reduce swap to fit; if none fits, fail.
+if [ "$MAX_SWAP_SECTORS" -le 0 ]; then
+    log_error "No usable free space after root for swap partitions (free=${FREE_SECTORS} sectors; buffer=${END_BUFFER_SECTORS})"
+    log_error "Refusing to shrink mounted root partition. Reinstall with unallocated tail space or perform offline shrink in rescue mode."
+    exit 1
+fi
+
+TOTAL_SWAP_USED_SECTORS=$TOTAL_SWAP_TARGET_SECTORS
+if [ "$TOTAL_SWAP_USED_SECTORS" -gt "$MAX_SWAP_SECTORS" ]; then
+    log_warn "Insufficient free space after root for target swap (${TOTAL_SWAP_TARGET_MIB}MiB)."
+    log_warn "Capping swap to fit available tail space without shrinking root."
+    TOTAL_SWAP_USED_SECTORS=$MAX_SWAP_SECTORS
+fi
+
+# Align per-device size down to 1MiB (2048 sectors) so all partitions are equal and aligned.
+PER_DEVICE_SECTORS=$((TOTAL_SWAP_USED_SECTORS / SWAP_DEVICES))
+PER_DEVICE_SECTORS=$(( (PER_DEVICE_SECTORS / 2048) * 2048 ))
+
+if [ "$PER_DEVICE_SECTORS" -lt 2048 ]; then
+    # Too many devices for available space; reduce device count so each gets at least 1MiB.
+    MAX_DEVICES=$((TOTAL_SWAP_USED_SECTORS / 2048))
+    if [ "$MAX_DEVICES" -lt 1 ]; then
+        MAX_DEVICES=1
+    fi
+    log_warn "Available space too small for ${SWAP_DEVICES} swap devices; reducing to ${MAX_DEVICES} to maintain >=1MiB per device"
+    SWAP_DEVICES=$MAX_DEVICES
+    PER_DEVICE_SECTORS=$((TOTAL_SWAP_USED_SECTORS / SWAP_DEVICES))
+    PER_DEVICE_SECTORS=$(( (PER_DEVICE_SECTORS / 2048) * 2048 ))
+fi
+
+TOTAL_SWAP_USED_SECTORS=$((PER_DEVICE_SECTORS * SWAP_DEVICES))
+PER_DEVICE_MIB=$((PER_DEVICE_SECTORS / 2048))
+TOTAL_SWAP_USED_MIB=$((PER_DEVICE_MIB * SWAP_DEVICES))
+
+log_info "Total usable tail space for swap: $((MAX_SWAP_SECTORS / 2048))MiB"
+log_info "Per-device: ${PER_DEVICE_MIB}MiB (${PER_DEVICE_SECTORS} sectors)"
+log_info "Total swap used: ${TOTAL_SWAP_USED_MIB}MiB (${TOTAL_SWAP_USED_SECTORS} sectors)"
+
+# Disk layout: we only ever EXTEND root (never shrink). If there's more free space than needed,
+# extend root so swap sits at the end and root uses the remainder.
+DISK_LAYOUT="minimal_root"
+log_info "Disk layout: MINIMAL ROOT (root is never shrunk)"
 
 # Backup partition table
 BACKUP_FILE="/tmp/ptable-backup-$(date +%s).dump"
@@ -260,10 +283,7 @@ if ! sfdisk --dump "/dev/$ROOT_DISK" > "$BACKUP_FILE" 2>&1; then
 fi
 log_success "Partition table backed up to: $BACKUP_FILE"
 
-# Calculate partition sizes
-PER_DEVICE_SECTORS=$((PER_DEVICE_MIB * 2048))
-
-log_info "Per-device: ${PER_DEVICE_MIB}MiB (${PER_DEVICE_SECTORS} sectors)"
+# Emit summary with final (possibly capped) values
 log_info "Total swap target: ${TOTAL_SWAP_TARGET_MIB}MiB (${TOTAL_SWAP_TARGET_SECTORS} sectors)"
 log_info "Total swap used:   ${TOTAL_SWAP_USED_MIB}MiB (${TOTAL_SWAP_USED_SECTORS} sectors)"
 
@@ -273,108 +293,64 @@ SWAP_TYPE_GUID="0657FD6D-A4AB-43C4-84E5-0933C84B4F4F"  # Linux swap GUID for GPT
 
 log_step "Creating modified partition table..."
 
-if [ "$DISK_LAYOUT" = "minimal_root" ]; then
-    # Scenario 1: MINIMAL ROOT - extend root to use most of disk, place swap at end
-    NEW_ROOT_SIZE_SECTORS=$((DISK_SIZE_SECTORS - ROOT_START - TOTAL_SWAP_USED_SECTORS - 2048))
-    NEW_ROOT_SIZE_GB=$((NEW_ROOT_SIZE_SECTORS / 2048 / 1024))
-    
-    log_info "New root size: ${NEW_ROOT_SIZE_GB}GB (${NEW_ROOT_SIZE_SECTORS} sectors)"
-    log_info "Root will be extended from ${ROOT_SIZE_GB}GB to ${NEW_ROOT_SIZE_GB}GB"
-    
-    # Generate modified partition table
-    {
-        # Copy header
-        grep -E "^(label|label-id|device|unit|first-lba|last-lba|sector-size):" "$BACKUP_FILE"
-        echo ""
-        
-        # Process existing partitions
-        # Policy: keep partitions strictly before root (e.g. EFI), keep root,
-        # and DROP anything after root so the disk is fully rewritten to the new plan.
-        while IFS= read -r line; do
-            if [[ "$line" =~ ^/dev/ ]]; then
-                PART_NUM=$(echo "$line" | grep -oE '[0-9]+' | head -1)
-                if [ "$PART_NUM" = "$ROOT_PART_NUM" ]; then
-                    # Extend root partition
-                    echo "$line" | sed -E "s/size= *[0-9]+/size=${NEW_ROOT_SIZE_SECTORS}/"
-                else
-                    # Keep only partitions that start before the root partition start.
-                    PART_START=$(echo "$line" | sed -E 's/.*start= *([0-9]+).*/\1/' | tr -d ' ')
-                    if [[ -n "$PART_START" ]] && [ "$PART_START" -lt "$ROOT_START" ]; then
-                        echo "$line"
-                    fi
-                fi
-            fi
-        done < "$BACKUP_FILE"
-        
-        # Add swap partitions
-        SWAP_START=$((ROOT_START + NEW_ROOT_SIZE_SECTORS))
-        for i in $(seq 1 "$SWAP_DEVICES"); do
-            SWAP_PART_NUM=$((ROOT_PART_NUM + i))
-            if [[ "$ROOT_DISK" =~ nvme ]]; then
-                PART_NAME="/dev/${ROOT_DISK}p${SWAP_PART_NUM}"
-            else
-                PART_NAME="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
-            fi
-            echo "${PART_NAME} : start=${SWAP_START}, size=${PER_DEVICE_SECTORS}, type=${SWAP_TYPE_GUID}"
-            SWAP_START=$((SWAP_START + PER_DEVICE_SECTORS))
-            SWAP_START=$(( (SWAP_START + 2047) / 2048 * 2048 ))  # Align to 2048 sectors
-        done
-    } > "$PTABLE_NEW"
-    
-else
-    # Scenario 2: FULL ROOT - shrink root, add swap at end
-    NEW_ROOT_SIZE_SECTORS=$((DISK_SIZE_SECTORS - ROOT_START - TOTAL_SWAP_USED_SECTORS - 2048))
-    NEW_ROOT_SIZE_GB=$((NEW_ROOT_SIZE_SECTORS / 2048 / 1024))
-    
-    log_info "New root size: ${NEW_ROOT_SIZE_GB}GB (${NEW_ROOT_SIZE_SECTORS} sectors)"
-    log_info "Root will be shrunk from ${ROOT_SIZE_GB}GB to ${NEW_ROOT_SIZE_GB}GB"
-    
-    if [ "$NEW_ROOT_SIZE_SECTORS" -le 0 ]; then
-        log_error "Not enough space: disk too small for desired swap configuration"
-        log_error "Disk: ${DISK_SIZE_GB}GB, Root start: $((ROOT_START / 2048 / 1024))GB, Swap needed: ${TOTAL_SWAP_GB}GB"
-        exit 1
+# We only ever extend root (never shrink). If there is enough space, extend root so swap sits at disk end.
+# Compute a swap start that is aligned DOWN so that swap+buffer fits exactly at the end.
+NEW_ROOT_SIZE_SECTORS=$ROOT_SIZE
+if [ "$FREE_SECTORS" -gt "$TOTAL_SWAP_USED_SECTORS" ]; then
+    DESIRED_SWAP_START=$((DISK_SIZE_SECTORS - END_BUFFER_SECTORS - TOTAL_SWAP_USED_SECTORS))
+    DESIRED_SWAP_START=$(( (DESIRED_SWAP_START / 2048) * 2048 ))
+    CANDIDATE_ROOT_SIZE=$((DESIRED_SWAP_START - ROOT_START))
+    if [ "$CANDIDATE_ROOT_SIZE" -gt "$ROOT_SIZE" ]; then
+        NEW_ROOT_SIZE_SECTORS=$CANDIDATE_ROOT_SIZE
     fi
-    
-    # Generate modified partition table
-    {
-        # Copy header
-        grep -E "^(label|label-id|device|unit|first-lba|last-lba|sector-size):" "$BACKUP_FILE"
-        echo ""
-        
-        # Process existing partitions
-        # Policy: keep partitions strictly before root (e.g. EFI), keep root,
-        # and DROP anything after root so the disk is fully rewritten to the new plan.
-        while IFS= read -r line; do
-            if [[ "$line" =~ ^/dev/ ]]; then
-                PART_NUM=$(echo "$line" | grep -oE '[0-9]+' | head -1)
-                if [ "$PART_NUM" = "$ROOT_PART_NUM" ]; then
-                    # Shrink root partition
-                    echo "$line" | sed -E "s/size= *[0-9]+/size=${NEW_ROOT_SIZE_SECTORS}/"
-                else
-                    # Keep only partitions that start before the root partition start.
-                    PART_START=$(echo "$line" | sed -E 's/.*start= *([0-9]+).*/\1/' | tr -d ' ')
-                    if [[ -n "$PART_START" ]] && [ "$PART_START" -lt "$ROOT_START" ]; then
-                        echo "$line"
-                    fi
+fi
+
+NEW_ROOT_SIZE_GB=$((NEW_ROOT_SIZE_SECTORS / 2048 / 1024))
+log_info "New root size: ${NEW_ROOT_SIZE_GB}GB (${NEW_ROOT_SIZE_SECTORS} sectors)"
+if [ "$NEW_ROOT_SIZE_SECTORS" -gt "$ROOT_SIZE" ]; then
+    log_info "Root will be extended from ${ROOT_SIZE_GB}GB to ${NEW_ROOT_SIZE_GB}GB"
+else
+    log_info "Root will remain unchanged (no shrink performed)"
+fi
+
+# Generate modified partition table
+{
+    # Copy header
+    grep -E "^(label|label-id|device|unit|first-lba|last-lba|sector-size):" "$BACKUP_FILE"
+    echo ""
+
+    # Process existing partitions
+    # Policy: keep partitions strictly before root (e.g. EFI), keep root,
+    # and DROP anything after root so the disk is fully rewritten to the new plan.
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^/dev/ ]]; then
+            PART_NUM=$(echo "$line" | grep -oE '[0-9]+' | head -1)
+            if [ "$PART_NUM" = "$ROOT_PART_NUM" ]; then
+                echo "$line" | sed -E "s/size= *[0-9]+/size=${NEW_ROOT_SIZE_SECTORS}/"
+            else
+                PART_START=$(echo "$line" | sed -E 's/.*start= *([0-9]+).*/\1/' | tr -d ' ')
+                if [[ -n "$PART_START" ]] && [ "$PART_START" -lt "$ROOT_START" ]; then
+                    echo "$line"
                 fi
             fi
-        done < "$BACKUP_FILE"
-        
-        # Add swap partitions
-        SWAP_START=$((ROOT_START + NEW_ROOT_SIZE_SECTORS))
-        for i in $(seq 1 "$SWAP_DEVICES"); do
-            SWAP_PART_NUM=$((ROOT_PART_NUM + i))
-            if [[ "$ROOT_DISK" =~ nvme ]]; then
-                PART_NAME="/dev/${ROOT_DISK}p${SWAP_PART_NUM}"
-            else
-                PART_NAME="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
-            fi
-            echo "${PART_NAME} : start=${SWAP_START}, size=${PER_DEVICE_SECTORS}, type=${SWAP_TYPE_GUID}"
-            SWAP_START=$((SWAP_START + PER_DEVICE_SECTORS))
-            SWAP_START=$(( (SWAP_START + 2047) / 2048 * 2048 ))  # Align to 2048 sectors
-        done
-    } > "$PTABLE_NEW"
-fi
+        fi
+    done < "$BACKUP_FILE"
+
+    # Add swap partitions
+    SWAP_START=$((ROOT_START + NEW_ROOT_SIZE_SECTORS))
+    SWAP_START=$(( (SWAP_START + 2047) / 2048 * 2048 ))  # Align to 2048 sectors
+    for i in $(seq 1 "$SWAP_DEVICES"); do
+        SWAP_PART_NUM=$((ROOT_PART_NUM + i))
+        if [[ "$ROOT_DISK" =~ nvme ]]; then
+            PART_NAME="/dev/${ROOT_DISK}p${SWAP_PART_NUM}"
+        else
+            PART_NAME="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
+        fi
+        echo "${PART_NAME} : start=${SWAP_START}, size=${PER_DEVICE_SECTORS}, type=${SWAP_TYPE_GUID}"
+        SWAP_START=$((SWAP_START + PER_DEVICE_SECTORS))
+        SWAP_START=$(( (SWAP_START + 2047) / 2048 * 2048 ))  # Align to 2048 sectors
+    done
+} > "$PTABLE_NEW"
 
 log_success "Modified partition table created: $PTABLE_NEW"
 
@@ -446,6 +422,16 @@ sleep 2
 # Notify kernel of partition table changes
 log_step "Notifying kernel of partition table changes..."
 
+# Method 0: blockdev --rereadpt (force re-read; may fail on in-use disks)
+if command -v blockdev >/dev/null 2>&1; then
+    log_info "Using blockdev --rereadpt..."
+    if blockdev --rereadpt "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE"; then
+        log_success "blockdev completed"
+    else
+        log_warn "blockdev reported errors (expected for in-use disk)"
+    fi
+fi
+
 # Method 1: partprobe (preferred)
 if command -v partprobe >/dev/null 2>&1; then
     log_info "Using partprobe..."
@@ -464,6 +450,11 @@ if command -v partx >/dev/null 2>&1; then
     else
         log_warn "partx reported errors (expected for in-use disk)"
     fi
+fi
+
+# Settle udev events so device nodes show up (when possible)
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm settle 2>&1 | tee -a "$LOG_FILE" || true
 fi
 
 # Wait for device nodes to appear
@@ -503,7 +494,7 @@ case "$FS_TYPE" in
         log_info "Checking ext filesystem (read-only)..."
         e2fsck -n -v "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE" || true
         
-        if [ "$DISK_LAYOUT" = "minimal_root" ]; then
+        if [ "$NEW_ROOT_SIZE_SECTORS" -gt "$ROOT_SIZE" ]; then
             log_info "Expanding filesystem to fill partition..."
             if resize2fs "$ROOT_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
                 log_success "Filesystem expanded"
@@ -512,14 +503,12 @@ case "$FS_TYPE" in
                 exit 1
             fi
         else
-            log_warn "Skipping online filesystem shrink on mounted ext* root"
-            log_warn "Partition table was updated to a smaller root size; schedule a reboot and fsck"
-            log_warn "If the filesystem had allocated blocks beyond the new end, corruption is possible"
+            log_info "Root partition unchanged; no filesystem resize needed"
         fi
         ;;
     xfs)
         # XFS can only grow
-        if [ "$DISK_LAYOUT" = "minimal_root" ]; then
+        if [ "$NEW_ROOT_SIZE_SECTORS" -gt "$ROOT_SIZE" ]; then
             log_info "Growing XFS filesystem..."
             if xfs_growfs / 2>&1 | tee -a "$LOG_FILE"; then
                 log_success "XFS filesystem grown"
@@ -528,12 +517,11 @@ case "$FS_TYPE" in
                 exit 1
             fi
         else
-            log_error "Cannot shrink XFS filesystem"
-            exit 1
+            log_info "Root partition unchanged; no filesystem resize needed"
         fi
         ;;
     btrfs)
-        if [ "$DISK_LAYOUT" = "minimal_root" ]; then
+        if [ "$NEW_ROOT_SIZE_SECTORS" -gt "$ROOT_SIZE" ]; then
             log_info "Growing btrfs filesystem..."
             if btrfs filesystem resize max / 2>&1 | tee -a "$LOG_FILE"; then
                 log_success "Btrfs filesystem grown"
@@ -542,14 +530,7 @@ case "$FS_TYPE" in
                 exit 1
             fi
         else
-            log_info "Shrinking btrfs filesystem..."
-            TARGET_SIZE=$((NEW_ROOT_SIZE_SECTORS * 512))
-            if btrfs filesystem resize "${TARGET_SIZE}" / 2>&1 | tee -a "$LOG_FILE"; then
-                log_success "Btrfs filesystem shrunk"
-            else
-                log_error "Failed to shrink btrfs filesystem"
-                exit 1
-            fi
+            log_info "Root partition unchanged; no filesystem resize needed"
         fi
         ;;
     *)
@@ -576,6 +557,7 @@ if [ -f /etc/fstab ]; then
     log_info "Cleaned swap entries from /etc/fstab (backup: $FSTAB_BACKUP)"
 fi
 
+missing_dev=0
 for i in $(seq 1 "$SWAP_DEVICES"); do
     SWAP_PART_NUM=$((ROOT_PART_NUM + i))
     
@@ -598,6 +580,7 @@ for i in $(seq 1 "$SWAP_DEVICES"); do
     
     if [ ! -b "$SWAP_PARTITION" ]; then
         log_error "Device ${SWAP_PARTITION} not found"
+        missing_dev=1
         continue
     fi
     
@@ -620,22 +603,29 @@ for i in $(seq 1 "$SWAP_DEVICES"); do
     fi
     
     # Add to /etc/fstab using PARTUUID
-    PARTUUID=$(blkid -s PARTUUID -o value "$SWAP_PARTITION" 2>/dev/null)
-    if [ -n "$PARTUUID" ]; then
-        if ! grep -q "$PARTUUID" /etc/fstab 2>/dev/null; then
-            echo "PARTUUID=${PARTUUID} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
-            log_info "Added swap ${i} to /etc/fstab (PARTUUID=${PARTUUID})"
-        else
-            log_info "Swap ${i} already in /etc/fstab"
-        fi
+    PARTUUID=$(lsblk -no PARTUUID "$SWAP_PARTITION" 2>/dev/null | tr -d ' ')
+    if [ -z "$PARTUUID" ]; then
+        PARTUUID=$(blkid -s PARTUUID -o value "$SWAP_PARTITION" 2>/dev/null || true)
+    fi
+    if [ -z "$PARTUUID" ]; then
+        log_error "Failed to resolve PARTUUID for ${SWAP_PARTITION}; refusing to write unstable fstab entry"
+        missing_dev=1
+        continue
+    fi
+
+    if ! grep -q "^PARTUUID=${PARTUUID}\\b" /etc/fstab 2>/dev/null; then
+        echo "PARTUUID=${PARTUUID} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+        log_info "Added swap ${i} to /etc/fstab (PARTUUID=${PARTUUID})"
     else
-        log_warn "No PARTUUID found for ${SWAP_PARTITION}, using device path"
-        if ! grep -q "$SWAP_PARTITION" /etc/fstab 2>/dev/null; then
-            echo "${SWAP_PARTITION} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
-            log_info "Added swap ${i} to /etc/fstab (device path)"
-        fi
+        log_info "Swap ${i} already in /etc/fstab"
     fi
 done
+
+if [ "$missing_dev" -ne 0 ]; then
+    log_error "One or more swap partitions failed to appear or be configured"
+    log_error "Do not reboot until you verify the partition table and swap devices"
+    exit 1
+fi
 
 # Show final status
 log_step "Final Status"
