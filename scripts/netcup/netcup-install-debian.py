@@ -53,6 +53,9 @@ import sys
 import json
 import socket
 import argparse
+import subprocess
+import threading
+import time
 import requests
 from typing import Optional, Dict, Any, List
 from datetime import datetime
@@ -215,6 +218,35 @@ These can be set in a .env file in the current directory.
         default=5.0,
         help="Polling interval in seconds for --monitor (default: 5)."
     )
+
+    parser.add_argument(
+        "--attach-bootstrap",
+        dest="attach_bootstrap",
+        action="store_true",
+        default=True,
+        help="When monitoring, attempt to SSH in once cloud-init starts and tail bootstrap logs. (default: enabled)"
+    )
+    parser.add_argument(
+        "--no-attach-bootstrap",
+        dest="attach_bootstrap",
+        action="store_false",
+        help="Disable SSH attach/bootstrap log tailing while monitoring."
+    )
+    parser.add_argument(
+        "--ssh-host",
+        default=os.environ.get("NETCUP_SSH_HOST"),
+        help="SSH host/IP to attach to (default: detected server IPv4; override via NETCUP_SSH_HOST)."
+    )
+    parser.add_argument(
+        "--ssh-user",
+        default=os.environ.get("NETCUP_SSH_USER", "root"),
+        help="SSH user for attaching to the freshly installed system (default: root; override via NETCUP_SSH_USER)."
+    )
+    parser.add_argument(
+        "--ssh-identity-file",
+        default=os.environ.get("NETCUP_SSH_IDENTITY_FILE"),
+        help="Path to SSH identity file to use for attach (optional; override via NETCUP_SSH_IDENTITY_FILE)."
+    )
     return parser.parse_args()
 
 
@@ -234,11 +266,170 @@ def _fmt_ts(ts: Optional[str]) -> str:
     return ts
 
 
-def monitor_task(client: "NetcupSCPClient", task_uuid: str, poll_interval: float = 5.0) -> Dict[str, Any]:
+def _extract_primary_ipv4(server_details: Dict[str, Any]) -> Optional[str]:
+    ip_address = None
+    if "ipv4Addresses" in server_details and server_details["ipv4Addresses"]:
+        ip_address = server_details["ipv4Addresses"][0].get("ip")
+    elif "serverLiveInfo" in server_details and "interfaces" in server_details["serverLiveInfo"]:
+        interfaces = server_details["serverLiveInfo"]["interfaces"]
+        if interfaces and "ipv4Addresses" in interfaces[0] and interfaces[0]["ipv4Addresses"]:
+            ip_address = interfaces[0]["ipv4Addresses"][0]
+    return ip_address
+
+
+def _tcp_port_open(host: str, port: int = 22, timeout: float = 2.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _build_ssh_cmd_base(host: str, user: str, identity_file: Optional[str] = None) -> List[str]:
+    cmd = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=5",
+        "-o", "ServerAliveInterval=5",
+        "-o", "ServerAliveCountMax=3",
+        "-o", "LogLevel=ERROR",
+    ]
+    if identity_file:
+        cmd += ["-i", identity_file]
+    cmd.append(f"{user}@{host}")
+    return cmd
+
+
+class _SSHBootstrapFollower:
+    def __init__(
+        self,
+        host: str,
+        user: str,
+        identity_file: Optional[str],
+        poll_interval: float,
+    ) -> None:
+        self.host = host
+        self.user = user
+        self.identity_file = identity_file
+        self.poll_interval = max(1.0, float(poll_interval))
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._proc: Optional[subprocess.Popen[str]] = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+        if self._thread:
+            self._thread.join(timeout=3)
+
+    def _run(self) -> None:
+        banner = f"SSH ATTACH: {self.user}@{self.host}"
+        print("=" * 70)
+        print(banner)
+        print("=" * 70)
+
+        # Wait for SSH to become reachable and usable.
+        while not self._stop.is_set():
+            if not _tcp_port_open(self.host, 22, timeout=2.0):
+                time.sleep(self.poll_interval)
+                continue
+
+            cmd = _build_ssh_cmd_base(self.host, self.user, self.identity_file) + ["true"]
+            try:
+                r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+                if r.returncode == 0:
+                    break
+            except Exception:
+                pass
+            time.sleep(self.poll_interval)
+
+        if self._stop.is_set():
+            return
+
+        # Prefer the bootstrap log if it exists; otherwise fall back to cloud-init output.
+        remote = (
+            "bash -lc 'set -euo pipefail; "
+            "LOG=$(ls -1t /var/log/debian-install/bootstrap-*.log 2>/dev/null | head -1 || true); "
+            "if [ -n \"$LOG\" ]; then echo \"$LOG\"; else echo /var/log/cloud-init-output.log; fi'"
+        )
+        find_cmd = _build_ssh_cmd_base(self.host, self.user, self.identity_file) + [remote]
+        log_path = "/var/log/cloud-init-output.log"
+        try:
+            cp = subprocess.run(find_cmd, text=True, capture_output=True, timeout=20)
+            if cp.returncode == 0 and cp.stdout.strip():
+                log_path = cp.stdout.strip().splitlines()[-1].strip()
+        except Exception:
+            pass
+
+        print(f"[attach] Tailing: {log_path}")
+
+        tail_remote = (
+            "bash -lc 'set -euo pipefail; "
+            f"P={json.dumps(log_path)}; "
+            "if [ ! -f \"$P\" ]; then "
+            "  echo \"[attach] Waiting for log to appear: $P\"; "
+            "  for i in $(seq 1 300); do [ -f \"$P\" ] && break; sleep 1; done; "
+            "fi; "
+            "tail -n 200 -F \"$P\"'"
+        )
+
+        cmd = _build_ssh_cmd_base(self.host, self.user, self.identity_file) + [tail_remote]
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as e:
+            print(f"[attach] Failed to start SSH tail: {e}")
+            return
+
+        assert self._proc.stdout is not None
+        for line in self._proc.stdout:
+            if self._stop.is_set():
+                break
+            # Prefix to make interleaving with task polling readable.
+            sys.stdout.write(f"[remote] {line}")
+            sys.stdout.flush()
+
+        try:
+            if self._proc and self._proc.poll() is None:
+                self._proc.terminate()
+        except Exception:
+            pass
+
+
+def monitor_task(
+    client: "NetcupSCPClient",
+    task_uuid: str,
+    poll_interval: float = 5.0,
+    *,
+    ssh_host: Optional[str] = None,
+    ssh_user: str = "root",
+    ssh_identity_file: Optional[str] = None,
+    attach_bootstrap: bool = True,
+) -> Dict[str, Any]:
     """Poll task endpoint until it reaches a terminal state."""
     last_progress = None
     last_state = None
     last_step_states = {}
+
+    follower: Optional[_SSHBootstrapFollower] = None
+    attach_started = False
 
     print("=" * 70)
     print(f"MONITORING TASK {task_uuid}")
@@ -259,16 +450,35 @@ def monitor_task(client: "NetcupSCPClient", task_uuid: str, poll_interval: float
         # Steps (optional)
         steps = task.get("steps") or []
         step_lines = []
+        cloudinit_seen = False
         if isinstance(steps, list):
             for s in steps:
                 sname = s.get("name")
                 sstate = s.get("state")
                 suuid = s.get("uuid")
                 if sname and sstate:
+                    if "Cloudinit" in sname and sstate in ("RUNNING", "FINISHED"):
+                        cloudinit_seen = True
                     prev = last_step_states.get(suuid)
                     if prev != sstate:
                         last_step_states[suuid] = sstate
                         step_lines.append(f"  - {sstate:12s} {sname}")
+
+        # Once cloud-init starts, try attaching via SSH to stream bootstrap logs.
+        if (
+            attach_bootstrap
+            and not attach_started
+            and ssh_host
+            and cloudinit_seen
+        ):
+            attach_started = True
+            follower = _SSHBootstrapFollower(
+                host=ssh_host,
+                user=ssh_user,
+                identity_file=ssh_identity_file,
+                poll_interval=poll_interval,
+            )
+            follower.start()
 
         changed = False
         if state != last_state:
@@ -295,6 +505,8 @@ def monitor_task(client: "NetcupSCPClient", task_uuid: str, poll_interval: float
             last_progress = progress
 
         if state in ("FINISHED", "ERROR", "CANCELED", "ROLLBACK"):
+            if follower:
+                follower.stop()
             # Print responseError if present
             resp_err = task.get("responseError")
             if resp_err:
@@ -309,6 +521,8 @@ def monitor_task(client: "NetcupSCPClient", task_uuid: str, poll_interval: float
             time.sleep(max(0.5, float(poll_interval)))
         except KeyboardInterrupt:
             print("\nInterrupted; task continues server-side.")
+            if follower:
+                follower.stop()
             return task
 
 
@@ -459,6 +673,15 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
     
     print()
     
+    # Best-effort fetch server details so we can attach via SSH during monitoring.
+    server_details = None
+    ip_address = None
+    try:
+        server_details = client.get(f"/api/v1/servers/{server_id}")
+        ip_address = _extract_primary_ipv4(server_details)
+    except Exception:
+        pass
+
     # Display payload summary
     print("=" * 70)
     print("PAYLOAD SUMMARY")
@@ -496,7 +719,15 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
             print("Monitor progress with:")
             print(f"  python3 monitor-task.py {task_uuid}")
             if getattr(args, "monitor", False) or is_noninteractive(args):
-                monitor_task(client, task_uuid, poll_interval=getattr(args, "poll_interval", 5.0))
+                monitor_task(
+                    client,
+                    task_uuid,
+                    poll_interval=getattr(args, "poll_interval", 5.0),
+                    ssh_host=(getattr(args, "ssh_host", None) or ip_address),
+                    ssh_user=getattr(args, "ssh_user", "root"),
+                    ssh_identity_file=getattr(args, "ssh_identity_file", None),
+                    attach_bootstrap=getattr(args, "attach_bootstrap", True),
+                )
     except requests.HTTPError as e:
         print(f"❌ HTTP Error: {e}", file=sys.stderr)
         if e.response.text:
@@ -656,14 +887,8 @@ def main():
         
         # Get IP address and perform reverse DNS lookup
         # Try to get IPv4 address from either ipv4Addresses or interfaces
-        ip_address = None
+        ip_address = _extract_primary_ipv4(server_details)
         hostname_method = None
-        if "ipv4Addresses" in server_details and server_details["ipv4Addresses"]:
-            ip_address = server_details["ipv4Addresses"][0]["ip"]
-        elif "serverLiveInfo" in server_details and "interfaces" in server_details["serverLiveInfo"]:
-            interfaces = server_details["serverLiveInfo"]["interfaces"]
-            if interfaces and "ipv4Addresses" in interfaces[0] and interfaces[0]["ipv4Addresses"]:
-                ip_address = interfaces[0]["ipv4Addresses"][0]
         
         if ip_address:
             try:
@@ -802,7 +1027,15 @@ def main():
             print("Monitor progress with:")
             print(f"  python3 monitor-task.py {task_uuid}")
             if getattr(args, "monitor", False) or is_noninteractive(args):
-                monitor_task(client, task_uuid, poll_interval=getattr(args, "poll_interval", 5.0))
+                monitor_task(
+                    client,
+                    task_uuid,
+                    poll_interval=getattr(args, "poll_interval", 5.0),
+                    ssh_host=(getattr(args, "ssh_host", None) or ip_address),
+                    ssh_user=getattr(args, "ssh_user", "root"),
+                    ssh_identity_file=getattr(args, "ssh_identity_file", None),
+                    attach_bootstrap=getattr(args, "attach_bootstrap", True),
+                )
 
     except requests.HTTPError as e:
         print(f"❌ HTTP Error: {e}", file=sys.stderr)
