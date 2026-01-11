@@ -236,6 +236,15 @@ align_down_2048() {
     echo $(( (v / 2048) * 2048 ))
 }
 
+require_mib_aligned() {
+    local what="$1"
+    local sectors="$2"
+    if [ $((sectors % 2048)) -ne 0 ]; then
+        log_error "$what is not 1MiB-aligned (sectors=$sectors; mod2048=$((sectors % 2048)))"
+        exit 1
+    fi
+}
+
 # Determine how much space is safely usable at the end of the disk for swap.
 # Keep a small tail buffer so we don't press against GPT end-of-disk structures.
 END_BUFFER_SECTORS=2048
@@ -278,6 +287,8 @@ fi
 # Align per-device size down to 1MiB (2048 sectors) so all partitions are equal and aligned.
 PER_DEVICE_SECTORS=$((TOTAL_SWAP_USED_SECTORS / SWAP_DEVICES))
 PER_DEVICE_SECTORS=$(align_down_2048 "$PER_DEVICE_SECTORS")
+
+require_mib_aligned "Per-device swap size" "$PER_DEVICE_SECTORS"
 
 if [ "$PER_DEVICE_SECTORS" -lt 2048 ]; then
     # Too many devices for available space; reduce device count so each gets at least 1MiB.
@@ -327,6 +338,8 @@ log_step "Creating modified partition table..."
 DESIRED_SWAP_START=$((DISK_SIZE_SECTORS - END_BUFFER_SECTORS - TOTAL_SWAP_USED_SECTORS))
 DESIRED_SWAP_START=$(align_down_2048 "$DESIRED_SWAP_START")
 
+require_mib_aligned "Desired swap start" "$DESIRED_SWAP_START"
+
 if [ "$DESIRED_SWAP_START" -lt "$ROOT_MIN_END_ALIGNED" ]; then
     # Should not happen due to MAX_SWAP_SECTORS cap, but keep it safe.
     log_warn "Desired swap start would violate minimum root size; shrinking swap to fit minimum root"
@@ -342,6 +355,8 @@ fi
 
 NEW_ROOT_SIZE_SECTORS=$((DESIRED_SWAP_START - ROOT_START))
 NEW_ROOT_SIZE_SECTORS=$(align_down_2048 "$NEW_ROOT_SIZE_SECTORS")
+
+require_mib_aligned "New root size" "$NEW_ROOT_SIZE_SECTORS"
 
 NEW_ROOT_SIZE_GB=$((NEW_ROOT_SIZE_SECTORS / 2048 / 1024))
 log_info "New root size: ${NEW_ROOT_SIZE_GB}GB (${NEW_ROOT_SIZE_SECTORS} sectors)"
@@ -384,6 +399,8 @@ fi
     # Add swap partitions
     SWAP_START=$((ROOT_START + NEW_ROOT_SIZE_SECTORS))
     SWAP_START=$(( (SWAP_START + 2047) / 2048 * 2048 ))  # Align to 2048 sectors
+
+    require_mib_aligned "First swap partition start" "$SWAP_START"
     for i in $(seq 1 "$SWAP_DEVICES"); do
         SWAP_PART_NUM=$((ROOT_PART_NUM + i))
         if [[ "$ROOT_DISK" =~ nvme ]]; then
@@ -391,6 +408,9 @@ fi
         else
             PART_NAME="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
         fi
+
+        require_mib_aligned "Swap partition ${i} start" "$SWAP_START"
+        require_mib_aligned "Swap partition ${i} size" "$PER_DEVICE_SECTORS"
         echo "${PART_NAME} : start=${SWAP_START}, size=${PER_DEVICE_SECTORS}, type=${SWAP_TYPE_GUID}"
         SWAP_START=$((SWAP_START + PER_DEVICE_SECTORS))
         SWAP_START=$(( (SWAP_START + 2047) / 2048 * 2048 ))  # Align to 2048 sectors
