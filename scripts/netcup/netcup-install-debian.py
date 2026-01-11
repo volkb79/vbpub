@@ -450,87 +450,121 @@ class _SSHBootstrapFollower:
                 _log(f"[attach] Waiting {self.initial_delay:.0f}s before first SSH probe...", lf)
                 time.sleep(self.initial_delay)
 
-            # Wait for SSH to become reachable and usable (up to max_wait_seconds).
-            last_reason = None
-            start = time.monotonic()
+            def _wait_for_ssh(max_wait: float) -> bool:
+                """Wait for SSH to become reachable and usable.
+
+                Returns True if usable, False if timed out or stopped.
+                """
+                last_reason = None
+                start = time.monotonic()
+                while not self._stop.is_set():
+                    if (time.monotonic() - start) > max_wait:
+                        _log(f"[attach] Giving up after {max_wait:.0f}s without SSH becoming usable.", lf)
+                        return False
+                    if not _tcp_port_open(self.host, 22, timeout=2.0):
+                        time.sleep(self.poll_interval)
+                        continue
+
+                    cmd_probe = _build_ssh_cmd_base(self.host, self.user, self.identity_file) + ["true"]
+                    try:
+                        r = subprocess.run(cmd_probe, text=True, capture_output=True, timeout=10)
+                        if r.returncode == 0:
+                            return True
+
+                        reason = (r.stderr or "").strip().splitlines()[-1:]  # last line only
+                        reason_txt = reason[0] if reason else f"ssh exit={r.returncode}"
+                        if reason_txt != last_reason:
+                            last_reason = reason_txt
+                            _log(f"[attach] SSH not ready/auth failed: {reason_txt}", lf)
+                            if not self.identity_file:
+                                _log(
+                                    "[attach] Hint: pass --ssh-identity-file or set NETCUP_SSH_IDENTITY_FILE if this is a key auth issue.",
+                                    lf,
+                                )
+                    except Exception as e:
+                        reason_txt = f"{type(e).__name__}: {e}"
+                        if reason_txt != last_reason:
+                            last_reason = reason_txt
+                            _log(f"[attach] SSH probe error: {reason_txt}", lf)
+
+                    time.sleep(self.poll_interval)
+                return False
+
+            # First attach: wait up to max_wait_seconds. After reboots/disconnects,
+            # keep trying in shorter windows.
+            first_attach = True
             while not self._stop.is_set():
-                if (time.monotonic() - start) > self.max_wait_seconds:
-                    _log(f"[attach] Giving up after {self.max_wait_seconds:.0f}s without SSH becoming usable.", lf)
+                max_wait = self.max_wait_seconds if first_attach else max(60.0, self.max_wait_seconds)
+                if not _wait_for_ssh(max_wait=max_wait):
                     return
-                if not _tcp_port_open(self.host, 22, timeout=2.0):
+                first_attach = False
+                _log("[attach] SSH reachable; starting remote tail.", lf)
+
+                # Tail both stage1 and stage2 logs in one SSH session.
+                # - stage1: /root/custom_script.output (netcup customScript)
+                # - stage2: systemd journal for vbpub-bootstrap-stage2.service (survives cloud-init being disabled)
+                tail_remote = (
+                    "bash -lc 'set -euo pipefail; "
+                    "echo \"[attach] Streaming stage1+stage2 logs\"; "
+                    "tail_stage1(){ P=/root/custom_script.output; "
+                    "  if [ ! -f \"$P\" ]; then "
+                    "    echo \"[attach] Waiting for log to appear: $P\"; "
+                    "    for i in $(seq 1 300); do [ -f \"$P\" ] && break; sleep 1; done; "
+                    "  fi; "
+                    "  if [ -f \"$P\" ]; then echo \"[attach] Tailing: $P\"; tail -n 200 -F \"$P\"; "
+                    "  else echo \"[attach] No stage1 log at $P\"; fi; "
+                    "}; "
+                    "tail_stage2(){ "
+                    "  if ! command -v journalctl >/dev/null 2>&1; then echo \"[attach] journalctl not available\"; return 0; fi; "
+                    "  echo \"[attach] Tailing: journalctl -u vbpub-bootstrap-stage2.service\"; "
+                    "  # Wait until the unit exists / emits logs (best effort). "
+                    "  for i in $(seq 1 600); do journalctl -u vbpub-bootstrap-stage2.service -n 1 --no-pager >/dev/null 2>&1 && break; sleep 1; done; "
+                    "  journalctl -u vbpub-bootstrap-stage2.service -n 200 -f --no-pager || true; "
+                    "}; "
+                    "(tail_stage1 2>&1 | sed -u \"s/^/[stage1] /\") & "
+                    "(tail_stage2 2>&1 | sed -u \"s/^/[stage2] /\") & "
+                    "wait'"
+                )
+
+                cmd_tail = _build_ssh_cmd_base(self.host, self.user, self.identity_file) + [tail_remote]
+                try:
+                    self._proc = subprocess.Popen(
+                        cmd_tail,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                    )
+                except Exception as e:
+                    _log(f"[attach] Failed to start SSH tail: {e}", lf)
                     time.sleep(self.poll_interval)
                     continue
 
-                cmd_probe = _build_ssh_cmd_base(self.host, self.user, self.identity_file) + ["true"]
+                assert self._proc.stdout is not None
                 try:
-                    r = subprocess.run(cmd_probe, text=True, capture_output=True, timeout=10)
-                    if r.returncode == 0:
-                        _log("[attach] SSH reachable; starting remote tail.", lf)
-                        break
-
-                    reason = (r.stderr or "").strip().splitlines()[-1:]  # last line only
-                    reason_txt = reason[0] if reason else f"ssh exit={r.returncode}"
-                    if reason_txt != last_reason:
-                        last_reason = reason_txt
-                        _log(f"[attach] SSH not ready/auth failed: {reason_txt}", lf)
-                        if not self.identity_file:
-                            _log(
-                                "[attach] Hint: pass --ssh-identity-file or set NETCUP_SSH_IDENTITY_FILE if this is a key auth issue.",
-                                lf,
-                            )
+                    for line in self._proc.stdout:
+                        if self._stop.is_set():
+                            break
+                        out_line = f"[remote] {line}"
+                        sys.stdout.write(out_line)
+                        sys.stdout.flush()
+                        lf.write(out_line)
+                        lf.flush()
                 except Exception as e:
-                    reason_txt = f"{type(e).__name__}: {e}"
-                    if reason_txt != last_reason:
-                        last_reason = reason_txt
-                        _log(f"[attach] SSH probe error: {reason_txt}", lf)
+                    _log(f"[attach] Failed while capturing remote output: {e}", lf)
 
+                try:
+                    if self._proc and self._proc.poll() is None:
+                        self._proc.terminate()
+                except Exception:
+                    pass
+
+                if self._stop.is_set():
+                    return
+
+                # Most common reason: reboot / network hiccup. Loop and reattach.
+                _log("[attach] Remote tail ended (likely reboot/disconnect); reattaching...", lf)
                 time.sleep(self.poll_interval)
-
-            if self._stop.is_set():
-                return
-
-            tail_remote = (
-                "bash -lc 'set -euo pipefail; "
-                "P=/root/custom_script.output; "
-                "if [ ! -f \"$P\" ]; then "
-                "  echo \"[attach] Waiting for log to appear: $P\"; "
-                "  for i in $(seq 1 300); do [ -f \"$P\" ] && break; sleep 1; done; "
-                "fi; "
-                "echo \"[attach] Tailing: $P\"; "
-                "tail -n 200 -F \"$P\"'"
-            )
-
-            cmd_tail = _build_ssh_cmd_base(self.host, self.user, self.identity_file) + [tail_remote]
-            try:
-                self._proc = subprocess.Popen(
-                    cmd_tail,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                )
-            except Exception as e:
-                _log(f"[attach] Failed to start SSH tail: {e}", lf)
-                return
-
-            assert self._proc.stdout is not None
-            try:
-                for line in self._proc.stdout:
-                    if self._stop.is_set():
-                        break
-                    out_line = f"[remote] {line}"
-                    sys.stdout.write(out_line)
-                    sys.stdout.flush()
-                    lf.write(out_line)
-                    lf.flush()
-            except Exception as e:
-                _log(f"[attach] Failed while capturing remote output: {e}", lf)
-
-            try:
-                if self._proc and self._proc.poll() is None:
-                    self._proc.terminate()
-            except Exception:
-                pass
 
 
 def monitor_task(
