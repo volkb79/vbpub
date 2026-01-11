@@ -188,8 +188,7 @@ KEYCLOAK_URL = "https://www.servercontrolpanel.de/realms/scp/protocol/openid-con
 #    }
 #  }
 
-#SERVER_NAME = os.environ.get("SERVER_NAME", "v2202511209318402047")   # r1002.vxxu.de
-SERVER_NAME = os.environ.get("SERVER_NAME", "v2202511209318406253")    # v1001.vxxu.de
+SERVER_NAME = os.environ.get("SERVER_NAME")    # v1001.vxxu.de
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
