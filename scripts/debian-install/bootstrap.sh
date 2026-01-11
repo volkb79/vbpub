@@ -22,7 +22,10 @@ REPO_BRANCH="${REPO_BRANCH:-main}"
 CLONE_DIR="${CLONE_DIR:-/opt/vbpub}"
 SCRIPT_DIR="${CLONE_DIR}/scripts/debian-install"
 LOG_DIR="${LOG_DIR:-/var/log/debian-install}"
-LOG_FILE="${LOG_DIR}/bootstrap-$(date +%Y%m%d-%H%M%S).log"
+RUN_TS="${RUN_TS:-$(date +%Y%m%d-%H%M%S)}"
+# If LOG_FILE is pre-set by the caller, honor it. Otherwise we will select a
+# stage-specific log file in main() once BOOTSTRAP_STAGE is resolved.
+LOG_FILE="${LOG_FILE:-}"
 
 # Stage control
 # - stage1: minimal setup + schedule stage2, then reboot
@@ -30,6 +33,7 @@ LOG_FILE="${LOG_DIR}/bootstrap-$(date +%Y%m%d-%H%M%S).log"
 # - full: legacy one-shot behavior (runs everything now)
 BOOTSTRAP_STAGE="${BOOTSTRAP_STAGE:-auto}"  # auto, stage1, stage2, full
 AUTO_REBOOT_AFTER_STAGE1="${AUTO_REBOOT_AFTER_STAGE1:-auto}"  # auto, yes, no
+NEVER_REBOOT="${NEVER_REBOOT:-no}"  # yes/no (force: never reboot automatically)
 
 STATE_DIR="${STATE_DIR:-/var/lib/vbpub/bootstrap}"
 ENV_FILE="${ENV_FILE:-/etc/vbpub/bootstrap.env}"
@@ -90,6 +94,21 @@ log_debug() {
     fi
 }
 
+select_log_file_for_stage() {
+    # Only select automatically if caller did not provide LOG_FILE.
+    if [ -n "$LOG_FILE" ]; then
+        return 0
+    fi
+
+    local stage="$1"
+    case "$stage" in
+        stage1) LOG_FILE="${LOG_DIR}/stage1-${RUN_TS}.log" ;;
+        stage2) LOG_FILE="${LOG_DIR}/stage2-${RUN_TS}.log" ;;
+        full)   LOG_FILE="${LOG_DIR}/full-${RUN_TS}.log" ;;
+        *)      LOG_FILE="${LOG_DIR}/bootstrap-${RUN_TS}.log" ;;
+    esac
+}
+
 is_cloud_init_context() {
     # Best-effort detection. Netcup "customScript" is not always cloud-init, but on NoCloud it is.
     [ -d /run/cloud-init ] || [ -f /var/lib/cloud/instance/boot-finished ]
@@ -102,6 +121,9 @@ state_set() {
 }
 
 should_reboot_after_stage1() {
+    if [ "$NEVER_REBOOT" = "yes" ]; then
+        return 1
+    fi
     case "$AUTO_REBOOT_AFTER_STAGE1" in
         yes) return 0 ;;
         no) return 1 ;;
@@ -123,6 +145,11 @@ should_reboot_after_stage1() {
 
 stage1_reboot() {
     sync || true
+
+    if [ "$NEVER_REBOOT" = "yes" ]; then
+        log_warn "NEVER_REBOOT=yes; refusing to reboot automatically"
+        return 0
+    fi
 
     # IMPORTANT: When running under cloud-init/customScript, rebooting inline can
     # strand the provider task (e.g. Netcup CloudinitWait). Instead, schedule a
@@ -584,10 +611,9 @@ run_stage2() {
             state_set partitions_done
             log_root_layout
         elif [ "$rc" -eq 42 ]; then
-            log_warn "Offline ext* resize required; rebooting to continue stage2"
+            log_warn "Offline ext* resize required; reboot is required to continue stage2"
             state_set partitions_reboot_scheduled
-            sync
-            systemctl reboot || reboot
+            log_warn "NEVER_REBOOT=$NEVER_REBOOT; not rebooting automatically. Reboot manually when ready."
             return 0
         else
             log_error "✗ Swap partition creation failed (rc=$rc)"
@@ -702,10 +728,19 @@ print_bootstrap_summary() {
 
 main() {
     mkdir -p "$LOG_DIR"
+    # Ensure we always have a log file even before stage parsing.
+    if [ -z "$LOG_FILE" ]; then
+        LOG_FILE="${LOG_DIR}/bootstrap-${RUN_TS}.log"
+    fi
     log_info "Debian System Setup Bootstrap"
     log_info "Log: $LOG_FILE"
 
     parse_stage_from_args "$@"
+
+    # Switch to stage-specific log file for the bulk of the run.
+    select_log_file_for_stage "$BOOTSTRAP_STAGE"
+    log_info "Stage: $BOOTSTRAP_STAGE"
+    log_info "Stage log: $LOG_FILE"
 
     # Send system summary
     log_info "==> Collecting system summary"

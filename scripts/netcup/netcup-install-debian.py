@@ -213,7 +213,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 INSTALLATION_CONFIG = {
     "locale": "en_US.UTF-8",
     "timezone": "Europe/Berlin",
-    "customScript":  f"curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | DEBUG_MODE=yes BOOTSTRAP_STAGE=stage1 AUTO_REBOOT_AFTER_STAGE1=yes TELEGRAM_BOT_TOKEN={TELEGRAM_BOT_TOKEN} TELEGRAM_CHAT_ID={TELEGRAM_CHAT_ID} bash",
+    "customScript":  f"curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | DEBUG_MODE=yes BOOTSTRAP_STAGE=stage1 AUTO_REBOOT_AFTER_STAGE1=no NEVER_REBOOT=yes TELEGRAM_BOT_TOKEN={TELEGRAM_BOT_TOKEN} TELEGRAM_CHAT_ID={TELEGRAM_CHAT_ID} bash",
     "rootPartitionFullDiskSize": True,
     "sshPasswordAuthentication": False,
     "emailToExecutingUser": True,
@@ -292,6 +292,12 @@ These can be set in a .env file in the current directory.
         "--monitor",
         action="store_true",
         help="After starting an installation, poll /api/v1/tasks/{uuid} until finished."
+    )
+
+    parser.add_argument(
+        "--poweroff",
+        action="store_true",
+        help="Power off the server via API (state=OFF, stateOption=POWEROFF) and exit."
     )
     parser.add_argument(
         "--poll-interval",
@@ -479,6 +485,8 @@ class _SSHBootstrapFollower:
         self._proc: Optional[subprocess.Popen[str]] = None
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         self.local_log_path = Path.cwd() / f"ssh-tail-{task_uuid}-{ts}.log"
+        self.local_stage1_log_path = Path.cwd() / f"ssh-tail-stage1-{task_uuid}-{ts}.log"
+        self.local_stage2_log_path = Path.cwd() / f"ssh-tail-stage2-{task_uuid}-{ts}.log"
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -516,11 +524,17 @@ class _SSHBootstrapFollower:
                 except Exception:
                     pass
 
-        with open(self.local_log_path, "a", encoding="utf-8") as lf:
+        with (
+            open(self.local_log_path, "a", encoding="utf-8") as lf,
+            open(self.local_stage1_log_path, "a", encoding="utf-8") as lf_stage1,
+            open(self.local_stage2_log_path, "a", encoding="utf-8") as lf_stage2,
+        ):
             _log("=" * 70, lf)
             _log(banner, lf)
             _log("=" * 70, lf)
             _log(f"[attach] Local capture: {self.local_log_path}", lf)
+            _log(f"[attach] Stage1 capture: {self.local_stage1_log_path}", lf)
+            _log(f"[attach] Stage2 capture: {self.local_stage2_log_path}", lf)
             _log(f"[attach] Identity: {identity_hint}", lf)
 
             if self.initial_delay > 0:
@@ -627,6 +641,15 @@ class _SSHBootstrapFollower:
                         sys.stdout.flush()
                         lf.write(out_line)
                         lf.flush()
+
+                        # Also split into stage-specific files based on the prefixes added
+                        # by the remote tail command (sed in tail_remote).
+                        if "[stage1]" in out_line:
+                            lf_stage1.write(out_line)
+                            lf_stage1.flush()
+                        elif "[stage2]" in out_line:
+                            lf_stage2.write(out_line)
+                            lf_stage2.flush()
                 except Exception as e:
                     _log(f"[attach] Failed while capturing remote output: {e}", lf)
 
@@ -866,6 +889,33 @@ class NetcupSCPClient:
         log_debug(f"Response: {json.dumps(_redact_for_log(result), indent=2)}")
         return result
 
+    def patch(self, endpoint: str, data: Dict, params: Optional[Dict] = None) -> Any:
+        """Make PATCH request to API."""
+        url = f"{self.base_url}{endpoint}"
+        log_debug(f"PATCH {url} {params or ''}")
+        log_debug(f"Payload: {json.dumps(_redact_for_log(data), indent=2)}")
+        response = self.session.patch(
+            url,
+            params=params,
+            json=data,
+            headers={"Content-Type": "application/merge-patch+json"},
+            timeout=30,
+        )
+        if response.status_code == 401 and self.refresh_token:
+            log_debug("401 Unauthorized; refreshing token and retrying once")
+            self.refresh_access_token()
+            response = self.session.patch(
+                url,
+                params=params,
+                json=data,
+                headers={"Content-Type": "application/merge-patch+json"},
+                timeout=30,
+            )
+        response.raise_for_status()
+        result = response.json() if response.content else {}
+        log_debug(f"Response: {json.dumps(_redact_for_log(result), indent=2)}")
+        return result
+
     def get_user_info(self) -> Dict:
         """Get user information from OIDC userinfo endpoint"""
         log_debug(f"GET {KEYCLOAK_URL}/userinfo")
@@ -1089,6 +1139,18 @@ def main():
         server_id = servers[0]["id"]
         print(f"   ✓ Server ID: {server_id}")
         print()
+
+        if getattr(args, "poweroff", False):
+            print("=" * 70)
+            print("POWER OFF SERVER")
+            print("=" * 70)
+            result = client.patch(
+                f"/api/v1/servers/{server_id}",
+                {"state": "OFF"},
+                params={"stateOption": "POWEROFF"},
+            )
+            print(json.dumps(result, indent=2))
+            return
 
         # 2. Get server details (for disk info and hostname)
         print("2. Getting server details...")

@@ -402,7 +402,12 @@ def calculate_memory_distribution(test_size_mb):
     SAFETY_BUFFER_MB = 1024 if ram_gb <= 8 else 500
     
     aggressive = os.environ.get('BENCHMARK_AGGRESSIVE', '').lower() == 'yes'
-    if aggressive and ram_gb >= 16:
+    if (ram_gb <= 8) and (not aggressive):
+        # On smaller systems, mem_locker + mem_pressure can OOM-kill the entire unit.
+        # Default to *no* mem_locker unless explicitly requested.
+        lock_percent = 0.0
+        lock_size_mb = 0
+    elif aggressive and ram_gb >= 16:
         # Aggressive mode on larger boxes only
         lock_percent = 0.85
         lock_size_mb = max(0, int(available_mb * lock_percent) - test_size_mb)
@@ -907,24 +912,42 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         # Create memory pressure to force actual swapping to ZRAM
         # The key is to allocate MORE than available RAM to force the kernel to swap
         
-        # Get available memory
+        # Get available/total memory and pick an allocation size that induces swapping
+        # without OOM-killing the system (especially under systemd service limits).
         try:
             with open('/proc/meminfo', 'r') as f:
                 meminfo = f.read()
             mem_available_kb = 0
+            mem_total_kb = 0
             for line in meminfo.split('\n'):
                 if line.startswith('MemAvailable:'):
                     mem_available_kb = int(line.split()[1])
-                    break
-            
-            # Allocate significantly more than available memory to force swapping
-            # This ensures the kernel MUST use ZRAM swap
-            alloc_size_mb = max(size_mb, (mem_available_kb // 1024) + size_mb)
-            log_info(f"Creating memory pressure (allocating {alloc_size_mb}MB to force swapping)...")
-            log_debug_ts(f"Available memory: {mem_available_kb // 1024}MB, allocating: {alloc_size_mb}MB")
-        except:
-            # Fallback to original approach if we can't read meminfo
-            alloc_size_mb = size_mb * COMPRESSION_MEMORY_PERCENT // 100
+                elif line.startswith('MemTotal:'):
+                    mem_total_kb = int(line.split()[1])
+
+            mem_available_mb = mem_available_kb // 1024 if mem_available_kb else 0
+            mem_total_mb = mem_total_kb // 1024 if mem_total_kb else 0
+
+            system_info = get_system_info()
+            ram_gb = system_info.get('ram_gb', 8)
+            safety_buffer_mb = 1024 if ram_gb <= 8 else 500
+
+            # Add a small extra over MemAvailable to encourage swap activity, but cap
+            # hard to keep headroom.
+            extra_alloc_cap = 128 if ram_gb <= 8 else 1024
+            extra_mb = min(size_mb, extra_alloc_cap)
+
+            target_mb = mem_available_mb + extra_mb if mem_available_mb else size_mb
+            hard_cap_mb = (mem_total_mb - safety_buffer_mb) if mem_total_mb else target_mb
+            alloc_size_mb = max(size_mb, min(target_mb, hard_cap_mb))
+
+            log_info(f"Creating memory pressure (allocating {alloc_size_mb}MB to encourage swapping)...")
+            log_debug_ts(
+                f"MemTotal={mem_total_mb}MB MemAvailable={mem_available_mb}MB safety={safety_buffer_mb}MB extra={extra_mb}MB alloc={alloc_size_mb}MB"
+            )
+        except Exception:
+            # Conservative fallback
+            alloc_size_mb = max(size_mb, size_mb * COMPRESSION_MEMORY_PERCENT // 100)
             log_info(f"Creating memory pressure (allocating {alloc_size_mb}MB)...")
         
         # Use C-based mem_pressure for fast memory allocation
