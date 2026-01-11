@@ -26,6 +26,7 @@ RUN_TS="${RUN_TS:-$(date +%Y%m%d-%H%M%S)}"
 # If LOG_FILE is pre-set by the caller, honor it. Otherwise we will select a
 # stage-specific log file in main() once BOOTSTRAP_STAGE is resolved.
 LOG_FILE="${LOG_FILE:-}"
+CALLER_LOG_FILE="${LOG_FILE}"
 
 # Stage control
 # - stage1: minimal setup + schedule stage2, then reboot
@@ -95,8 +96,8 @@ log_debug() {
 }
 
 select_log_file_for_stage() {
-    # Only select automatically if caller did not provide LOG_FILE.
-    if [ -n "$LOG_FILE" ]; then
+    # Only keep LOG_FILE fixed if the caller explicitly provided it.
+    if [ -n "${CALLER_LOG_FILE:-}" ]; then
         return 0
     fi
 
@@ -433,6 +434,9 @@ ConditionPathExists=!${STATE_DIR}/stage2_done
 Type=oneshot
 EnvironmentFile=-${ENV_FILE}
 ExecStart=/usr/local/sbin/vbpub-bootstrap-stage2
+TimeoutStartSec=infinity
+StandardOutput=journal+console
+StandardError=journal+console
 
 [Install]
 WantedBy=multi-user.target

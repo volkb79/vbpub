@@ -260,6 +260,165 @@ require_mib_aligned() {
     fi
 }
 
+schedule_offline_ext_shrink() {
+    local mode
+    mode=${MODE:-swap}
+    # Prepare one-shot initramfs task that will:
+    #   e2fsck -f -y -> resize2fs to NEW_BLOCKS -> e2fsck -f -y -> sfdisk apply ptable
+    local script_dir
+    script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+    export DEBIAN_FRONTEND=noninteractive
+    # Ensure prerequisites for initramfs-based ext shrink exist.
+    if ! command -v update-initramfs >/dev/null 2>&1 || ! command -v dumpe2fs >/dev/null 2>&1; then
+        log_info "Installing prerequisites for offline ext* shrink (initramfs-tools, e2fsprogs, util-linux)..."
+        apt-get update -qq || true
+        apt-get install -y -qq initramfs-tools e2fsprogs util-linux || true
+    fi
+
+    if ! command -v update-initramfs >/dev/null 2>&1; then
+        log_error "update-initramfs not found; cannot schedule offline shrink automatically"
+        return 1
+    fi
+    if ! command -v dumpe2fs >/dev/null 2>&1; then
+        log_error "dumpe2fs not found; cannot compute ext block size"
+        return 1
+    fi
+
+    # Compute target filesystem block count for the new partition boundary.
+    local block_size
+    block_size=$(dumpe2fs -h "$ROOT_PARTITION" 2>/dev/null | awk -F: '/Block size/ {gsub(/ /,"",$2); print $2; exit}')
+    if [[ -z "${block_size:-}" || ! "$block_size" =~ ^[0-9]+$ || "$block_size" -le 0 ]]; then
+        log_error "Failed to determine ext block size via dumpe2fs"
+        return 1
+    fi
+    local new_bytes
+    new_bytes=$((NEW_ROOT_SIZE_SECTORS * 512))
+    local new_blocks
+    new_blocks=$((new_bytes / block_size))
+    if [ "$new_blocks" -le 0 ]; then
+        log_error "Computed NEW_BLOCKS is invalid: $new_blocks"
+        return 1
+    fi
+
+    mkdir -p /etc/vbpub
+    cp "$PTABLE_NEW" /etc/vbpub/offline-ptable.sfdisk
+
+    local swap_first_num
+    local swap_last_num
+    if [ "$mode" = "swap" ]; then
+        swap_first_num=$((ROOT_PART_NUM + 1))
+        swap_last_num=$((ROOT_PART_NUM + SWAP_DEVICES))
+    else
+        swap_first_num=0
+        swap_last_num=0
+    fi
+
+    cat > /etc/vbpub/offline-repartition.conf <<EOF
+MODE=${mode}
+ROOT_DISK=${ROOT_DISK}
+ROOT_PARTITION=${ROOT_PARTITION}
+NEW_BLOCKS=${new_blocks}
+PTABLE_PATH=/etc/vbpub/offline-ptable.sfdisk
+SWAP_FIRST_NUM=${swap_first_num}
+SWAP_LAST_NUM=${swap_last_num}
+SWAP_PRIORITY=${SWAP_PRIORITY}
+EOF
+
+    mkdir -p /etc/initramfs-tools/scripts/local-premount /etc/initramfs-tools/hooks
+    cp "$script_dir/initramfs/vbpub-offline-repartition-premount.sh" /etc/initramfs-tools/scripts/local-premount/vbpub-offline-repartition
+    cp "$script_dir/initramfs/vbpub-offline-repartition-hook.sh" /etc/initramfs-tools/hooks/vbpub-offline-repartition
+    chmod +x /etc/initramfs-tools/scripts/local-premount/vbpub-offline-repartition /etc/initramfs-tools/hooks/vbpub-offline-repartition
+
+    if [ "$mode" = "swap" ]; then
+        # Install a one-shot finalizer that formats/enables swap partitions and updates /etc/fstab
+        # on the next successful boot. This is important because cloud-init is often disabled after
+        # first boot, and the initramfs stage may not be able to mount the root FS read-write.
+        mkdir -p /usr/local/sbin /etc/systemd/system
+        cat > /usr/local/sbin/vbpub-finalize-swap <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+CONF=/etc/vbpub/offline-repartition.conf
+PT=/etc/vbpub/offline-ptable.sfdisk
+
+if [ ! -f "$CONF" ] || [ ! -f "$PT" ]; then
+    exit 0
+fi
+
+# shellcheck disable=SC1090
+source "$CONF"
+
+SWAP_PRIORITY=${SWAP_PRIORITY:-10}
+SWAP_FIRST_NUM=${SWAP_FIRST_NUM:-0}
+SWAP_LAST_NUM=${SWAP_LAST_NUM:-0}
+
+if [ -z "${ROOT_DISK:-}" ] || [ -z "${SWAP_FIRST_NUM:-}" ] || [ -z "${SWAP_LAST_NUM:-}" ]; then
+    echo "vbpub-finalize-swap: missing required config values" >&2
+    exit 0
+fi
+
+part_path() {
+    local disk="$1" num="$2"
+    if [[ "$disk" =~ nvme ]]; then
+        echo "/dev/${disk}p${num}"
+    else
+        echo "/dev/${disk}${num}"
+    fi
+}
+
+for n in $(seq "$SWAP_FIRST_NUM" "$SWAP_LAST_NUM"); do
+    p=$(part_path "$ROOT_DISK" "$n")
+    [ -b "$p" ] || continue
+    t=$(blkid -s TYPE -o value "$p" 2>/dev/null || true)
+    if [ "$t" != "swap" ]; then
+        mkswap "$p" >/dev/null 2>&1 || true
+    fi
+    swapon -p "$SWAP_PRIORITY" "$p" >/dev/null 2>&1 || true
+
+    pu=$(blkid -s PARTUUID -o value "$p" 2>/dev/null || true)
+    if [ -n "$pu" ]; then
+        grep -q "^PARTUUID=${pu}\\b" /etc/fstab 2>/dev/null || echo "PARTUUID=${pu} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+    else
+        grep -q "^${p}\\b" /etc/fstab 2>/dev/null || echo "${p} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+    fi
+done
+
+rm -f "$CONF" "$PT" || true
+exit 0
+EOF
+        chmod +x /usr/local/sbin/vbpub-finalize-swap
+
+        cat > /etc/systemd/system/vbpub-finalize-swap.service <<'EOF'
+[Unit]
+Description=vbpub: finalize swap after offline repartition
+After=local-fs.target
+ConditionPathExists=/etc/vbpub/offline-repartition.conf
+ConditionPathExists=/etc/vbpub/offline-ptable.sfdisk
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vbpub-finalize-swap
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable vbpub-finalize-swap.service 2>/dev/null || true
+    fi
+
+    log_info "Updating initramfs to include resize2fs + offline repartition job..."
+    if ! update-initramfs -u; then
+        log_error "update-initramfs failed; offline shrink was NOT scheduled"
+        return 1
+    fi
+
+    log_warn "Offline shrink+repartition scheduled. Reboot is required."
+    log_warn "If anything goes wrong, initramfs log: /run/vbpub-offline-repartition.log"
+    touch /forcefsck 2>/dev/null || true
+    return 0
+}
+
 # Determine how much space is safely usable at the end of the disk for swap.
 # Keep a small tail buffer so we don't press against GPT end-of-disk structures.
 END_BUFFER_SECTORS=2048
@@ -524,165 +683,6 @@ fi
 } > "$PTABLE_NEW"
 
 log_success "Modified partition table created: $PTABLE_NEW"
-
-schedule_offline_ext_shrink() {
-    local mode
-    mode=${MODE:-swap}
-    # Prepare one-shot initramfs task that will:
-    #   e2fsck -f -y -> resize2fs to NEW_BLOCKS -> e2fsck -f -y -> sfdisk apply ptable
-    local script_dir
-    script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-
-    export DEBIAN_FRONTEND=noninteractive
-    # Ensure prerequisites for initramfs-based ext shrink exist.
-    if ! command -v update-initramfs >/dev/null 2>&1 || ! command -v dumpe2fs >/dev/null 2>&1; then
-        log_info "Installing prerequisites for offline ext* shrink (initramfs-tools, e2fsprogs, util-linux)..."
-        apt-get update -qq || true
-        apt-get install -y -qq initramfs-tools e2fsprogs util-linux || true
-    fi
-
-    if ! command -v update-initramfs >/dev/null 2>&1; then
-        log_error "update-initramfs not found; cannot schedule offline shrink automatically"
-        return 1
-    fi
-    if ! command -v dumpe2fs >/dev/null 2>&1; then
-        log_error "dumpe2fs not found; cannot compute ext block size"
-        return 1
-    fi
-
-    # Compute target filesystem block count for the new partition boundary.
-    local block_size
-    block_size=$(dumpe2fs -h "$ROOT_PARTITION" 2>/dev/null | awk -F: '/Block size/ {gsub(/ /,"",$2); print $2; exit}')
-    if [[ -z "${block_size:-}" || ! "$block_size" =~ ^[0-9]+$ || "$block_size" -le 0 ]]; then
-        log_error "Failed to determine ext block size via dumpe2fs"
-        return 1
-    fi
-    local new_bytes
-    new_bytes=$((NEW_ROOT_SIZE_SECTORS * 512))
-    local new_blocks
-    new_blocks=$((new_bytes / block_size))
-    if [ "$new_blocks" -le 0 ]; then
-        log_error "Computed NEW_BLOCKS is invalid: $new_blocks"
-        return 1
-    fi
-
-    mkdir -p /etc/vbpub
-    cp "$PTABLE_NEW" /etc/vbpub/offline-ptable.sfdisk
-
-    local swap_first_num
-    local swap_last_num
-    if [ "$mode" = "swap" ]; then
-        swap_first_num=$((ROOT_PART_NUM + 1))
-        swap_last_num=$((ROOT_PART_NUM + SWAP_DEVICES))
-    else
-        swap_first_num=0
-        swap_last_num=0
-    fi
-
-    cat > /etc/vbpub/offline-repartition.conf <<EOF
-MODE=${mode}
-ROOT_DISK=${ROOT_DISK}
-ROOT_PARTITION=${ROOT_PARTITION}
-NEW_BLOCKS=${new_blocks}
-PTABLE_PATH=/etc/vbpub/offline-ptable.sfdisk
-SWAP_FIRST_NUM=${swap_first_num}
-SWAP_LAST_NUM=${swap_last_num}
-SWAP_PRIORITY=${SWAP_PRIORITY}
-EOF
-
-    mkdir -p /etc/initramfs-tools/scripts/local-premount /etc/initramfs-tools/hooks
-    cp "$script_dir/initramfs/vbpub-offline-repartition-premount.sh" /etc/initramfs-tools/scripts/local-premount/vbpub-offline-repartition
-    cp "$script_dir/initramfs/vbpub-offline-repartition-hook.sh" /etc/initramfs-tools/hooks/vbpub-offline-repartition
-    chmod +x /etc/initramfs-tools/scripts/local-premount/vbpub-offline-repartition /etc/initramfs-tools/hooks/vbpub-offline-repartition
-
-    if [ "$mode" = "swap" ]; then
-        # Install a one-shot finalizer that formats/enables swap partitions and updates /etc/fstab
-        # on the next successful boot. This is important because cloud-init is often disabled after
-        # first boot, and the initramfs stage may not be able to mount the root FS read-write.
-        mkdir -p /usr/local/sbin /etc/systemd/system
-        cat > /usr/local/sbin/vbpub-finalize-swap <<'EOF'
-#!/bin/bash
-set -euo pipefail
-
-CONF=/etc/vbpub/offline-repartition.conf
-PT=/etc/vbpub/offline-ptable.sfdisk
-
-if [ ! -f "$CONF" ] || [ ! -f "$PT" ]; then
-    exit 0
-fi
-
-# shellcheck disable=SC1090
-source "$CONF"
-
-SWAP_PRIORITY=${SWAP_PRIORITY:-10}
-SWAP_FIRST_NUM=${SWAP_FIRST_NUM:-0}
-SWAP_LAST_NUM=${SWAP_LAST_NUM:-0}
-
-if [ -z "${ROOT_DISK:-}" ] || [ -z "${SWAP_FIRST_NUM:-}" ] || [ -z "${SWAP_LAST_NUM:-}" ]; then
-    echo "vbpub-finalize-swap: missing required config values" >&2
-    exit 0
-fi
-
-part_path() {
-    local disk="$1" num="$2"
-    if [[ "$disk" =~ nvme ]]; then
-        echo "/dev/${disk}p${num}"
-    else
-        echo "/dev/${disk}${num}"
-    fi
-}
-
-for n in $(seq "$SWAP_FIRST_NUM" "$SWAP_LAST_NUM"); do
-    p=$(part_path "$ROOT_DISK" "$n")
-    [ -b "$p" ] || continue
-    t=$(blkid -s TYPE -o value "$p" 2>/dev/null || true)
-    if [ "$t" != "swap" ]; then
-        mkswap "$p" >/dev/null 2>&1 || true
-    fi
-    swapon -p "$SWAP_PRIORITY" "$p" >/dev/null 2>&1 || true
-
-    pu=$(blkid -s PARTUUID -o value "$p" 2>/dev/null || true)
-    if [ -n "$pu" ]; then
-        grep -q "^PARTUUID=${pu}\\b" /etc/fstab 2>/dev/null || echo "PARTUUID=${pu} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
-    else
-        grep -q "^${p}\\b" /etc/fstab 2>/dev/null || echo "${p} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
-    fi
-done
-
-rm -f "$CONF" "$PT" || true
-exit 0
-EOF
-        chmod +x /usr/local/sbin/vbpub-finalize-swap
-
-        cat > /etc/systemd/system/vbpub-finalize-swap.service <<'EOF'
-[Unit]
-Description=vbpub: finalize swap after offline repartition
-After=local-fs.target
-ConditionPathExists=/etc/vbpub/offline-repartition.conf
-ConditionPathExists=/etc/vbpub/offline-ptable.sfdisk
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/vbpub-finalize-swap
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload 2>/dev/null || true
-        systemctl enable vbpub-finalize-swap.service 2>/dev/null || true
-    fi
-
-    log_info "Updating initramfs to include resize2fs + offline repartition job..."
-    if ! update-initramfs -u; then
-        log_error "update-initramfs failed; offline shrink was NOT scheduled"
-        return 1
-    fi
-
-    log_warn "Offline shrink+repartition scheduled. Reboot is required."
-    log_warn "If anything goes wrong, initramfs log: /run/vbpub-offline-repartition.log"
-    touch /forcefsck 2>/dev/null || true
-    return 0
-}
 
 # Show changes
 log_info "Partition table changes:"
