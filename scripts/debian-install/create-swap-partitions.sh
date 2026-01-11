@@ -561,6 +561,21 @@ esac
 # Format and enable swap partitions
 log_step "Formatting and enabling swap partitions..."
 
+# Ensure we are not using any swap while repartitioning / reformatting.
+swapoff -a 2>/dev/null || true
+
+# Rewrite /etc/fstab swap entries so repeated runs don't accumulate stale PARTUUIDs.
+if [ -f /etc/fstab ]; then
+    FSTAB_BACKUP="/etc/fstab.backup.$(date +%Y%m%d_%H%M%S)"
+    cp /etc/fstab "$FSTAB_BACKUP"
+    awk '
+        /^[[:space:]]*#/ {print; next}
+        NF>=3 && $3=="swap" {next}
+        {print}
+    ' /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
+    log_info "Cleaned swap entries from /etc/fstab (backup: $FSTAB_BACKUP)"
+fi
+
 for i in $(seq 1 "$SWAP_DEVICES"); do
     SWAP_PART_NUM=$((ROOT_PART_NUM + i))
     
