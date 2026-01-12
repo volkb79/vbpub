@@ -1987,16 +1987,53 @@ def discover_gpt_swap_partitions(limit=None):
 
 
 def _fio_sum_bw_and_lat(data):
-    """Sum bw and compute avg mean lat (us) across fio jobs."""
+    """Sum bandwidth and compute latency (mean + p99, in µs) across fio jobs."""
     jobs = data.get('jobs') or []
     if not isinstance(jobs, list) or not jobs:
-        return 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     total_read_bw_kib = 0.0
     total_write_bw_kib = 0.0
-    read_lat_us_sum = 0.0
-    write_lat_us_sum = 0.0
+    read_lat_mean_us_sum = 0.0
+    write_lat_mean_us_sum = 0.0
+    read_lat_p99_us_sum = 0.0
+    write_lat_p99_us_sum = 0.0
     lat_count = 0
+
+    def _get_percentile_us(io_stats, percentile=99.0):
+        if not isinstance(io_stats, dict):
+            return None
+
+        # fio percentiles are typically under clat_ns.percentile.
+        for lat_key in ('clat_ns', 'lat_ns'):
+            lat = io_stats.get(lat_key) or {}
+            pct = lat.get('percentile')
+            if not isinstance(pct, dict) or not pct:
+                continue
+
+            # Keys are strings like "99.000000".
+            target = f"{float(percentile):.6f}"
+            v = pct.get(target)
+            if isinstance(v, (int, float)):
+                return float(v) / 1000.0
+
+            # Fallback: pick the closest key.
+            try:
+                parsed = []
+                for k, vv in pct.items():
+                    try:
+                        kk = float(k)
+                    except Exception:
+                        continue
+                    if isinstance(vv, (int, float)):
+                        parsed.append((kk, float(vv)))
+                if not parsed:
+                    continue
+                parsed.sort(key=lambda t: abs(t[0] - float(percentile)))
+                return parsed[0][1] / 1000.0
+            except Exception:
+                continue
+        return None
 
     for job in jobs:
         read = job.get('read') or {}
@@ -2007,16 +2044,26 @@ def _fio_sum_bw_and_lat(data):
         rlat = (read.get('lat_ns') or {}).get('mean')
         wlat = (write.get('lat_ns') or {}).get('mean')
         if isinstance(rlat, (int, float)):
-            read_lat_us_sum += float(rlat) / 1000.0
+            read_lat_mean_us_sum += float(rlat) / 1000.0
         if isinstance(wlat, (int, float)):
-            write_lat_us_sum += float(wlat) / 1000.0
+            write_lat_mean_us_sum += float(wlat) / 1000.0
+
+        rp99 = _get_percentile_us(read, 99.0)
+        wp99 = _get_percentile_us(write, 99.0)
+        if isinstance(rp99, (int, float)):
+            read_lat_p99_us_sum += float(rp99)
+        if isinstance(wp99, (int, float)):
+            write_lat_p99_us_sum += float(wp99)
+
         lat_count += 1
 
     read_mb_s = total_read_bw_kib / 1024.0
     write_mb_s = total_write_bw_kib / 1024.0
-    read_lat_us = (read_lat_us_sum / lat_count) if lat_count else 0.0
-    write_lat_us = (write_lat_us_sum / lat_count) if lat_count else 0.0
-    return read_mb_s, write_mb_s, read_lat_us, write_lat_us
+    read_lat_mean_us = (read_lat_mean_us_sum / lat_count) if lat_count else 0.0
+    write_lat_mean_us = (write_lat_mean_us_sum / lat_count) if lat_count else 0.0
+    read_lat_p99_us = (read_lat_p99_us_sum / lat_count) if lat_count else 0.0
+    write_lat_p99_us = (write_lat_p99_us_sum / lat_count) if lat_count else 0.0
+    return read_mb_s, write_mb_s, read_lat_mean_us, write_lat_mean_us, read_lat_p99_us, write_lat_p99_us
 
 
 def test_swap_partitions_stripe_matrix(
@@ -2024,7 +2071,12 @@ def test_swap_partitions_stripe_matrix(
     block_sizes=None,
     device_counts=None,
     numjobs_per_device_levels=None,
+    iodepth_levels=None,
+    rwmixread=80,
     per_device_size_mb=256,
+    use_full_device_size=True,
+    full_device_size_margin_mb=16,
+    latency_metric='p99',
     max_partitions=None,
 ):
     """Benchmark real swap partitions as block devices.
@@ -2060,7 +2112,11 @@ def test_swap_partitions_stripe_matrix(
     if device_counts is None:
         device_counts = [1, 2, 4, 8, 16]
     if numjobs_per_device_levels is None:
-        numjobs_per_device_levels = [1, 2, 4]
+        # Latency-oriented default: keep per-device parallelism modest.
+        numjobs_per_device_levels = [1, 2]
+    if iodepth_levels is None:
+        # Latency-oriented default: shallow queues, closer to page-fault critical path.
+        iodepth_levels = [1, 2]
 
     max_devices_available = len(parts)
     device_counts = [d for d in device_counts if isinstance(d, int) and 1 <= d <= max_devices_available]
@@ -2071,134 +2127,211 @@ def test_swap_partitions_stripe_matrix(
     if not numjobs_per_device_levels:
         numjobs_per_device_levels = [1]
 
-    total_combinations = len(block_sizes) * len(device_counts) * len(numjobs_per_device_levels)
+    iodepth_levels = [d for d in iodepth_levels if isinstance(d, int) and d >= 1]
+    if not iodepth_levels:
+        iodepth_levels = [1]
+
+    if not isinstance(rwmixread, int):
+        try:
+            rwmixread = int(rwmixread)
+        except Exception:
+            rwmixread = 80
+    if rwmixread < 0:
+        rwmixread = 0
+    if rwmixread > 100:
+        rwmixread = 100
+
+    latency_metric = str(latency_metric or '').strip().lower()
+    if latency_metric not in ('mean', 'p99'):
+        latency_metric = 'p99'
+
+    total_combinations = len(block_sizes) * len(device_counts) * len(numjobs_per_device_levels) * len(iodepth_levels)
     log_step_ts(f"Swap Partition Stripe Matrix ({total_combinations} combinations)")
     log_info(f"Detected swap partitions: {max_devices_available}")
     log_info(f"Device counts: {device_counts}")
     log_info(f"Numjobs per device: {numjobs_per_device_levels}")
+    log_info(f"IO depths: {iodepth_levels}")
     log_info(f"Block sizes: {block_sizes} KB")
     log_info(f"Runtime per test: {runtime_sec}s")
+    log_info(f"Read mix: {rwmixread}%")
+    if use_full_device_size:
+        log_info(f"Size: full device (minus {int(full_device_size_margin_mb)}MB margin)")
+    else:
+        log_info(f"Size: {int(per_device_size_mb)}MB per device")
 
     results = {
         'timestamp': datetime.now().isoformat(),
         'swap_partitions': parts,
         'runtime_sec': int(runtime_sec),
-        'per_device_size_mb': int(per_device_size_mb),
+        'per_device_size_mb': int(per_device_size_mb) if not use_full_device_size else None,
+        'use_full_device_size': bool(use_full_device_size),
+        'full_device_size_margin_mb': int(full_device_size_margin_mb),
         'fio_workload': {
             'rw': 'randrw',
-            'rwmixread': 50,
+            'rwmixread': int(rwmixread),
             'direct': 1,
             'ioengine': 'libaio',
-            'iodepth': 32,
+            'iodepth_levels': iodepth_levels,
             'time_based': True,
+            'latency_metric': latency_metric,
         },
         'block_sizes': block_sizes,
         'device_counts': device_counts,
         'numjobs_per_device_levels': numjobs_per_device_levels,
+        'iodepth_levels': iodepth_levels,
         'matrix': [],
     }
 
     test_num = 0
+    def _device_size_mb(dev_path):
+        try:
+            p = _run_cmd(['blockdev', '--getsize64', dev_path], timeout=5)
+            if p.returncode != 0:
+                return None
+            b = int((p.stdout or '').strip())
+            if b <= 0:
+                return None
+            return b // (1024 * 1024)
+        except Exception:
+            return None
+
     for bs in block_sizes:
         for dev_count in device_counts:
+            selected = parts[:dev_count]
+            # If benchmarking the "full device", use the smallest selected device size.
+            # Keep a small margin to avoid edge-case end-of-partition alignment quirks.
+            full_mb = None
+            if use_full_device_size:
+                sizes = [s for s in (_device_size_mb(d) for d in selected) if isinstance(s, int) and s > 0]
+                if sizes:
+                    full_mb = max(1, min(sizes) - int(full_device_size_margin_mb))
+
             for numjobs in numjobs_per_device_levels:
-                test_num += 1
-                progress_str = f"[{test_num}/{total_combinations}]"
-                log_info_ts(f"{progress_str} Testing {dev_count} devices × {numjobs} jobs/dev @ {bs}KB...")
+                for iodepth in iodepth_levels:
+                    test_num += 1
+                    progress_str = f"[{test_num}/{total_combinations}]"
+                    log_info_ts(f"{progress_str} Testing {dev_count} devices × {numjobs} jobs/dev @ {bs}KB (iodepth={iodepth})...")
 
-                selected = parts[:dev_count]
+                    size_mb_to_use = full_mb if (use_full_device_size and full_mb) else int(per_device_size_mb)
 
-                fio_job_lines = [
-                    "[global]",
-                    "ioengine=libaio",
-                    "direct=1",
-                    "time_based",
-                    f"runtime={runtime_sec}",
-                    "group_reporting",
-                    "randrepeat=0",
-                    "norandommap",
-                    "iodepth=32",
-                    f"numjobs={numjobs}",
-                    f"bs={bs}k",
-                    "rw=randrw",
-                    "rwmixread=50",
-                    f"size={per_device_size_mb}m",
-                    "",
-                ]
-
-                for idx, dev in enumerate(selected, start=1):
-                    fio_job_lines.extend([
-                        f"[dev{idx}]",
-                        f"filename={dev}",
+                    fio_job_lines = [
+                        "[global]",
+                        "ioengine=libaio",
+                        "direct=1",
+                        "time_based",
+                        f"runtime={runtime_sec}",
+                        "group_reporting",
+                        "randrepeat=0",
+                        "norandommap",
+                        f"iodepth={iodepth}",
+                        f"bs={bs}k",
+                        "rw=randrw",
+                        f"rwmixread={int(rwmixread)}",
+                        f"size={size_mb_to_use}m",
                         "",
-                    ])
+                    ]
 
-                try:
-                    job_path = '/tmp/fio_swap_partitions_matrix.job'
-                    with open(job_path, 'w') as f:
-                        f.write("\n".join(fio_job_lines))
+                    # Bind jobs explicitly to their device by making each section a device-specific job.
+                    for idx, dev in enumerate(selected, start=1):
+                        fio_job_lines.extend([
+                            f"[dev{idx}]",
+                            f"filename={dev}",
+                            f"numjobs={numjobs}",
+                            "",
+                        ])
 
-                    proc = subprocess.run(
-                        ['fio', '--output-format=json', job_path],
-                        capture_output=True,
-                        text=True,
-                        timeout=300,
-                    )
-                    if proc.returncode != 0:
-                        raise subprocess.CalledProcessError(proc.returncode, 'fio', proc.stderr)
+                    try:
+                        job_path = '/tmp/fio_swap_partitions_matrix.job'
+                        with open(job_path, 'w') as f:
+                            f.write("\n".join(fio_job_lines))
 
-                    data = json.loads(proc.stdout)
-                    read_mb_s, write_mb_s, read_lat_us, write_lat_us = _fio_sum_bw_and_lat(data)
-                    entry = {
-                        'block_size_kb': bs,
-                        'device_count': dev_count,
-                        'numjobs_per_device': numjobs,
-                        'read_mb_per_sec': round(read_mb_s, 2),
-                        'write_mb_per_sec': round(write_mb_s, 2),
-                        'combined_mb_per_sec': round(read_mb_s + write_mb_s, 2),
-                        'read_latency_us': round(read_lat_us, 2),
-                        'write_latency_us': round(write_lat_us, 2),
-                    }
-                    results['matrix'].append(entry)
-                    log_info(f"  Total: ↑{write_mb_s:.1f} ↓{read_mb_s:.1f} MB/s")
-                except subprocess.TimeoutExpired:
-                    results['matrix'].append({
-                        'block_size_kb': bs,
-                        'device_count': dev_count,
-                        'numjobs_per_device': numjobs,
-                        'error': 'Timeout after 300s',
-                        'read_mb_per_sec': 0,
-                        'write_mb_per_sec': 0,
-                        'combined_mb_per_sec': 0,
-                    })
-                except subprocess.CalledProcessError as e:
-                    stderr = (e.stderr or '')
-                    results['matrix'].append({
-                        'block_size_kb': bs,
-                        'device_count': dev_count,
-                        'numjobs_per_device': numjobs,
-                        'error': f"fio failed: {stderr[:120]}",
-                        'read_mb_per_sec': 0,
-                        'write_mb_per_sec': 0,
-                        'combined_mb_per_sec': 0,
-                    })
-                except Exception as e:
-                    results['matrix'].append({
-                        'block_size_kb': bs,
-                        'device_count': dev_count,
-                        'numjobs_per_device': numjobs,
-                        'error': str(e)[:120],
-                        'read_mb_per_sec': 0,
-                        'write_mb_per_sec': 0,
-                        'combined_mb_per_sec': 0,
-                    })
+                        proc = subprocess.run(
+                            ['fio', '--output-format=json', job_path],
+                            capture_output=True,
+                            text=True,
+                            timeout=300,
+                        )
+                        if proc.returncode != 0:
+                            raise subprocess.CalledProcessError(proc.returncode, 'fio', proc.stderr)
+
+                        data = json.loads(proc.stdout)
+                        (
+                            read_mb_s,
+                            write_mb_s,
+                            read_lat_mean_us,
+                            write_lat_mean_us,
+                            read_lat_p99_us,
+                            write_lat_p99_us,
+                        ) = _fio_sum_bw_and_lat(data)
+                        entry = {
+                            'block_size_kb': bs,
+                            'device_count': dev_count,
+                            'numjobs_per_device': numjobs,
+                            'iodepth': int(iodepth),
+                            'rwmixread': int(rwmixread),
+                            'size_mb_per_device': int(size_mb_to_use),
+                            'read_mb_per_sec': round(read_mb_s, 2),
+                            'write_mb_per_sec': round(write_mb_s, 2),
+                            'combined_mb_per_sec': round(read_mb_s + write_mb_s, 2),
+                            'read_latency_us': round(read_lat_mean_us, 2),
+                            'write_latency_us': round(write_lat_mean_us, 2),
+                            'read_latency_p99_us': round(read_lat_p99_us, 2),
+                            'write_latency_p99_us': round(write_lat_p99_us, 2),
+                        }
+                        results['matrix'].append(entry)
+                        log_info(
+                            f"  Total: ↑{write_mb_s:.1f} ↓{read_mb_s:.1f} MB/s | "
+                            + f"lat(mean) r={read_lat_mean_us:.1f}µs w={write_lat_mean_us:.1f}µs | "
+                            + f"lat(p99) r={read_lat_p99_us:.1f}µs w={write_lat_p99_us:.1f}µs"
+                        )
+                    except subprocess.TimeoutExpired:
+                        results['matrix'].append({
+                            'block_size_kb': bs,
+                            'device_count': dev_count,
+                            'numjobs_per_device': numjobs,
+                            'iodepth': int(iodepth),
+                            'rwmixread': int(rwmixread),
+                            'error': 'Timeout after 300s',
+                            'read_mb_per_sec': 0,
+                            'write_mb_per_sec': 0,
+                            'combined_mb_per_sec': 0,
+                        })
+                    except subprocess.CalledProcessError as e:
+                        stderr = (e.stderr or '')
+                        results['matrix'].append({
+                            'block_size_kb': bs,
+                            'device_count': dev_count,
+                            'numjobs_per_device': numjobs,
+                            'iodepth': int(iodepth),
+                            'rwmixread': int(rwmixread),
+                            'error': f"fio failed: {stderr[:120]}",
+                            'read_mb_per_sec': 0,
+                            'write_mb_per_sec': 0,
+                            'combined_mb_per_sec': 0,
+                        })
+                    except Exception as e:
+                        results['matrix'].append({
+                            'block_size_kb': bs,
+                            'device_count': dev_count,
+                            'numjobs_per_device': numjobs,
+                            'iodepth': int(iodepth),
+                            'rwmixread': int(rwmixread),
+                            'error': str(e)[:120],
+                            'read_mb_per_sec': 0,
+                            'write_mb_per_sec': 0,
+                            'combined_mb_per_sec': 0,
+                        })
 
     valid = [r for r in results['matrix'] if isinstance(r, dict) and 'error' not in r]
     if valid:
         def _latency_weighted_us(row):
             # Reads are usually on the critical path (page faults), writes often amortize.
-            rlat = float(row.get('read_latency_us', 0) or 0)
-            wlat = float(row.get('write_latency_us', 0) or 0)
+            if latency_metric == 'mean':
+                rlat = float(row.get('read_latency_us', 0) or 0)
+                wlat = float(row.get('write_latency_us', 0) or 0)
+            else:
+                rlat = float(row.get('read_latency_p99_us', 0) or 0)
+                wlat = float(row.get('write_latency_p99_us', 0) or 0)
             lat = (0.7 * rlat) + (0.3 * wlat)
             # Guard against missing/zero values.
             return lat if lat > 0 else 1.0
@@ -2217,13 +2350,24 @@ def test_swap_partitions_stripe_matrix(
         near_best = [r for r in valid if float(_score(r) or 0.0) >= threshold]
         chosen = min(
             near_best,
-            key=lambda r: (int(r.get('device_count', 1)), int(r.get('numjobs_per_device', 1)), int(r.get('block_size_kb', 4)))
+            key=lambda r: (
+                int(r.get('device_count', 1)),
+                int(r.get('iodepth', 1)),
+                int(r.get('numjobs_per_device', 1)),
+                int(r.get('block_size_kb', 4)),
+            )
         )
 
         # Keep top-3 candidates for reporting.
         top = sorted(
             valid,
-            key=lambda r: (-float(_score(r) or 0.0), int(r.get('device_count', 1)), int(r.get('numjobs_per_device', 1)), int(r.get('block_size_kb', 4)))
+            key=lambda r: (
+                -float(_score(r) or 0.0),
+                int(r.get('device_count', 1)),
+                int(r.get('iodepth', 1)),
+                int(r.get('numjobs_per_device', 1)),
+                int(r.get('block_size_kb', 4)),
+            )
         )[:3]
 
         block_to_cluster = {4: 0, 8: 1, 16: 2, 32: 3, 64: 4, 128: 5}
@@ -2235,8 +2379,42 @@ def test_swap_partitions_stripe_matrix(
             'best_score': round(best_score, 6),
             'recommended_swap_stripe_width': int(chosen.get('device_count', 1)),
             'recommended_fio_numjobs_per_device': int(chosen.get('numjobs_per_device', 1)),
+            'recommended_fio_iodepth': int(chosen.get('iodepth', 1)),
             'recommended_page_cluster': int(cluster),
+            'latency_metric': latency_metric,
         }
+
+        # Also compute per-block-size optima so we can answer "what if only 4KB accesses?"
+        try:
+            opt_by_bs = {}
+            for bs in sorted({int(r.get('block_size_kb')) for r in valid if isinstance(r.get('block_size_kb'), int)}):
+                candidates = [r for r in valid if int(r.get('block_size_kb', -1)) == bs]
+                if not candidates:
+                    continue
+                best_bs = max(candidates, key=_score)
+                best_bs_score = float(_score(best_bs) or 0.0)
+                threshold_bs = best_bs_score * 0.95
+                near_best_bs = [r for r in candidates if float(_score(r) or 0.0) >= threshold_bs]
+                chosen_bs = min(
+                    near_best_bs,
+                    key=lambda r: (
+                        int(r.get('device_count', 1)),
+                        int(r.get('iodepth', 1)),
+                        int(r.get('numjobs_per_device', 1)),
+                    )
+                )
+                opt_by_bs[str(bs)] = {
+                    'recommended_swap_stripe_width': int(chosen_bs.get('device_count', 1)),
+                    'recommended_fio_numjobs_per_device': int(chosen_bs.get('numjobs_per_device', 1)),
+                    'recommended_fio_iodepth': int(chosen_bs.get('iodepth', 1)),
+                    'chosen_point': chosen_bs,
+                    'best_score': round(best_bs_score, 6),
+                    'latency_metric': latency_metric,
+                }
+            if opt_by_bs:
+                results['optimal_by_block_size_kb'] = opt_by_bs
+        except Exception:
+            pass
 
         log_step_ts("Swap partition stripe matrix complete")
         try:
@@ -4565,6 +4743,116 @@ def generate_charts(results, output_dir='/var/log/debian-install', webp=True):
                 plt.close()
                 chart_files.append(chart_file)
                 log_info(f"Generated compression chart: {chart_file}")
+
+        # Swap partition striping matrix charts (real partitions)
+        try:
+            spm = results.get('swap_partitions_matrix')
+            if isinstance(spm, dict) and 'error' not in spm and isinstance(spm.get('matrix'), list) and spm.get('matrix'):
+                # Helper functions local to chart generator.
+                def _lat_w_us(row):
+                    metric = (spm.get('optimal') or {}).get('latency_metric') or (spm.get('fio_workload') or {}).get('latency_metric') or 'p99'
+                    metric = str(metric).lower()
+                    if metric == 'mean':
+                        rlat = float(row.get('read_latency_us', 0) or 0)
+                        wlat = float(row.get('write_latency_us', 0) or 0)
+                    else:
+                        rlat = float(row.get('read_latency_p99_us', 0) or 0)
+                        wlat = float(row.get('write_latency_p99_us', 0) or 0)
+                    lat = (0.7 * rlat) + (0.3 * wlat)
+                    return lat if lat > 0 else 1.0
+
+                def _score(row):
+                    bw = float(row.get('combined_mb_per_sec', 0) or 0)
+                    return bw / _lat_w_us(row)
+
+                valid_rows = [r for r in spm['matrix'] if isinstance(r, dict) and 'error' not in r]
+                if valid_rows:
+                    # For each device_count and block_size_kb, keep the best row by score.
+                    by = {}
+                    for r in valid_rows:
+                        bs = r.get('block_size_kb')
+                        dc = r.get('device_count')
+                        if not isinstance(bs, int) or not isinstance(dc, int):
+                            continue
+                        k = (bs, dc)
+                        cur = by.get(k)
+                        if cur is None or _score(r) > _score(cur):
+                            by[k] = r
+
+                    block_sizes = sorted({bs for (bs, _) in by.keys()})
+                    device_counts = sorted({dc for (_, dc) in by.keys()})
+
+                    # Chart A: score vs device_count
+                    fig, ax = plt.subplots(figsize=(11, 6))
+                    for bs in block_sizes:
+                        xs = [dc for dc in device_counts if (bs, dc) in by]
+                        ys = [_score(by[(bs, dc)]) for dc in xs]
+                        ax.plot(xs, ys, marker='o', linewidth=2, label=f"{bs}KB")
+
+                    chosen = (spm.get('optimal') or {}).get('best_combined') or {}
+                    try:
+                        cbs = int(chosen.get('block_size_kb'))
+                        cdc = int(chosen.get('device_count'))
+                        crow = by.get((cbs, cdc))
+                        if crow:
+                            ax.plot([cdc], [_score(crow)], marker='*', markersize=18, color='gold', markeredgecolor='black', label='Chosen')
+                    except Exception:
+                        pass
+
+                    metric = (spm.get('optimal') or {}).get('latency_metric') or (spm.get('fio_workload') or {}).get('latency_metric') or 'p99'
+                    mix = (spm.get('fio_workload') or {}).get('rwmixread', '?')
+                    ax.set_title(f"Swap Striping Score vs Devices (lat={metric}, rwmixread={mix}%)", fontsize=14, fontweight='bold')
+                    ax.set_xlabel('Swap devices (SWAP_STRIPE_WIDTH candidate)', fontsize=12)
+                    ax.set_ylabel('Score (MB/s per µs; higher is better)', fontsize=12)
+                    ax.grid(True, alpha=0.3)
+                    ax.legend(fontsize=10)
+
+                    chart_file = f"{output_dir}/swap-partitions-matrix-score-{timestamp}.png"
+                    plt.tight_layout()
+                    plt.savefig(chart_file, dpi=150, bbox_inches='tight')
+                    plt.close()
+                    chart_files.append(chart_file)
+                    log_info(f"Generated swap matrix score chart: {chart_file}")
+
+                    # Chart B: weighted latency vs device_count
+                    fig, ax = plt.subplots(figsize=(11, 6))
+                    for bs in block_sizes:
+                        xs = [dc for dc in device_counts if (bs, dc) in by]
+                        ys = [_lat_w_us(by[(bs, dc)]) for dc in xs]
+                        ax.plot(xs, ys, marker='o', linewidth=2, label=f"{bs}KB")
+                    ax.set_title(f"Swap Striping Weighted Latency vs Devices (lat={metric})", fontsize=14, fontweight='bold')
+                    ax.set_xlabel('Swap devices (SWAP_STRIPE_WIDTH candidate)', fontsize=12)
+                    ax.set_ylabel('Weighted latency (µs; lower is better)', fontsize=12)
+                    ax.grid(True, alpha=0.3)
+                    ax.legend(fontsize=10)
+
+                    chart_file = f"{output_dir}/swap-partitions-matrix-latency-{timestamp}.png"
+                    plt.tight_layout()
+                    plt.savefig(chart_file, dpi=150, bbox_inches='tight')
+                    plt.close()
+                    chart_files.append(chart_file)
+                    log_info(f"Generated swap matrix latency chart: {chart_file}")
+
+                    # Chart C: throughput vs device_count
+                    fig, ax = plt.subplots(figsize=(11, 6))
+                    for bs in block_sizes:
+                        xs = [dc for dc in device_counts if (bs, dc) in by]
+                        ys = [float(by[(bs, dc)].get('combined_mb_per_sec', 0) or 0) for dc in xs]
+                        ax.plot(xs, ys, marker='o', linewidth=2, label=f"{bs}KB")
+                    ax.set_title("Swap Striping Throughput vs Devices", fontsize=14, fontweight='bold')
+                    ax.set_xlabel('Swap devices (SWAP_STRIPE_WIDTH candidate)', fontsize=12)
+                    ax.set_ylabel('Throughput (MB/s; higher is better)', fontsize=12)
+                    ax.grid(True, alpha=0.3)
+                    ax.legend(fontsize=10)
+
+                    chart_file = f"{output_dir}/swap-partitions-matrix-throughput-{timestamp}.png"
+                    plt.tight_layout()
+                    plt.savefig(chart_file, dpi=150, bbox_inches='tight')
+                    plt.close()
+                    chart_files.append(chart_file)
+                    log_info(f"Generated swap matrix throughput chart: {chart_file}")
+        except Exception as e:
+            log_warn(f"Failed to generate swap-partitions matrix charts: {e}")
         
         # Chart 5: Latency Distribution (Box Plot)
         if 'latency_comparison' in results:
@@ -5071,23 +5359,39 @@ def format_benchmark_html(results):
         bs_list = spm.get('block_sizes') or []
         dev_counts = spm.get('device_counts') or []
         jobs_levels = spm.get('numjobs_per_device_levels') or []
+        iodepth_levels = spm.get('iodepth_levels') or []
         runtime_sec = spm.get('runtime_sec')
         per_dev_mb = spm.get('per_device_size_mb')
         workload = spm.get('fio_workload') or {}
+        use_full_device_size = bool(spm.get('use_full_device_size'))
+        full_device_size_margin_mb = spm.get('full_device_size_margin_mb')
 
         if parts:
             html += f"  Detected GPT swap partitions: {len(parts)}\n"
         if dev_counts and jobs_levels and bs_list:
             html += f"  Tested: devices={dev_counts}, jobs/dev={jobs_levels}, bs={bs_list}KB\n"
-        if runtime_sec and per_dev_mb:
-            html += f"  Workload: fio randrw 50/50, direct=1, runtime={runtime_sec}s, size={per_dev_mb}MB per device\n"
-        elif runtime_sec:
-            html += f"  Workload: fio randrw 50/50, direct=1, runtime={runtime_sec}s\n"
+        if iodepth_levels:
+            html += f"  Tested: iodepth={iodepth_levels}\n"
+
+        lat_metric = (workload.get('latency_metric') or (spm.get('optimal') or {}).get('latency_metric') or 'p99')
+        html += f"  Latency metric (selection): {lat_metric}\n"
+
+        mix = workload.get('rwmixread')
+        mix_str = f"{int(mix)}%" if isinstance(mix, int) else "?%"
+        if runtime_sec:
+            if use_full_device_size:
+                margin = f" (minus {int(full_device_size_margin_mb)}MB)" if isinstance(full_device_size_margin_mb, int) else ""
+                html += f"  Workload: fio randrw rwmixread={mix_str}, direct=1, runtime={runtime_sec}s, size=full-device{margin}\n"
+            elif per_dev_mb:
+                html += f"  Workload: fio randrw rwmixread={mix_str}, direct=1, runtime={runtime_sec}s, size={per_dev_mb}MB per device\n"
+            else:
+                html += f"  Workload: fio randrw rwmixread={mix_str}, direct=1, runtime={runtime_sec}s\n"
 
         opt = spm.get('optimal') or {}
         chosen = opt.get('best_combined') or {}
         rec_width = opt.get('recommended_swap_stripe_width')
         rec_jobs = opt.get('recommended_fio_numjobs_per_device')
+        rec_iodepth = opt.get('recommended_fio_iodepth')
         best_score = opt.get('best_score')
         if isinstance(rec_width, int) and rec_width > 0:
             html += f"  Selected SWAP_STRIPE_WIDTH={rec_width} ✅\n"
@@ -5095,11 +5399,25 @@ def format_benchmark_html(results):
                 html += f"  Install behavior: repartition swap space to exactly {rec_width} partitions\n"
         if isinstance(rec_jobs, int) and rec_jobs > 0:
             html += f"  (fio tuning) jobs/dev={rec_jobs}  <i>not a system setting</i>\n"
+        if isinstance(rec_iodepth, int) and rec_iodepth > 0:
+            html += f"  (fio tuning) iodepth={rec_iodepth}  <i>not a system setting</i>\n"
         if chosen.get('combined_mb_per_sec') is not None:
             html += (
-                f"  Chosen point: {chosen.get('device_count','?')} dev × {chosen.get('numjobs_per_device','?')} jobs/dev @ {chosen.get('block_size_kb','?')}KB = "
+                f"  Chosen point: {chosen.get('device_count','?')} dev × {chosen.get('numjobs_per_device','?')} jobs/dev @ {chosen.get('block_size_kb','?')}KB (iodepth={chosen.get('iodepth','?')}) = "
                 + f"{chosen.get('combined_mb_per_sec', 0):.0f} MB/s\n"
             )
+
+        # If we computed a 4KB-only recommendation, show it explicitly.
+        try:
+            opt_by_bs = spm.get('optimal_by_block_size_kb') or {}
+            o4 = opt_by_bs.get('4')
+            if isinstance(o4, dict) and isinstance(o4.get('recommended_swap_stripe_width'), int):
+                html += (
+                    f"  4KB-only recommendation: SWAP_STRIPE_WIDTH={int(o4.get('recommended_swap_stripe_width'))} "
+                    + f"(jobs/dev={int(o4.get('recommended_fio_numjobs_per_device', 1))}, iodepth={int(o4.get('recommended_fio_iodepth', 1))})\n"
+                )
+        except Exception:
+            pass
         if isinstance(best_score, (int, float)) and best_score:
             html += f"  Selection rule: smallest device_count within 95% of best score (throughput/latency)\n"
 
@@ -5109,13 +5427,19 @@ def format_benchmark_html(results):
             for idx, row in enumerate(top[:3], start=1):
                 try:
                     bw = float(row.get('combined_mb_per_sec', 0) or 0)
-                    rlat = float(row.get('read_latency_us', 0) or 0)
-                    wlat = float(row.get('write_latency_us', 0) or 0)
-                    lat = (0.7 * rlat) + (0.3 * wlat)
+                    rlat_mean = float(row.get('read_latency_us', 0) or 0)
+                    wlat_mean = float(row.get('write_latency_us', 0) or 0)
+                    rlat_p99 = float(row.get('read_latency_p99_us', 0) or 0)
+                    wlat_p99 = float(row.get('write_latency_p99_us', 0) or 0)
+                    lat = (0.7 * rlat_mean) + (0.3 * wlat_mean)
                     score = (bw / lat) if lat > 0 else 0.0
+                    lat_extra = ""
+                    if rlat_p99 > 0 or wlat_p99 > 0:
+                        latp = (0.7 * rlat_p99) + (0.3 * wlat_p99)
+                        lat_extra = f", p99~{latp:.1f}µs"
                     html += (
                         f"    #{idx}: {int(row.get('device_count', 1))} dev × {int(row.get('numjobs_per_device', 1))} jobs/dev "
-                        + f"@ {int(row.get('block_size_kb', 4))}KB — {bw:.0f} MB/s, lat~{lat:.1f}µs, score={score:.4f}\n"
+                        + f"@ {int(row.get('block_size_kb', 4))}KB (iodepth={int(row.get('iodepth', 1))}) — {bw:.0f} MB/s, mean~{lat:.1f}µs{lat_extra}, score={score:.4f}\n"
                     )
                 except Exception:
                     pass
@@ -5419,6 +5743,27 @@ Examples:
                        help='Test real GPT swap partitions as block devices to recommend SWAP_STRIPE_WIDTH')
     parser.add_argument('--swap-partitions-max', type=int, metavar='N', default=0,
                        help='Max GPT swap partitions to consider (default: 0 = all found)')
+    parser.add_argument('--swap-partitions-matrix-block-sizes', metavar='LIST', default='4,8,16,32',
+                       help='Block sizes (KB) to test in swap-partitions matrix (comma-separated, default: 4,8,16,32)')
+    parser.add_argument('--swap-partitions-matrix-iodepths', metavar='LIST', default='1,2',
+                       help='IO depths to test for swap-partitions matrix (comma-separated, default: 1,2)')
+    parser.add_argument('--swap-partitions-matrix-rwmixread', type=int, metavar='PCT', default=80,
+                       help='Read mix percentage for swap-partitions matrix randrw (default: 80)')
+    parser.add_argument('--swap-partitions-matrix-latency-metric', choices=['mean', 'p99'], default='p99',
+                       help='Latency metric used for scoring/selection in swap-partitions matrix (default: p99)')
+    parser.add_argument('--swap-partitions-matrix-size-mb', type=int, metavar='MB', default=256,
+                       help='Per-device size for swap-partitions matrix when not using full-device mode (default: 256)')
+    parser.add_argument('--swap-partitions-matrix-full-device',
+                       dest='swap_partitions_matrix_full_device',
+                       action='store_true',
+                       default=True,
+                       help='Use full partition size (minus margin) for swap-partitions matrix (default: enabled)')
+    parser.add_argument('--swap-partitions-matrix-no-full-device',
+                       dest='swap_partitions_matrix_full_device',
+                       action='store_false',
+                       help='Disable full-device mode and use --swap-partitions-matrix-size-mb instead')
+    parser.add_argument('--swap-partitions-matrix-full-device-margin-mb', type=int, metavar='MB', default=16,
+                       help='Margin to subtract when using full-device mode (default: 16)')
     parser.add_argument('--test-zswap', action='store_true',
                        help='Run comprehensive ZSWAP benchmarks (requires swap backing device)')
     parser.add_argument('--zswap-device', metavar='DEVICE', default='/dev/vda4',
@@ -5468,6 +5813,62 @@ Examples:
     
     if args.duration < 1 or args.duration > 3600:
         log_error(f"Invalid --duration: {args.duration}. Must be between 1 and 3600 seconds")
+        sys.exit(1)
+
+    if args.swap_partitions_matrix_rwmixread < 0 or args.swap_partitions_matrix_rwmixread > 100:
+        log_error(
+            f"Invalid --swap-partitions-matrix-rwmixread: {args.swap_partitions_matrix_rwmixread}. Must be 0..100"
+        )
+        sys.exit(1)
+
+    if args.swap_partitions_matrix_size_mb <= 0:
+        log_error(f"Invalid --swap-partitions-matrix-size-mb: {args.swap_partitions_matrix_size_mb}. Must be >0")
+        sys.exit(1)
+
+    if args.swap_partitions_matrix_full_device_margin_mb < 0:
+        log_error(
+            f"Invalid --swap-partitions-matrix-full-device-margin-mb: {args.swap_partitions_matrix_full_device_margin_mb}. Must be >=0"
+        )
+        sys.exit(1)
+
+    def _parse_int_list(value):
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            out = []
+            for x in value:
+                try:
+                    out.append(int(x))
+                except Exception:
+                    pass
+            return out
+        s = str(value).strip()
+        if not s:
+            return []
+        out = []
+        for token in s.split(','):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                out.append(int(token))
+            except Exception:
+                continue
+        return out
+
+    swap_matrix_iodepths = [d for d in _parse_int_list(args.swap_partitions_matrix_iodepths) if d >= 1]
+    swap_matrix_block_sizes = [b for b in _parse_int_list(args.swap_partitions_matrix_block_sizes) if b >= 1]
+    if not swap_matrix_block_sizes:
+        log_error(
+            f"Invalid --swap-partitions-matrix-block-sizes: {args.swap_partitions_matrix_block_sizes}. "
+            + "Expected comma-separated ints >=1 (e.g. 4,8,16,32)."
+        )
+        sys.exit(1)
+    if not swap_matrix_iodepths:
+        log_error(
+            f"Invalid --swap-partitions-matrix-iodepths: {args.swap_partitions_matrix_iodepths}. "
+            + "Expected comma-separated ints >=1 (e.g. 1,2)."
+        )
         sys.exit(1)
     
     # Check root and dependencies
@@ -5702,6 +6103,13 @@ Examples:
             results['swap_partitions_matrix'] = test_swap_partitions_stripe_matrix(
                 runtime_sec=args.duration,
                 max_partitions=max_parts,
+                block_sizes=swap_matrix_block_sizes,
+                iodepth_levels=swap_matrix_iodepths,
+                rwmixread=args.swap_partitions_matrix_rwmixread,
+                per_device_size_mb=args.swap_partitions_matrix_size_mb,
+                use_full_device_size=bool(args.swap_partitions_matrix_full_device),
+                full_device_size_margin_mb=args.swap_partitions_matrix_full_device_margin_mb,
+                latency_metric=args.swap_partitions_matrix_latency_metric,
             )
         except Exception as e:
             log_error(f"Swap partition stripe matrix failed: {e}")

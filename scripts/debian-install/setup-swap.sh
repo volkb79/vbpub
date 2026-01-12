@@ -2201,8 +2201,12 @@ setup_swap_solution() {
 
             local deferred_disk_swap="no"
             if [ -x "./create-swap-partitions.sh" ]; then
+                # If bootstrap already finalized partitions, do not re-partition here.
+                # Stage2 handles: (1) pre-create for benchmarks, (2) post-benchmark finalize to exactly N.
+                if [ -f /var/lib/vbpub/bootstrap/partitions_final_done ]; then
+                    log_info "Bootstrap already finalized swap partitions; skipping repartition enforcement"
                 # Only enforce when benchmark results exist (otherwise create-swap-partitions.sh will exit).
-                if ls -t /var/log/debian-install/benchmark-results-*.json >/dev/null 2>&1; then
+                elif ls -t /var/log/debian-install/benchmark-results-*.json >/dev/null 2>&1; then
                     log_info "Enforcing swap partition plan via create-swap-partitions.sh"
                     set +e
                     ./create-swap-partitions.sh 2>&1 | tee -a "$LOG_FILE"

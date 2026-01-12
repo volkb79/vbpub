@@ -23,6 +23,8 @@ OFFLINE_SHRINK_EXIT_CODE=42
 SWAP_PARTITION_COUNT="${SWAP_PARTITION_COUNT:-16}"
 ACTIVATE_SWAP="${ACTIVATE_SWAP:-yes}"  # yes/no
 
+USER_PROVIDED_SWAP_PARTITION_COUNT="no"
+
 # Stage1 pre-shrink support (shrink root offline now; decide swap later)
 PRE_SHRINK_ONLY="${PRE_SHRINK_ONLY:-no}"  # yes/no
 PRE_SHRINK_ROOT_EXTRA_GB="${PRE_SHRINK_ROOT_EXTRA_GB:-10}"  # keep used + extra GB
@@ -62,6 +64,7 @@ for arg in "$@"; do
             ;;
         --swap-partition-count=*)
             SWAP_PARTITION_COUNT="${arg#*=}"
+            USER_PROVIDED_SWAP_PARTITION_COUNT="yes"
             ;;
     esac
 done
@@ -83,7 +86,15 @@ select_benchmark_results_file() {
         [ -z "$candidate" ] && continue
         [ -f "$candidate" ] || continue
 
-        # Prefer the concurrency-derived optimal device count.
+        # Prefer results that contain a swap-partitions stripe-width recommendation.
+        value=$(jq -r '.swap_partitions_matrix.optimal.recommended_swap_stripe_width // empty' "$candidate" 2>/dev/null || true)
+        if [[ -n "$value" && "$value" != "null" && "$value" =~ ^[0-9]+$ && "$value" -gt 0 ]]; then
+            chosen="$candidate"
+            echo "$chosen"
+            return 0
+        fi
+
+        # Prefer the concurrency-derived optimal output (legacy single-target matrix).
         value=$(jq -r '.matrix.optimal.best_combined.concurrency // .matrix.optimal.best_read.concurrency // .matrix.optimal.best_write.concurrency // empty' "$candidate" 2>/dev/null || true)
         if [[ -n "$value" && "$value" != "null" && "$value" =~ ^[0-9]+$ && "$value" -gt 0 ]]; then
             chosen="$candidate"
@@ -103,20 +114,24 @@ select_benchmark_results_file() {
     return 1
 }
 
-OPTIMAL_DEVICES=1
+OPTIMAL_DEVICES=""
 if [ "$PRE_SHRINK_ONLY" != "yes" ]; then
-    # New flow default: create a fixed number of swap partitions up-front.
-    # If benchmark JSON exists, we still allow it to override, but do not require it.
-    RESULTS_FILE="$(select_benchmark_results_file || true)"
-    if [ -n "$RESULTS_FILE" ] && [ -f "$RESULTS_FILE" ]; then
-        log_info "Using benchmark results: $RESULTS_FILE"
+    # If the caller explicitly provided a swap-partition count, always honor it.
+    # This is required for stage2's (a) pre-create partitions for benchmarking and
+    # (b) post-benchmark finalization to exactly N partitions.
+    if [ "$USER_PROVIDED_SWAP_PARTITION_COUNT" != "yes" ]; then
+        RESULTS_FILE="$(select_benchmark_results_file || true)"
+        if [ -n "$RESULTS_FILE" ] && [ -f "$RESULTS_FILE" ]; then
+            log_info "Using benchmark results: $RESULTS_FILE"
 
-        # Extract benchmark-optimal stripe width / device count (legacy fields).
-        OPTIMAL_DEVICES=$(jq -r '.matrix.optimal.recommended_swap_stripe_width // empty' "$RESULTS_FILE" 2>/dev/null || true)
-        if [[ -n "$OPTIMAL_DEVICES" && "$OPTIMAL_DEVICES" != "null" && "$OPTIMAL_DEVICES" =~ ^[0-9]+$ && "$OPTIMAL_DEVICES" -gt 0 ]]; then
-            log_info "Benchmark-recommended swap stripe width: $OPTIMAL_DEVICES"
-        else
-            OPTIMAL_DEVICES=""
+            # Extract benchmark-optimal stripe width / device count.
+            # Prefer swap-partitions matrix; fall back to legacy field.
+            OPTIMAL_DEVICES=$(jq -r '.swap_partitions_matrix.optimal.recommended_swap_stripe_width // .matrix.optimal.recommended_swap_stripe_width // empty' "$RESULTS_FILE" 2>/dev/null || true)
+            if [[ -n "$OPTIMAL_DEVICES" && "$OPTIMAL_DEVICES" != "null" && "$OPTIMAL_DEVICES" =~ ^[0-9]+$ && "$OPTIMAL_DEVICES" -gt 0 ]]; then
+                log_info "Benchmark-recommended swap stripe width: $OPTIMAL_DEVICES"
+            else
+                OPTIMAL_DEVICES=""
+            fi
         fi
     fi
 

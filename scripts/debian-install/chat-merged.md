@@ -139,6 +139,33 @@ Application Memory
 
 ## 2. Kernel Swap Mechanics
 
+### Swap Concurrency, Locking, and Why Striping Can Help
+
+When RAM runs out, the thing that hurts most is **swap-in latency** (page faults). The kernel *can* perform concurrent swap I/O even on a single device, but swap has **metadata and allocation hot paths** that can become contended under heavy parallel paging.
+
+Key points (practical, not folklore):
+
+1. **Single swap device is not “single-threaded I/O”**
+    - The block layer can queue and complete multiple bios concurrently.
+    - Multiple tasks can fault and trigger swap reads at the same time.
+    - So “one device = no concurrency” is wrong.
+
+2. **But there are real swap metadata locks**
+    - Each swap area has a `swap_info_struct` with a per-device spinlock (`si->lock`) protecting critical structures like swap slot maps, in-use accounting, and cluster lists.
+    - There are also some global swap locks used in allocation/management paths.
+    - Under thrash, these locks can become hot and add latency even if the underlying disk could handle more I/O.
+
+3. **Multiple swap devices/partitions can reduce contention and spread work**
+    - Multiple swap areas = multiple `swap_info_struct` instances = **multiple per-device locks**.
+    - The kernel also distributes allocations across equal-priority swap areas (round-robin-like behavior).
+    - Result: often less lock contention and better parallelism under heavy paging.
+    - Caveat: this is not guaranteed; device characteristics and I/O scheduler behavior still dominate.
+
+4. **Our optimization goal is “minimize pain when working-set > RAM”**
+    - We bias tests toward **read-heavy** patterns because swap-ins are on the critical path.
+    - We use **shallow queues** (`iodepth=1..2`) to focus on latency rather than bulk throughput.
+    - We select a stripe width that is “near-best” but prefers fewer devices if performance is within a small threshold, to reduce complexity.
+
 ### SWAP_CLUSTER_MAX: Write Batching
 
 **Definition**: Kernel constant (32 pages) controlling write batch size
@@ -157,10 +184,10 @@ Application Memory
   Device 4: Pages 3, 7, 11, 15, 19, 23, 27, 31 (8 pages)
 ```
 
-**Implications for testing:**
-- Test with `iodepth=4-8` per device (matches kernel behavior)
-- Use `numjobs` to simulate parallel swap-out
-- 32 pages = 128KB is maximum "natural" burst size
+**Implications for testing (latency pain focus):**
+- Writes are batched, but “pain” is usually page-fault reads → bias read-heavy.
+- Use shallow queues (`iodepth=1..2`) to measure latency behavior, not max throughput.
+- Prefer testing across the full device surface to avoid cache/locality artifacts.
 
 ### vm.page-cluster: Read-Ahead
 
@@ -199,6 +226,20 @@ The kernel's swap behavior creates a **consistent I/O pattern**:
 - Reads: Page-cluster readahead, access pattern depends on workload
 
 **Testing must simulate this:**
+
+### Avoiding Cache/Locality Artifacts in Benchmarks
+
+If a benchmark only touches a small subset of each partition (e.g., 256MB), results can be dominated by:
+
+- controller/drive cache behavior,
+- block-layer merging on a tiny hot LBA range,
+- “lucky” locality that does not hold when swap really fills and the working set thrashes.
+
+For the swap stripe-width decision, we therefore default to **full-partition sizing** (minus a small safety margin). This forces fio to spread I/O across the same LBA surface area the system will use when swap is actually under pressure.
+
+This aligns the benchmark with the real question:
+
+> What stripe width minimizes user-visible latency pain when RAM runs out?
 - Use `rw=randrw` (mixed random read/write)
 - Use `numjobs` equal to or greater than swap device count
 - Use `iodepth=4` to match kernel batching
