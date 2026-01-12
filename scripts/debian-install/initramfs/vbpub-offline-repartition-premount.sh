@@ -52,13 +52,28 @@ attempts=$((attempts + 1))
 echo "$attempts" >"$attempts_file" 2>/dev/null || true
 
 if [ "$attempts" -gt 3 ]; then
-  log "Too many attempts ($attempts); dropping to shell."
-  exit 1
+  log "Too many attempts ($attempts); skipping offline repartition to avoid boot loop."
+  exit 0
 fi
 
 log "Starting offline root shrink + repartition (attempt $attempts)"
 log "ROOT_PARTITION=$ROOT_PARTITION NEW_BLOCKS=$NEW_BLOCKS PTABLE_PATH=$PTABLE_PATH"
 log "MODE=$MODE"
+
+mounted_at=$(awk -v dev="$ROOT_PARTITION" '$1==dev {print $2; exit}' /proc/mounts 2>/dev/null || true)
+if [ -n "${mounted_at:-}" ]; then
+  log "ROOT_PARTITION appears mounted at '${mounted_at}' (unexpected for offline shrink); attempting umount"
+  if [ "$mounted_at" = "/" ]; then
+    log "Root device is mounted as '/' (too late for offline shrink in this stage); skipping"
+    exit 0
+  fi
+  if umount "$mounted_at" >>"$LOG" 2>&1; then
+    log "Unmounted $ROOT_PARTITION from ${mounted_at}"
+  else
+    log "Failed to unmount $ROOT_PARTITION from ${mounted_at}; cannot offline-shrink while mounted"
+    exit 1
+  fi
+fi
 
 # Ensure tools exist (hook should include them)
 for bin in e2fsck resize2fs sfdisk partx; do

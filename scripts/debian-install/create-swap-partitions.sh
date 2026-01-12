@@ -325,10 +325,11 @@ SWAP_LAST_NUM=${swap_last_num}
 SWAP_PRIORITY=${SWAP_PRIORITY}
 EOF
 
-    mkdir -p /etc/initramfs-tools/scripts/local-premount /etc/initramfs-tools/hooks
-    cp "$script_dir/initramfs/vbpub-offline-repartition-premount.sh" /etc/initramfs-tools/scripts/local-premount/vbpub-offline-repartition
+    # Run as early as possible in initramfs so root is not yet mounted.
+    mkdir -p /etc/initramfs-tools/scripts/init-premount /etc/initramfs-tools/hooks
+    cp "$script_dir/initramfs/vbpub-offline-repartition-premount.sh" /etc/initramfs-tools/scripts/init-premount/vbpub-offline-repartition
     cp "$script_dir/initramfs/vbpub-offline-repartition-hook.sh" /etc/initramfs-tools/hooks/vbpub-offline-repartition
-    chmod +x /etc/initramfs-tools/scripts/local-premount/vbpub-offline-repartition /etc/initramfs-tools/hooks/vbpub-offline-repartition
+    chmod +x /etc/initramfs-tools/scripts/init-premount/vbpub-offline-repartition /etc/initramfs-tools/hooks/vbpub-offline-repartition
 
     if [ "$mode" = "swap" ]; then
         # Install a one-shot finalizer that formats/enables swap partitions and updates /etc/fstab

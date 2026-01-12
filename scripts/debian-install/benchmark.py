@@ -213,6 +213,11 @@ COMPRESSION_RATIO_SUSPICIOUS = 10.0  # Ratio above this is suspicious
 MIN_VALID_COMPRESSION_RATIO = 1.1  # Minimum ratio to consider valid (below this indicates test failure)
 ZRAM_STABILIZATION_DELAY_SEC = 2  # Time to wait after ZRAM cleanup for system stabilization
 
+# Optional: disk-backed guard swapfile for benchmarks (prevents OOM during aggressive tests)
+DEFAULT_GUARD_SWAP_MB = 1024
+DEFAULT_GUARD_SWAP_PRIO = -10
+DEFAULT_ZRAM_PRIO = 100
+
 # Memory pressure test constants
 STRESS_NG_TIMEOUT_SEC = 15  # Timeout for stress-ng memory allocation
 STRESS_NG_WAIT_SEC = 20  # Maximum wait time for stress-ng process
@@ -464,6 +469,149 @@ def run_command(cmd, check=True):
             raise
         return ""
 
+
+def list_active_swaps():
+    """Return a list of active swap devices as [{'name': str, 'prio': int}]."""
+    swaps = []
+    try:
+        out = run_command('swapon --noheadings --raw --show=NAME,PRIO', check=False)
+        for line in (out or "").splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            name = parts[0]
+            prio = int(parts[1]) if len(parts) > 1 and parts[1].lstrip('-').isdigit() else 0
+            swaps.append({'name': name, 'prio': prio})
+    except Exception:
+        return []
+    return swaps
+
+
+def swapoff_all_except(keep_names):
+    """Best-effort: swapoff everything except devices in keep_names."""
+    keep = set(keep_names)
+    for s in list_active_swaps():
+        name = s.get('name')
+        if not name or name in keep:
+            continue
+        try:
+            subprocess.run(['swapoff', name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+
+def restore_swaps(swaps):
+    """Best-effort: restore swaps previously returned by list_active_swaps()."""
+    for s in swaps or []:
+        name = s.get('name')
+        prio = s.get('prio', 0)
+        if not name:
+            continue
+        # Caller may have enabled /dev/zram0 separately.
+        if name == '/dev/zram0':
+            continue
+        try:
+            subprocess.run(['swapon', '-p', str(int(prio)), name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+
+def _debug_enabled() -> bool:
+    return os.environ.get('DEBUG', '').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+
+
+def _read_proc_swaps_used_kb(name: str) -> int:
+    try:
+        with open('/proc/swaps', 'r') as f:
+            for line in f:
+                if line.startswith('Filename'):
+                    continue
+                parts = line.split()
+                if len(parts) >= 4 and parts[0] == name:
+                    return int(parts[3])
+    except Exception:
+        pass
+    return 0
+
+
+def ensure_guard_swapfile(size_mb: int = DEFAULT_GUARD_SWAP_MB) -> str | None:
+    """Ensure a disk-backed guard swapfile is active; returns its path or None.
+
+    Controlled via env:
+      - BENCHMARK_GUARD_SWAP: yes/no (default yes)
+      - BENCHMARK_GUARD_SWAP_MB: integer size (default 1024)
+      - BENCHMARK_GUARD_SWAP_PATH: swapfile path
+      - BENCHMARK_GUARD_SWAP_PRIO: swapon priority (default -10)
+    """
+    enabled = os.environ.get('BENCHMARK_GUARD_SWAP', 'yes').strip().lower() not in ('0', 'false', 'no', 'off')
+    if not enabled:
+        return None
+
+    try:
+        size_mb = int(os.environ.get('BENCHMARK_GUARD_SWAP_MB', str(int(size_mb))))
+    except Exception:
+        size_mb = int(size_mb)
+
+    path = os.environ.get('BENCHMARK_GUARD_SWAP_PATH', '/var/lib/vbpub/benchmark/guard.swap')
+    prio = os.environ.get('BENCHMARK_GUARD_SWAP_PRIO', str(DEFAULT_GUARD_SWAP_PRIO))
+    try:
+        prio = int(prio)
+    except Exception:
+        prio = DEFAULT_GUARD_SWAP_PRIO
+
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if (not os.path.exists(path)) or (os.path.getsize(path) < size_mb * 1024 * 1024):
+            log_info_ts(f"Creating guard swapfile {path} ({size_mb}MB)...")
+            subprocess.run(['swapoff', path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(['rm', '-f', path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(['fallocate', '-l', f'{size_mb}M', path], check=True)
+            os.chmod(path, 0o600)
+            subprocess.run(['mkswap', '-f', path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Ensure active with low priority.
+        active = {s.get('name'): s.get('prio') for s in list_active_swaps()}
+        if path not in active:
+            log_info_ts(f"Enabling guard swapfile (prio {prio})...")
+            subprocess.run(['swapon', '-p', str(int(prio)), path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return path
+    except Exception as e:
+        log_warn_ts(f"Failed to set up guard swapfile: {e}")
+        return None
+
+
+def disable_guard_swapfile(path: str | None) -> None:
+    if not path:
+        return
+    try:
+        subprocess.run(['swapoff', path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def _filter_patterns(data_patterns):
+    """Filter patterns based on BENCHMARK_PATTERNS='mixed,random,zeros,sequential'."""
+    raw = os.environ.get('BENCHMARK_PATTERNS', '').strip().lower()
+    if not raw:
+        return data_patterns
+    wanted = {p.strip() for p in raw.split(',') if p.strip()}
+    return [(pid, name) for (pid, name) in data_patterns if name.lower() in wanted]
+
+
+def get_sysctl_int(name, default=0):
+    try:
+        val = run_command(f"sysctl -n {name}", check=False)
+        return int(val.strip())
+    except Exception:
+        return int(default)
+
+
+def set_sysctl_int(name, value):
+    try:
+        subprocess.run(['sysctl', '-w', f"{name}={int(value)}"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
 def get_system_info():
     """Get system information"""
     info = {}
@@ -550,24 +698,12 @@ def ensure_zram_loaded():
             log_error("ZRAM device /dev/zram0 not found after loading module")
             return False
         
-        # Reset any existing zram device completely
+        # Reset any existing zram device completely (swapoff + reset with retries)
+        # This is critical - without reset, disksize writes can fail with "Device or resource busy".
         if os.path.exists('/sys/block/zram0/disksize'):
-            # First, disable swap if active
-            run_command('swapoff /dev/zram0 2>/dev/null || true', check=False)
-            
-            # Always reset the device to ensure clean state
-            # This is critical - without reset, disksize writes fail with "Device or resource busy"
-            try:
-                if os.path.exists('/sys/block/zram0/reset'):
-                    log_debug("Resetting ZRAM device...")
-                    with open('/sys/block/zram0/reset', 'w') as reset_f:
-                        reset_f.write('1\n')
-                    # Give kernel time to complete reset
-                    time.sleep(0.5)
-                    log_debug("ZRAM device reset complete")
-            except Exception as e:
-                log_error(f"Failed to reset ZRAM device: {e}")
-                # Don't return False here, try to continue
+            if not cleanup_zram_aggressive():
+                log_error("Failed to cleanup/reset ZRAM device")
+                return False
         
         return True
     except Exception as e:
@@ -816,6 +952,12 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
     
     # Log with progress tracking
     pattern_names = {0: 'mixed', 1: 'random', 2: 'zeros', 3: 'sequential'}
+    pattern_desc = {
+        0: 'mixed (default; some compressible, some not)',
+        1: 'random (incompressible; worst-case)',
+        2: 'zeros (highly compressible; best-case)',
+        3: 'sequential (typically compressible)',
+    }
     pattern_name = pattern_names.get(pattern, 'unknown')
     progress_str = f"[{test_num}/{total_tests}] " if test_num and total_tests else ""
     log_step_ts(f"{progress_str}Compression test: {compressor} with {allocator} ({pattern_name} data, test size: {size_mb}MB)")
@@ -824,13 +966,28 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         'compressor': compressor,
         'allocator': allocator,
         'test_size_mb': size_mb,
+        'pattern_id': int(pattern),
+        'data_pattern': pattern_name,
+        'data_pattern_description': pattern_desc.get(pattern, 'unknown'),
         'timestamp': datetime.now().isoformat()
     }
     
     # Initialize mem_locker_proc to None so it's in scope for cleanup
     mem_locker_proc = None
+
+    # Track system state we may temporarily change
+    prior_swaps = None
+    prior_swappiness = None
+    prior_zswap_enabled = None
+    zram_disksize_mb = size_mb
+    guard_swap_path = None
+    guard_swap_used_start_kb = 0
+    zram_mem_limit_mb = 0
     
     try:
+        # Snapshot swap state before we start modifying it.
+        prior_swaps = list_active_swaps()
+
         # Ensure ZRAM is loaded and clean
         log_info("Ensuring ZRAM device is clean...")
         if not ensure_zram_loaded():
@@ -855,21 +1012,91 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
             except:
                 log_warn(f"Could not set compressor to {compressor}, using default")
         
-        # Set size - use bash redirection instead of echo command to avoid shell issues
-        size_bytes = size_mb * 1024 * 1024
+        # Make the ZRAM device large enough that we can *force* meaningful swapping
+        # even on 8GB systems without immediately OOM-killing the machine.
+        # NOTE: disksize is virtual; it doesn't allocate RAM up-front.
+        system_info = get_system_info()
+        mem_info = get_memory_info()
+        ram_mb = int(mem_info.get('total_mb') or (int(system_info.get('ram_gb', 8)) * 1024))
+
+        # Target about 25% of RAM, but ensure it's also large relative to test size.
+        target_zram_mb = max(size_mb, 512, size_mb * 8, int(ram_mb * 0.25))
+        # Cap at 50% RAM (and an absolute cap) to avoid pathological settings on huge hosts.
+        max_zram_mb = min(8192, max(2048, int(ram_mb * 0.5)))
+        zram_disksize_mb = min(target_zram_mb, max_zram_mb)
+
+        # Set size
+        size_bytes = zram_disksize_mb * 1024 * 1024
         try:
-            log_info(f"Setting disk size to {size_bytes} bytes ({size_mb}MB)...")
+            log_info(f"Setting disk size to {size_bytes} bytes ({zram_disksize_mb}MB)...")
             with open('/sys/block/zram0/disksize', 'w') as f:
                 f.write(str(size_bytes))
         except OSError as e:
             log_error(f"Failed to set ZRAM disk size: {e}")
             results['error'] = f"Failed to set disksize: {e}"
             return results
+
+        # Optional: enable a disk-backed guard swapfile (low priority) to prevent OOM during
+        # aggressive tests. ZRAM remains higher priority so we still measure zram behavior.
+        guard_swap_path = ensure_guard_swapfile()
+        if guard_swap_path:
+            guard_swap_used_start_kb = _read_proc_swaps_used_kb(guard_swap_path)
+
+        # IMPORTANT: zswap sits in front of swap devices and can absorb swap-outs
+        # before they reach /dev/zram0, making zram0/mm_stat look like "no swap".
+        # Temporarily disable zswap so the benchmark measures the zram device itself.
+        if os.path.exists('/sys/module/zswap/parameters/enabled'):
+            try:
+                with open('/sys/module/zswap/parameters/enabled', 'r') as f:
+                    prior_zswap_enabled = f.read().strip()
+                # Accept Y/N or 1/0 style.
+                if prior_zswap_enabled.upper().startswith('Y') or prior_zswap_enabled == '1':
+                    log_info("Temporarily disabling zswap for ZRAM benchmark...")
+                    with open('/sys/module/zswap/parameters/enabled', 'w') as f:
+                        f.write('N\n')
+                    time.sleep(0.1)
+            except Exception as e:
+                log_warn(f"Could not toggle zswap enabled state: {e}")
+
+        # Optional: cap zram RAM usage to avoid OOM on incompressible patterns.
+        # mem_limit is in BYTES; 0 means "no limit".
+        try:
+            if os.path.exists('/sys/block/zram0/mem_limit'):
+                # Allow env override per run.
+                raw_limit = os.environ.get('BENCHMARK_ZRAM_MEM_LIMIT_MB', '').strip()
+                raw_limit_random = os.environ.get('BENCHMARK_ZRAM_MEM_LIMIT_MB_RANDOM', '').strip()
+                if raw_limit:
+                    zram_mem_limit_mb = int(raw_limit)
+                elif pattern == 1 and guard_swap_path:
+                    # Random/incompressible data: keep zram bounded.
+                    zram_mem_limit_mb = int(raw_limit_random) if raw_limit_random else 256
+                elif guard_swap_path:
+                    # With a guard swap, keep some bound by default.
+                    zram_mem_limit_mb = 1024
+                else:
+                    zram_mem_limit_mb = 0
+
+                mem_limit_bytes = max(0, int(zram_mem_limit_mb) * 1024 * 1024)
+                log_debug_ts(f"Setting zram mem_limit to {zram_mem_limit_mb}MB")
+                with open('/sys/block/zram0/mem_limit', 'w') as f:
+                    f.write(str(mem_limit_bytes))
+        except Exception as e:
+            log_warn_ts(f"Could not set zram mem_limit: {e}")
         
         # Make swap
         log_info("Enabling swap on /dev/zram0...")
         run_command('mkswap /dev/zram0')
-        run_command('swapon -p 100 /dev/zram0')
+        run_command(f'swapon -p {DEFAULT_ZRAM_PRIO} /dev/zram0')
+
+        # Prefer ZRAM for this test: disable other swaps so mm_stat reflects this run.
+        keep = ['/dev/zram0']
+        if guard_swap_path:
+            keep.append(guard_swap_path)
+        swapoff_all_except(keep)
+
+        # Encourage swapping during the test, then restore afterwards.
+        prior_swappiness = get_sysctl_int('vm.swappiness', default=60)
+        set_sysctl_int('vm.swappiness', 180)
         
         # Optional: Start mem_locker to lock free RAM (prevents non-test memory from swapping)
         # This is optional but makes tests more reliable and predictable
@@ -909,44 +1136,65 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         elif DISABLE_MEM_LOCKER:
             log_warn_ts("Skipping mem_locker (disabled due to earlier OOM-kill)")
         
-        # Create memory pressure to force actual swapping to ZRAM
-        # The key is to allocate MORE than available RAM to force the kernel to swap
-        
-        # Get available/total memory and pick an allocation size that induces swapping
-        # without OOM-killing the system (especially under systemd service limits).
+        # Create memory pressure to force actual swapping to ZRAM.
+        # MemAvailable-based heuristics can result in *zero swap* (only cache reclaim).
+        # Instead, allocate near MemTotal with a safety headroom.
+        #
+        # IMPORTANT: ZRAM lives in RAM. For incompressible data (e.g. random), swapping to
+        # ZRAM does not create meaningful headroom and can still trigger the OOM killer.
+        # We therefore keep explicit headroom and only allow limited overcommit based on a
+        # conservative per-pattern minimum compression ratio.
         try:
-            with open('/proc/meminfo', 'r') as f:
-                meminfo = f.read()
-            mem_available_kb = 0
-            mem_total_kb = 0
-            for line in meminfo.split('\n'):
-                if line.startswith('MemAvailable:'):
-                    mem_available_kb = int(line.split()[1])
-                elif line.startswith('MemTotal:'):
-                    mem_total_kb = int(line.split()[1])
-
-            mem_available_mb = mem_available_kb // 1024 if mem_available_kb else 0
-            mem_total_mb = mem_total_kb // 1024 if mem_total_kb else 0
-
-            system_info = get_system_info()
-            ram_gb = system_info.get('ram_gb', 8)
+            mem_total_mb = int(get_memory_info().get('total_mb', 0))
+            ram_gb = int(system_info.get('ram_gb', 8))
             safety_buffer_mb = 1024 if ram_gb <= 8 else 500
 
-            # Add a small extra over MemAvailable to encourage swap activity, but cap
-            # hard to keep headroom.
-            extra_alloc_cap = 128 if ram_gb <= 8 else 1024
-            extra_mb = min(size_mb, extra_alloc_cap)
+            # Conservative minimum compression ratios used only for safety sizing.
+            # (Actual observed ratios may be much higher for compressible patterns.)
+            # Patterns: 0=mixed, 1=random, 2=zeros, 3=sequential
+            min_ratio_floor = {
+                0: 1.20,  # mixed: assume only modest compressibility
+                1: 1.00,  # random: assume incompressible
+                2: 1.50,  # zeros: should compress extremely well, but keep floor conservative
+                3: 1.50,  # sequential: typically compressible, but be conservative
+            }.get(pattern, 1.00)
 
-            target_mb = mem_available_mb + extra_mb if mem_available_mb else size_mb
-            hard_cap_mb = (mem_total_mb - safety_buffer_mb) if mem_total_mb else target_mb
-            alloc_size_mb = max(size_mb, min(target_mb, hard_cap_mb))
+            # Keep some headroom to avoid OOM-killing system services.
+            # For incompressible data (min_ratio_floor ~= 1.0), we must keep *extra* headroom
+            # because swapping into ZRAM does not significantly reduce RAM pressure.
+            reserve_mb = max(128, int(safety_buffer_mb * 0.25))
+            if min_ratio_floor <= 1.05:
+                reserve_mb = max(reserve_mb, int(safety_buffer_mb * 1.25))
 
-            log_info(f"Creating memory pressure (allocating {alloc_size_mb}MB to encourage swapping)...")
+            # Allow limited overcommit only when we expect at least some compression.
+            # This raises swap pressure for compressible patterns, while keeping random safe.
+            extra_overcommit_mb = int(safety_buffer_mb * max(0.0, min_ratio_floor - 1.0) * 0.75)
+
+            base_alloc_mb = max(size_mb, mem_total_mb - reserve_mb)
+            alloc_size_mb = base_alloc_mb + extra_overcommit_mb
+
+            # If we have a guard swapfile and a zram mem_limit, we can safely force enough
+            # pressure to get *some* zram activity for random, without risking OOM.
+            if guard_swap_path and min_ratio_floor <= 1.05:
+                desired_swap_mb = 256
+                if zram_mem_limit_mb > 0:
+                    desired_swap_mb = max(64, min(512, int(zram_mem_limit_mb // 2)))
+                alloc_size_mb = mem_total_mb + desired_swap_mb
+
+            # Clamp to what ZRAM can absorb while maintaining the safety buffer.
+            max_safe_alloc_mb = mem_total_mb + max(0, zram_disksize_mb - safety_buffer_mb)
+            alloc_size_mb = min(alloc_size_mb, max_safe_alloc_mb)
+            alloc_size_mb = max(size_mb, alloc_size_mb)
+
+            log_info(f"Creating memory pressure (allocating {alloc_size_mb}MB; zram={zram_disksize_mb}MB)...")
             log_debug_ts(
-                f"MemTotal={mem_total_mb}MB MemAvailable={mem_available_mb}MB safety={safety_buffer_mb}MB extra={extra_mb}MB alloc={alloc_size_mb}MB"
+                "MemTotal={}".format(mem_total_mb)
+                + f"MB safety={safety_buffer_mb}MB reserve={reserve_mb}MB "
+                + f"min_ratio_floor={min_ratio_floor:.2f} extra_overcommit={extra_overcommit_mb}MB "
+                + f"guard_swap={'yes' if guard_swap_path else 'no'} zram_mem_limit_mb={zram_mem_limit_mb} "
+                + f"max_safe_alloc={max_safe_alloc_mb}MB alloc={alloc_size_mb}MB"
             )
         except Exception:
-            # Conservative fallback
             alloc_size_mb = max(size_mb, size_mb * COMPRESSION_MEMORY_PERCENT // 100)
             log_info(f"Creating memory pressure (allocating {alloc_size_mb}MB)...")
         
@@ -968,34 +1216,88 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         pattern_name = pattern_names.get(pattern, 'unknown')
         log_info_ts(f"Using C-based mem_pressure for allocation ({alloc_size_mb}MB, {pattern_name} data)...")
         
-        # Run with timeout to prevent hanging
-        log_info(f"Starting memory pressure test (timeout: {COMPRESSION_TEST_TIMEOUT_SEC}s)...")
-        
+        # Run memory pressure and sample mm_stat while memory is held.
+        # If we only read mm_stat *after* mem_pressure exits, swapped pages may have been freed,
+        # resulting in near-zero orig_data_size even when the system did swap during the run.
         try:
-            result = subprocess.run(
-                [str(mem_pressure_path), str(alloc_size_mb), str(pattern), '15'],
-                capture_output=True,
+            hold_seconds = int(os.environ.get('BENCHMARK_HOLD_SECONDS', '10').strip() or '10')
+        except Exception:
+            hold_seconds = 10
+        hold_seconds = max(3, min(60, hold_seconds))
+        results['hold_seconds'] = int(hold_seconds)
+        log_info(f"Starting memory pressure test (timeout: {COMPRESSION_TEST_TIMEOUT_SEC}s)...")
+
+        peak_orig = 0
+        peak_compr = 0
+        peak_mem = 0
+        stderr = ""
+        stdout = ""
+        success = False
+        proc = None
+
+        try:
+            proc = subprocess.Popen(
+                [str(mem_pressure_path), str(alloc_size_mb), str(pattern), str(hold_seconds)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=COMPRESSION_TEST_TIMEOUT_SEC
+                preexec_fn=lambda: set_oom_score_adj(1000),
             )
-            success = (result.returncode == 0)
-            stderr = result.stderr if not success else ""
+
+            deadline = time.time() + COMPRESSION_TEST_TIMEOUT_SEC
+            while True:
+                # Sample zram stats while the pressure test is running.
+                try:
+                    if os.path.exists('/sys/block/zram0/mm_stat'):
+                        stats = run_command('cat /sys/block/zram0/mm_stat', check=False).split()
+                        if len(stats) >= 3:
+                            peak_orig = max(peak_orig, int(stats[0]))
+                            peak_compr = max(peak_compr, int(stats[1]))
+                            peak_mem = max(peak_mem, int(stats[2]))
+                except Exception:
+                    pass
+
+                if proc.poll() is not None:
+                    break
+
+                if time.time() > deadline:
+                    raise subprocess.TimeoutExpired(cmd=str(mem_pressure_path), timeout=COMPRESSION_TEST_TIMEOUT_SEC)
+
+                time.sleep(1)
+
+            try:
+                stdout, stderr = proc.communicate(timeout=2)
+            except Exception:
+                stdout = stdout or ""
+                stderr = stderr or ""
+
+            success = (proc.returncode == 0)
         except subprocess.TimeoutExpired:
             success = False
             stderr = f"Timeout after {COMPRESSION_TEST_TIMEOUT_SEC}s"
             log_warn_ts(f"Memory pressure test timed out after {COMPRESSION_TEST_TIMEOUT_SEC}s")
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
         except Exception as e:
             success = False
             stderr = str(e)
             log_error(f"Memory pressure test failed: {e}")
-        
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
         if not success:
-            log_error(f"Memory pressure test failed or timed out")
+            log_error("Memory pressure test failed or timed out")
             if stderr:
                 log_error(f"Error: {stderr}")
             results['error'] = f"mem_pressure failed: {stderr}"
             return results
-        
+
         log_info("Memory pressure test completed successfully")
 
         # Make kernel OOM-kill of mem_locker visible in the benchmark log (it won't show up
@@ -1016,94 +1318,102 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         
         duration = time.time() - start_time
         
-        # Get stats
+        # Use peak stats observed during the pressure run (see sampling loop above).
         log_info("Reading ZRAM statistics...")
-        if os.path.exists('/sys/block/zram0/mm_stat'):
-            stats = run_command('cat /sys/block/zram0/mm_stat').split()
-            
-            # Enhanced debug logging with field names
-            log_debug_ts(f"Raw mm_stat: {' '.join(stats)}")
-            if len(stats) >= 7:
-                log_debug_ts(f"mm_stat breakdown:")
-                log_debug_ts(f"  [0] orig_data_size:   {int(stats[0])/1024/1024:.2f} MB (uncompressed data)")
-                log_debug_ts(f"  [1] compr_data_size:  {int(stats[1])/1024/1024:.2f} MB (compressed size)")
-                log_debug_ts(f"  [2] mem_used_total:   {int(stats[2])/1024/1024:.2f} MB (memory used incl. overhead)")
-                log_debug_ts(f"  [3] mem_limit:        {int(stats[3])/1024/1024:.2f} MB (memory limit)")
-                log_debug_ts(f"  [4] mem_used_max:     {int(stats[4])/1024/1024:.2f} MB (peak memory)")
-                log_debug_ts(f"  [5] same_pages:       {stats[5]} (pages with same content)")
-                log_debug_ts(f"  [6] pages_compacted:  {stats[6]} (compaction count)")
-                
-                # Calculate overhead
-                if len(stats) >= 3:
-                    overhead_mb = (int(stats[2]) - int(stats[1])) / 1024 / 1024
-                    overhead_pct = ((int(stats[2]) - int(stats[1])) / int(stats[1]) * 100) if int(stats[1]) > 0 else 0
-                    log_debug_ts(f"  Allocator overhead:   {overhead_mb:.2f} MB ({overhead_pct:.1f}% of compressed)")
-            
-            if len(stats) >= 3:
-                orig_size = int(stats[0])
-                compr_size = int(stats[1])
-                mem_used = int(stats[2])
-                
-                # Validation: catch impossible values
-                if orig_size == 0:
-                    log_warn("No data swapped to ZRAM (orig_size = 0)")
-                    results['error'] = 'No swap activity detected'
-                    return results
-                
-                # VALIDATION: Ensure meaningful data was swapped
-                # Adjust threshold based on RAM size - high RAM systems won't swap as much
-                system_info = get_system_info()
-                ram_gb = system_info.get('ram_gb', 8)
-                
-                if ram_gb >= 4:
-                    # Medium to high RAM systems won't swap much (20% threshold = 25.6MB for 128MB test)
-                    min_swap_percent = 20
+        if peak_orig > 0 or peak_mem > 0:
+            orig_size = int(peak_orig)
+            compr_size = int(peak_compr)
+            mem_used = int(peak_mem)
+
+            log_debug_ts(
+                "Peak mm_stat during pressure: "
+                f"orig={orig_size/1024/1024:.2f}MB compr={compr_size/1024/1024:.2f}MB mem_used={mem_used/1024/1024:.2f}MB"
+            )
+
+            # Validation: catch impossible values
+            if orig_size == 0:
+                log_warn("No data swapped to ZRAM (orig_size = 0)")
+                results['error'] = 'No swap activity detected'
+                return results
+
+            # VALIDATION: ensure meaningful swap happened. When only a few pages
+            # move, ratios/efficiency are dominated by allocator overhead and are junk.
+            # Minimum activity threshold:
+            # - 16MB was only a "did anything happen" floor and is too low for stable allocator metrics.
+            # - Use pattern-aware defaults, overridable via env.
+            try:
+                env_min = os.environ.get('BENCHMARK_MIN_SWAP_ACTIVITY_MB', '').strip()
+                env_min_random = os.environ.get('BENCHMARK_MIN_SWAP_ACTIVITY_MB_RANDOM', '').strip()
+                if pattern == 1 and env_min_random:
+                    min_activity_mb = int(env_min_random)
+                elif env_min:
+                    min_activity_mb = int(env_min)
                 else:
-                    # Low RAM systems will swap more aggressively
-                    min_swap_percent = 35
-                
-                min_expected_bytes = size_mb * 1024 * 1024 * min_swap_percent // 100
-                if orig_size < min_expected_bytes:
-                    log_warn(f"Insufficient swap activity: only {orig_size/1024/1024:.1f}MB of {size_mb}MB swapped (expected at least {min_swap_percent}%)")
-                    log_warn("Consider increasing test size or memory pressure")
-                    results['warning'] = f'Low swap activity: {orig_size/1024/1024:.1f}MB < {size_mb*min_swap_percent/100:.1f}MB expected'
-                
-                if compr_size == 0:
-                    log_error("Compressed size is zero - invalid ZRAM state")
-                    results['error'] = 'Invalid ZRAM compression state'
-                    return results
-                
-                if mem_used > orig_size * 2:
-                    log_warn(f"Memory overhead detected: used {mem_used} > orig {orig_size}")
-                
-                # Calculate with proper bounds checking
-                results['orig_size_mb'] = round(orig_size / 1024 / 1024, 2)
-                results['compr_size_mb'] = round(compr_size / 1024 / 1024, 2)
-                results['mem_used_mb'] = round(mem_used / 1024 / 1024, 2)
-                
-                # Compression ratio: should be 1.5 - 4.0 typically
-                ratio = orig_size / compr_size
-                if ratio < COMPRESSION_RATIO_MIN or ratio > COMPRESSION_RATIO_SUSPICIOUS:
-                    log_warn(f"Suspicious compression ratio: {ratio:.2f}x (expected {COMPRESSION_RATIO_MIN}-{COMPRESSION_RATIO_MAX}x for typical data)")
-                
-                results['compression_ratio'] = round(ratio, 2)
-                
-                # Efficiency: (orig - mem_used) / orig as percentage
-                # Negative values indicate allocator overhead exceeds space savings
-                # This can happen with small data sizes or high-overhead allocators
-                if orig_size > 0:
-                    efficiency = ((orig_size - mem_used) / orig_size) * 100
-                    results['efficiency_pct'] = round(efficiency, 2)
-                    
-                    if efficiency < -50:
-                        log_warn(f"High allocator overhead: {abs(efficiency):.1f}% overhead (mem_used > orig_size)")
-                        log_warn("This can occur with small test sizes or inefficient allocators")
-                else:
-                    results['efficiency_pct'] = 0
-                    
-                log_info(f"  Compression ratio: {ratio:.2f}x")
-                log_info(f"  Space efficiency: {results['efficiency_pct']:.1f}%")
-                log_info(f"  Memory saved: {results['orig_size_mb'] - results['mem_used_mb']:.2f} MB")
+                    min_activity_mb = 128 if pattern == 1 else 256
+            except Exception:
+                min_activity_mb = 128 if pattern == 1 else 256
+
+            # If the user asked for a larger test, don't set a smaller threshold than the test size.
+            min_activity_mb = max(32, min_activity_mb)
+            results['min_swap_activity_mb'] = int(min_activity_mb)
+            activity_mb = orig_size / 1024 / 1024
+            results['swap_activity_mb'] = round(activity_mb, 2)
+            results['zram_disksize_mb'] = int(zram_disksize_mb)
+
+            if activity_mb < min_activity_mb:
+                msg = (
+                    f"Insufficient swap activity: only {activity_mb:.2f}MB swapped "
+                    f"(need >= {min_activity_mb}MB for reliable metrics)"
+                )
+                log_warn(msg)
+                results['error'] = 'Insufficient swap activity'
+                results['reliable'] = False
+                results['warning'] = msg
+                return results
+            results['reliable'] = True
+
+            if compr_size == 0:
+                log_error("Compressed size is zero - invalid ZRAM state")
+                results['error'] = 'Invalid ZRAM compression state'
+                return results
+
+            if mem_used > orig_size * 2:
+                log_warn(f"Memory overhead detected: used {mem_used} > orig {orig_size}")
+
+            # Calculate with proper bounds checking
+            results['orig_size_mb'] = round(orig_size / 1024 / 1024, 2)
+            results['compr_size_mb'] = round(compr_size / 1024 / 1024, 2)
+            results['mem_used_mb'] = round(mem_used / 1024 / 1024, 2)
+
+            # Compression ratio: should be 1.5 - 4.0 typically
+            ratio = orig_size / compr_size
+            if ratio < COMPRESSION_RATIO_MIN or ratio > COMPRESSION_RATIO_SUSPICIOUS:
+                log_warn(f"Suspicious compression ratio: {ratio:.2f}x (expected {COMPRESSION_RATIO_MIN}-{COMPRESSION_RATIO_MAX}x for typical data)")
+
+            results['compression_ratio'] = round(ratio, 2)
+
+            # Efficiency: (orig - mem_used) / orig as percentage
+            # Negative values indicate allocator overhead exceeds space savings
+            # This can happen with small data sizes or high-overhead allocators
+            if orig_size > 0:
+                efficiency = ((orig_size - mem_used) / orig_size) * 100
+                results['efficiency_pct'] = round(efficiency, 2)
+
+                if efficiency < -50:
+                    log_warn(f"High allocator overhead: {abs(efficiency):.1f}% overhead (mem_used > orig_size)")
+                    log_warn("This can occur with small test sizes or inefficient allocators")
+            else:
+                results['efficiency_pct'] = 0
+
+            log_info(f"  Compression ratio: {ratio:.2f}x")
+            log_info(f"  Space efficiency: {results['efficiency_pct']:.1f}%")
+            log_info(f"  Memory saved: {results['orig_size_mb'] - results['mem_used_mb']:.2f} MB")
+
+        elif os.path.exists('/sys/block/zram0/mm_stat'):
+            # Fallback: if sampling failed for some reason, read the current value.
+            # This may under-report activity if mem_pressure already freed memory.
+            stats = run_command('cat /sys/block/zram0/mm_stat', check=False).split()
+            log_debug_ts(f"Raw mm_stat (fallback): {' '.join(stats)}")
         
         results['duration_sec'] = round(duration, 2)
         
@@ -1117,6 +1427,25 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         elapsed = time.time() - start_time
         log_error(f"Test failed after {elapsed:.1f}s")
     finally:
+        # Restore sysctls/swaps before tearing down zram.
+        if prior_swappiness is not None:
+            set_sysctl_int('vm.swappiness', prior_swappiness)
+        if prior_swaps is not None:
+            restore_swaps(prior_swaps)
+
+        if prior_zswap_enabled is not None and os.path.exists('/sys/module/zswap/parameters/enabled'):
+            try:
+                # Normalize to Y/N if possible.
+                restore_val = prior_zswap_enabled.strip()
+                if restore_val == '1':
+                    restore_val = 'Y'
+                if restore_val == '0':
+                    restore_val = 'N'
+                with open('/sys/module/zswap/parameters/enabled', 'w') as f:
+                    f.write(f"{restore_val}\n")
+            except Exception:
+                pass
+
         # Cleanup mem_locker if it was started
         if mem_locker_proc is not None:
             try:
@@ -1133,6 +1462,19 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
         
         # Cleanup swap
         cleanup_zram_aggressive()
+
+        # Disable guard swapfile if we enabled it for the test.
+        if guard_swap_path:
+            try:
+                guard_swap_used_end_kb = _read_proc_swaps_used_kb(guard_swap_path)
+                results['guard_swap_path'] = guard_swap_path
+                results['guard_swap_used_kb_start'] = int(guard_swap_used_start_kb)
+                results['guard_swap_used_kb_end'] = int(guard_swap_used_end_kb)
+                results['guard_swap_used_kb_delta'] = int(max(0, guard_swap_used_end_kb - guard_swap_used_start_kb))
+                results['zram_mem_limit_mb'] = int(zram_mem_limit_mb)
+            except Exception:
+                pass
+            disable_guard_swapfile(guard_swap_path)
     
     return results
 
@@ -1499,15 +1841,17 @@ bs={block_size}k
         recommended_cluster = block_to_cluster.get(best_combined['block_size_kb'], 3)
         results['optimal']['recommended_page_cluster'] = recommended_cluster
         
-        # Use max successfully tested concurrency (not 16 if it failed)
-        # Filter out results with errors
+        # Stripe width recommendation should match the best observed configuration.
+        # Keep max_successful as a diagnostic upper bound.
         valid_results = [r for r in results['matrix'] if 'error' not in r]
         max_successful = max([r['concurrency'] for r in valid_results]) if valid_results else 1
-        results['optimal']['recommended_swap_stripe_width'] = max_successful
+        results['optimal']['recommended_swap_stripe_width'] = int(best_combined['concurrency'])
+        results['optimal']['max_tested_swap_stripe_width'] = int(max_successful)
         
         log_info(f"Recommended settings:")
         log_info(f"  SWAP_PAGE_CLUSTER={recommended_cluster} (for {best_combined['block_size_kb']}KB blocks)")
-        log_info(f"  SWAP_STRIPE_WIDTH={max_successful} (max tested successfully)")
+        log_info(f"  SWAP_STRIPE_WIDTH={results['optimal']['recommended_swap_stripe_width']} (best combined throughput)")
+        log_info(f"  (Max tested successfully: {max_successful})")
     
     # Cleanup
     if os.path.exists(test_dir):
@@ -2991,9 +3335,11 @@ def export_shell_config(results, output_file):
                 # ZSWAP is a RAM cache - no seek cost, readahead wastes bandwidth
                 # ALWAYS use page-cluster=0 for ZSWAP systems (see chat-merged.md section 2.2)
                 cluster_zswap = 0
-                
-                f.write(f"# Matrix test result: {best_matrix.get('block_size_kb')}KB "
-                       f"× {best_matrix.get('num_jobs')} jobs\n")
+
+                f.write(
+                    f"# Matrix test result: {best_matrix.get('block_size_kb')}KB "
+                    f"× {best_matrix.get('concurrency')} jobs\n"
+                )
                 f.write(f"# Disk I/O throughput: "
                        f"{best_matrix.get('write_mb_per_sec', 0) + best_matrix.get('read_mb_per_sec', 0):.0f} MB/s\n")
                 f.write(f"# Optimal DISK page-cluster: {cluster_disk_optimal} ({best_matrix.get('block_size_kb')}KB blocks)\n")
@@ -3020,23 +3366,44 @@ def export_shell_config(results, output_file):
             f.write(f"# Optimal page-cluster value: vm.page-cluster={cluster}\n")
             f.write(f"SWAP_PAGE_CLUSTER={cluster}\n\n")
         
-        # Find best compressor
+        # Find best compressor (ignore failed/unreliable runs)
         if 'compressors' in results and results['compressors']:
-            best_comp = max(results['compressors'], 
-                          key=lambda x: x.get('compression_ratio', 0))
-            f.write(f"# Best compressor: {best_comp['compressor']}\n")
-            f.write(f"# (Compression ratio: {best_comp.get('compression_ratio', 0)}x)\n")
-            f.write(f"ZSWAP_COMPRESSOR={best_comp['compressor']}\n")
-            f.write(f"ZRAM_COMPRESSOR={best_comp['compressor']}\n\n")
+            candidates = [
+                r for r in results['compressors']
+                if isinstance(r, dict)
+                and 'error' not in r
+                and r.get('reliable', True)
+                and isinstance(r.get('compression_ratio'), (int, float))
+            ]
+            best_comp = max(candidates, key=lambda x: x.get('compression_ratio', 0), default=None)
+            if best_comp:
+                f.write(f"# Best compressor: {best_comp['compressor']}\n")
+                f.write(f"# (Compression ratio: {best_comp.get('compression_ratio', 0)}x)\n")
+                f.write(f"ZSWAP_COMPRESSOR={best_comp['compressor']}\n")
+                f.write(f"ZRAM_COMPRESSOR={best_comp['compressor']}\n\n")
+            else:
+                f.write("# Compressor benchmarks were unreliable; using safe default\n")
+                f.write("ZSWAP_COMPRESSOR=lz4\n")
+                f.write("ZRAM_COMPRESSOR=lz4\n\n")
         
-        # Best allocator (note: prefer zbud for ZSWAP per chat-merged.md)
+        # Best allocator (ignore failed/unreliable runs)
         if 'allocators' in results and results['allocators']:
-            best_alloc = max(results['allocators'], 
-                           key=lambda x: x.get('efficiency_pct', 0))
-            f.write(f"# Best allocator: {best_alloc['allocator']}\n")
-            f.write(f"# (Efficiency: {best_alloc.get('efficiency_pct', 0)}%)\n")
-            f.write(f"# NOTE: zbud often works better with ZSWAP (z3fold can fail to load)\n")
-            f.write(f"ZRAM_ALLOCATOR={best_alloc['allocator']}\n\n")
+            candidates = [
+                r for r in results['allocators']
+                if isinstance(r, dict)
+                and 'error' not in r
+                and r.get('reliable', True)
+                and isinstance(r.get('efficiency_pct'), (int, float))
+            ]
+            best_alloc = max(candidates, key=lambda x: x.get('efficiency_pct', 0), default=None)
+            if best_alloc:
+                f.write(f"# Best allocator: {best_alloc['allocator']}\n")
+                f.write(f"# (Efficiency: {best_alloc.get('efficiency_pct', 0)}%)\n")
+                f.write(f"# NOTE: zbud often works better with ZSWAP (z3fold can fail to load)\n")
+                f.write(f"ZRAM_ALLOCATOR={best_alloc['allocator']}\n\n")
+            else:
+                f.write("# Allocator benchmarks were unreliable; using safe default\n")
+                f.write("ZRAM_ALLOCATOR=zsmalloc\n\n")
         
         # Optimal stripe width
         # Prefer matrix-derived concurrency (modern path) over deprecated standalone concurrency test.
@@ -3097,9 +3464,21 @@ def generate_benchmark_summary_report(results, output_file):
         f.write("OPTIMAL CONFIGURATION\n")
         f.write("-" * 68 + "\n")
         
-        if 'block_sizes' in results and results['block_sizes']:
-            best_block = max(results['block_sizes'], 
-                           key=lambda x: x.get('read_mb_per_sec', 0) + x.get('write_mb_per_sec', 0))
+        # Prefer matrix-derived block size (modern path)
+        matrix_opt = None
+        if isinstance(results.get('matrix'), dict):
+            matrix_opt = (results['matrix'].get('optimal') or {})
+
+        if isinstance(matrix_opt, dict) and isinstance((matrix_opt.get('best_combined') or {}).get('block_size_kb'), int):
+            best = matrix_opt['best_combined']
+            block_to_cluster = {4: 0, 8: 1, 16: 2, 32: 3, 64: 4, 128: 5}
+            cluster = block_to_cluster.get(best['block_size_kb'], 3)
+            f.write(f"✓ Page Cluster:        {cluster} ({best['block_size_kb']}KB blocks; matrix best)\n")
+        elif 'block_sizes' in results and results['block_sizes']:
+            best_block = max(
+                results['block_sizes'],
+                key=lambda x: x.get('read_mb_per_sec', 0) + x.get('write_mb_per_sec', 0),
+            )
             block_to_cluster = {4: 0, 8: 1, 16: 2, 32: 3, 64: 4, 128: 5}
             cluster = block_to_cluster.get(best_block['block_size_kb'], 3)
             f.write(f"✓ Page Cluster:        {cluster} ({best_block['block_size_kb']}KB blocks)\n")
@@ -3116,11 +3495,16 @@ def generate_benchmark_summary_report(results, output_file):
             f.write(f"✓ Allocator:           {best_alloc['allocator']} ")
             f.write(f"({best_alloc.get('efficiency_pct', 0):.1f}% efficiency)\n")
         
-        if 'concurrency' in results and results['concurrency']:
-            best_concur = max(results['concurrency'], 
-                            key=lambda x: x.get('write_mb_per_sec', 0) + x.get('read_mb_per_sec', 0))
-            f.write(f"✓ Stripe Width:        {best_concur['num_files']} devices ")
-            f.write(f"(optimal concurrency)\n")
+        # Prefer matrix-derived stripe width
+        if isinstance(matrix_opt, dict) and isinstance((matrix_opt.get('best_combined') or {}).get('concurrency'), int):
+            stripe = matrix_opt['best_combined']['concurrency']
+            f.write(f"✓ Stripe Width:        {stripe} devices (matrix best)\n")
+        elif 'concurrency' in results and results['concurrency']:
+            best_concur = max(
+                results['concurrency'],
+                key=lambda x: x.get('write_mb_per_sec', 0) + x.get('read_mb_per_sec', 0),
+            )
+            f.write(f"✓ Stripe Width:        {best_concur['num_files']} devices (deprecated test)\n")
         
         f.write("\n")
         
@@ -3246,10 +3630,24 @@ def generate_swap_config_report(results, output_file):
         f.write(f"RAM Swap:        {int(ram_gb * 0.5)}GB (50% of RAM)\n")
         f.write(f"Disk Swap:       {int(ram_gb * 1.0)}GB (overflow protection)\n")
         
-        if 'concurrency' in results and results['concurrency']:
-            best_concur = max(results['concurrency'], 
-                            key=lambda x: x.get('write_mb_per_sec', 0) + x.get('read_mb_per_sec', 0))
-            f.write(f"Stripe Width:    {best_concur['num_files']} devices\n")
+        # Prefer matrix-derived stripe width
+        stripe_width = None
+        if isinstance(results.get('matrix'), dict):
+            matrix_opt = (results['matrix'].get('optimal') or {})
+            if isinstance(matrix_opt, dict):
+                for k in ('best_combined', 'best_read', 'best_write'):
+                    v = (matrix_opt.get(k) or {}).get('concurrency')
+                    if isinstance(v, int) and v > 0:
+                        stripe_width = v
+                        break
+        if stripe_width is None and 'concurrency' in results and results['concurrency']:
+            best_concur = max(
+                results['concurrency'],
+                key=lambda x: x.get('write_mb_per_sec', 0) + x.get('read_mb_per_sec', 0),
+            )
+            stripe_width = best_concur.get('num_files')
+        if stripe_width:
+            f.write(f"Stripe Width:    {stripe_width} devices\n")
         
         f.write("\n")
         
@@ -3265,15 +3663,13 @@ def generate_swap_config_report(results, output_file):
         
         f.write("• Disk backing required: Prevents OOM situations\n")
         
-        if 'concurrency' in results and results['concurrency']:
-            best_concur = max(results['concurrency'], 
-                            key=lambda x: x.get('write_mb_per_sec', 0) + x.get('read_mb_per_sec', 0))
+        if stripe_width:
             cpu_cores = system_info.get('cpu_cores', 4)
-            f.write(f"• {best_concur['num_files']} swap files: ")
-            if best_concur['num_files'] >= cpu_cores:
-                f.write(f"Matches/exceeds CPU core count for parallelism\n")
+            f.write(f"• {stripe_width} swap devices: ")
+            if stripe_width >= cpu_cores:
+                f.write("Matches/exceeds CPU core count for parallelism\n")
             else:
-                f.write(f"Optimal for this workload\n")
+                f.write("Optimal for this workload\n")
         
         f.write("\n")
         
@@ -4034,6 +4430,38 @@ def format_benchmark_html(results):
     if 'system_info' in results:
         sysinfo = results['system_info']
         html += f"<b>💻 System:</b> {sysinfo.get('ram_gb', 'N/A')}GB RAM, {sysinfo.get('cpu_cores', 'N/A')} CPU cores\n\n"
+
+    # Extra observability when DEBUG=1
+    if _debug_enabled():
+        try:
+            stages = []
+            if results.get('block_sizes'):
+                stages.append(f"block_sizes={len(results.get('block_sizes') or [])}")
+            if results.get('compressors'):
+                stages.append(f"compressors={len(results.get('compressors') or [])}")
+            if results.get('allocators'):
+                stages.append(f"allocators={len(results.get('allocators') or [])}")
+            if results.get('concurrency'):
+                stages.append(f"concurrency={len(results.get('concurrency') or [])}")
+            if isinstance(results.get('matrix'), dict):
+                stages.append("matrix=yes")
+            if isinstance(results.get('zswap_latency'), dict):
+                stages.append("zswap_latency=yes")
+
+            html += "<b>Debug</b>\n"
+            if stages:
+                html += f"Stages: {', '.join(stages)}\n"
+            html += "Env:\n"
+            html += f"  DEBUG={os.environ.get('DEBUG','')}\n"
+            html += f"  BENCHMARK_PATTERNS={os.environ.get('BENCHMARK_PATTERNS','')}\n"
+            html += f"  BENCHMARK_GUARD_SWAP={os.environ.get('BENCHMARK_GUARD_SWAP','yes')}\n"
+            html += f"  BENCHMARK_GUARD_SWAP_MB={os.environ.get('BENCHMARK_GUARD_SWAP_MB', str(DEFAULT_GUARD_SWAP_MB))}\n"
+            html += f"  BENCHMARK_GUARD_SWAP_PRIO={os.environ.get('BENCHMARK_GUARD_SWAP_PRIO', str(DEFAULT_GUARD_SWAP_PRIO))}\n"
+            html += f"  BENCHMARK_ZRAM_MEM_LIMIT_MB={os.environ.get('BENCHMARK_ZRAM_MEM_LIMIT_MB','')}\n"
+            html += f"  BENCHMARK_ZRAM_MEM_LIMIT_MB_RANDOM={os.environ.get('BENCHMARK_ZRAM_MEM_LIMIT_MB_RANDOM','')}\n"
+            html += "\n"
+        except Exception:
+            pass
     
     # Block size tests with visual bar chart
     if 'block_sizes' in results and results['block_sizes']:
@@ -4118,6 +4546,17 @@ def format_benchmark_html(results):
             is_best = ratio == max_ratio
             marker = " ⭐" if is_best else ""
             html += f"  {name:8s}: {bar} {ratio:.1f}x ratio, {eff:+.0f}% eff{marker}\n"
+            if _debug_enabled():
+                try:
+                    html += (
+                        "    "
+                        + f"swap_activity_mb={comp.get('swap_activity_mb','')} "
+                        + f"zram_disksize_mb={comp.get('zram_disksize_mb','')} "
+                        + f"zram_mem_limit_mb={comp.get('zram_mem_limit_mb','')} "
+                        + f"guard_swap_delta_kb={comp.get('guard_swap_used_kb_delta','')}\n"
+                    )
+                except Exception:
+                    pass
         html += "\n"
     
     # Allocator comparison
@@ -4155,6 +4594,17 @@ def format_benchmark_html(results):
                 diff_str = f" ({diff_pct:+.0f}% vs best)"
             
             html += f"  {name:8s}: {bar} {ratio:.1f}x ratio, {eff:+.0f}% eff{diff_str}{marker}\n"
+            if _debug_enabled():
+                try:
+                    html += (
+                        "    "
+                        + f"swap_activity_mb={alloc.get('swap_activity_mb','')} "
+                        + f"zram_disksize_mb={alloc.get('zram_disksize_mb','')} "
+                        + f"zram_mem_limit_mb={alloc.get('zram_mem_limit_mb','')} "
+                        + f"guard_swap_delta_kb={alloc.get('guard_swap_used_kb_delta','')}\n"
+                    )
+                except Exception:
+                    pass
         html += "\n"
     
     # Concurrency tests with scaling chart
@@ -4626,8 +5076,13 @@ Examples:
     
     if args.test_all or args.test_allocators:
         allocators = ['zsmalloc', 'z3fold', 'zbud']
-        data_patterns = 4  # mixed, random, zeros, sequential
-        total_tests += len(allocators) * data_patterns
+        data_patterns = _filter_patterns([
+            (0, 'mixed'),
+            (1, 'random'),
+            (2, 'zeros'),
+            (3, 'sequential'),
+        ])
+        total_tests += len(allocators) * len(data_patterns)
     
     if not args.test_all and args.test_concurrency:
         # Only run if explicitly requested with --test-concurrency (deprecated path)
@@ -4651,7 +5106,9 @@ Examples:
     results = {
         'system_info': system_info,
         'timestamp': datetime.now().isoformat(),
-        'compression_test_size_mb': compression_test_size
+        'compression_test_size_mb': compression_test_size,
+        'default_data_pattern': 'mixed',
+        'default_data_pattern_description': 'mixed (default; some compressible, some not)'
     }
     
     # Track current test number
@@ -4687,6 +5144,7 @@ Examples:
                     comp, 
                     'zsmalloc', 
                     size_mb=compression_test_size,
+                    pattern=0,
                     test_num=current_test,
                     total_tests=total_tests
                 )
@@ -4696,12 +5154,12 @@ Examples:
     
     if args.test_all or args.test_allocators:
         allocators = ['zsmalloc', 'z3fold', 'zbud']
-        data_patterns = [
+        data_patterns = _filter_patterns([
             (0, 'mixed'),
             (1, 'random'),
             (2, 'zeros'),
             (3, 'sequential')
-        ]
+        ])
         results['allocators'] = []
         
         log_info(f"Testing {len(allocators)} allocators with {len(data_patterns)} data patterns each ({len(allocators) * len(data_patterns)} total tests)")

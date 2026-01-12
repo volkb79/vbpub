@@ -66,13 +66,17 @@ void print_timestamp() {
     fprintf(stderr, "%s", buffer);
 }
 
-// Fast random number generator (LCG)
-// Note: Uses fixed seed for reproducible benchmark results
-// This is intentional for consistent testing, not for security purposes
-static unsigned long rand_state = 12345;
-static inline unsigned char fast_rand() {
-    rand_state = (rand_state * 1103515245 + 12345) & 0x7fffffff;
-    return (unsigned char)(rand_state & 0xFF);
+// Fast pseudo-random number generator (xorshift32)
+// Note: Uses fixed seed for reproducible benchmark results.
+// This is intentional for consistent testing, not for security purposes.
+static uint32_t rand_state = 0x12345678u;
+static inline uint32_t fast_rand32(void) {
+    uint32_t x = rand_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    rand_state = x;
+    return x;
 }
 
 void fill_pattern(char *buffer, size_t size, int pattern_type, size_t offset) {
@@ -80,8 +84,15 @@ void fill_pattern(char *buffer, size_t size, int pattern_type, size_t offset) {
     
     switch (pattern_type) {
         case 1: // Random - low compression
-            for (i = 0; i < size; i++) {
-                buffer[i] = fast_rand();
+            {
+                size_t words = size / sizeof(uint32_t);
+                uint32_t *p32 = (uint32_t *)buffer;
+                for (size_t w = 0; w < words; w++) {
+                    p32[w] = fast_rand32();
+                }
+                for (i = words * sizeof(uint32_t); i < size; i++) {
+                    buffer[i] = (unsigned char)(fast_rand32() & 0xFF);
+                }
             }
             break;
             
@@ -104,8 +115,15 @@ void fill_pattern(char *buffer, size_t size, int pattern_type, size_t offset) {
                 
                 switch (subpattern) {
                     case 0: // Random bytes (low compression)
-                        for (size_t j = 0; j < chunk_size; j++) {
-                            buffer[i + j] = fast_rand();
+                        {
+                            size_t words = chunk_size / sizeof(uint32_t);
+                            uint32_t *p32 = (uint32_t *)(buffer + i);
+                            for (size_t w = 0; w < words; w++) {
+                                p32[w] = fast_rand32();
+                            }
+                            for (size_t j = words * sizeof(uint32_t); j < chunk_size; j++) {
+                                buffer[i + j] = (unsigned char)(fast_rand32() & 0xFF);
+                            }
                         }
                         break;
                     case 1: // Repeated pattern (medium compression)

@@ -433,13 +433,9 @@ def _find_active_task_for_server(client: "NetcupSCPClient", server_id: int) -> O
 
 
 def _build_ssh_cmd_base(host: str, user: str, identity_file: Optional[str] = None) -> List[str]:
-    if not identity_file:
-        raise ValueError("ssh identity_file is required (refusing to use default ssh identities)")
-
     cmd = [
         "ssh",
         "-o", "BatchMode=yes",
-        "-o", "IdentitiesOnly=yes",
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "ConnectTimeout=5",
@@ -447,7 +443,9 @@ def _build_ssh_cmd_base(host: str, user: str, identity_file: Optional[str] = Non
         "-o", "ServerAliveCountMax=3",
         "-o", "LogLevel=ERROR",
     ]
-    cmd += ["-i", identity_file]
+    if identity_file:
+        cmd += ["-o", "IdentitiesOnly=yes"]
+        cmd += ["-i", identity_file]
     cmd.append(f"{user}@{host}")
     return cmd
 
@@ -694,9 +692,9 @@ def monitor_task(
     print(f"Monitor capture: {monitor_log_path}")
 
     if attach_bootstrap and not ssh_identity_file:
-        raise ValueError(
-            "--ssh-identity-file (or $NETCUP_SSH_IDENTITY_FILE) is required when attach_bootstrap is enabled; "
-            "refusing to use default ssh identities"
+        print(
+            "[attach] NOTE: no --ssh-identity-file provided; attempting SSH attach using default ssh identities/agent. "
+            "For deterministic behavior, pass --ssh-identity-file (or set NETCUP_SSH_IDENTITY_FILE)."
         )
 
     # Start attach early (about 10s after installation kickoff) and retry until SSH becomes usable.
