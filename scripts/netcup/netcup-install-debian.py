@@ -213,6 +213,10 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 INSTALLATION_CONFIG = {
     "locale": "en_US.UTF-8",
     "timezone": "Europe/Berlin",
+    # IMPORTANT: Do NOT trigger reboots from our bootstrap logic during cloud-init.
+    # Netcup/cloud-init owns the reboot after the post-install/customScript finishes.
+    # Stage1 should prepare the system and schedule stage2 (systemd unit + marker gating),
+    # then cloud-init's normal reboot will bring the machine back and stage2 will run.
     "customScript":  f"curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | DEBUG_MODE=yes BOOTSTRAP_STAGE=stage1 AUTO_REBOOT_AFTER_STAGE1=no NEVER_REBOOT=yes TELEGRAM_BOT_TOKEN={TELEGRAM_BOT_TOKEN} TELEGRAM_CHAT_ID={TELEGRAM_CHAT_ID} bash",
     "rootPartitionFullDiskSize": True,
     "sshPasswordAuthentication": False,
@@ -370,6 +374,90 @@ def _tcp_port_open(host: str, port: int = 22, timeout: float = 2.0) -> bool:
             return True
     except OSError:
         return False
+
+
+def _wait_for_stage2_done(
+    *,
+    host: str,
+    user: str,
+    identity_file: Optional[str],
+    poll_interval: float,
+    max_wait_seconds: float,
+    monitor_log_path: Path,
+) -> None:
+    """Wait for vbpub stage2 completion on the newly installed host.
+
+    Uses a marker file written by bootstrap stage2:
+      /var/lib/vbpub/bootstrap/stage2_done
+
+    Handles reboots/disconnects by retrying SSH.
+    """
+
+    start = time.monotonic()
+    poll = max(1.0, float(poll_interval))
+
+    def _emit(line: str) -> None:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        out = f"[{now}] [stage2-wait] {line}"
+        print(out)
+        try:
+            with open(monitor_log_path, "a", encoding="utf-8") as mf:
+                mf.write(out + "\n")
+        except Exception:
+            pass
+
+    _emit(f"Waiting for stage2 completion marker on {user}@{host} (timeout {max_wait_seconds:.0f}s)")
+
+    last_status = None
+    while True:
+        if (time.monotonic() - start) > max_wait_seconds:
+            raise TimeoutError(f"Timed out waiting for stage2_done after {max_wait_seconds:.0f}s")
+
+        if not _tcp_port_open(host, 22, timeout=2.0):
+            time.sleep(poll)
+            continue
+
+        cmd = (
+            "bash -lc 'set -euo pipefail; "
+            "S=/var/lib/vbpub/bootstrap/stage2_done; "
+            "if [ -f \"$S\" ]; then echo STAGE2_DONE; else echo STAGE2_NOT_DONE; fi; "
+            "if command -v systemctl >/dev/null 2>&1; then "
+            "  systemctl is-active vbpub-bootstrap-stage2.service 2>/dev/null || true; "
+            "  systemctl show -p ActiveState -p SubState -p Result vbpub-bootstrap-stage2.service 2>/dev/null || true; "
+            "fi'"
+        )
+
+        cmd_ssh = _build_ssh_cmd_base(host, user, identity_file) + [cmd]
+        try:
+            r = subprocess.run(cmd_ssh, text=True, capture_output=True, timeout=15)
+        except Exception as e:
+            status = f"ssh-error: {type(e).__name__}: {e}"
+            if status != last_status:
+                _emit(status)
+                last_status = status
+            time.sleep(poll)
+            continue
+
+        out = (r.stdout or "").strip()
+        err = (r.stderr or "").strip()
+        status = f"ssh-exit={r.returncode}"
+        if err:
+            status += f" err={err.splitlines()[-1]}"
+
+        if out:
+            # Keep the output small; it can be multi-line.
+            summary = out.splitlines()[:6]
+            status += " out=" + " | ".join(summary)
+
+        if status != last_status:
+            _emit(status)
+            last_status = status
+
+        if r.returncode == 0 and "STAGE2_DONE" in out:
+            _emit("Stage2 completion marker present (stage2_done).")
+            return
+
+        time.sleep(poll)
 
 
 _TASK_TERMINAL_STATES = {"FINISHED", "ERROR", "CANCELED", "ROLLBACK"}
@@ -778,6 +866,23 @@ def monitor_task(
             last_progress = progress
 
         if state in ("FINISHED", "ERROR", "CANCELED", "ROLLBACK"):
+            # If the SCP task finished successfully, stage2 may still be running after the reboot.
+            # Keep SSH attach alive and explicitly wait for the stage2_done marker.
+            if state == "FINISHED" and ssh_host and attach_bootstrap:
+                try:
+                    _wait_for_stage2_done(
+                        host=ssh_host,
+                        user=ssh_user,
+                        identity_file=ssh_identity_file,
+                        poll_interval=poll_interval,
+                        max_wait_seconds=60 * 60,  # 60 minutes
+                        monitor_log_path=monitor_log_path,
+                    )
+                    task["vbpub_stage2_done"] = True
+                except Exception as e:
+                    task["vbpub_stage2_done"] = False
+                    task["vbpub_stage2_wait_error"] = str(e)
+
             if follower:
                 follower.stop()
             # Print responseError if present
@@ -950,6 +1055,19 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
     print("✓ Payload loaded successfully")
     print()
 
+    # Allow safe payload files that contain placeholders instead of secrets.
+    # Supported placeholders:
+    #   {{TELEGRAM_BOT_TOKEN}}, {{TELEGRAM_CHAT_ID}}, {{SERVER_NAME}}
+    try:
+        cs = installation_payload.get("customScript")
+        if isinstance(cs, str) and "{{" in cs and "}}" in cs:
+            cs = cs.replace("{{TELEGRAM_BOT_TOKEN}}", os.environ.get("TELEGRAM_BOT_TOKEN", ""))
+            cs = cs.replace("{{TELEGRAM_CHAT_ID}}", os.environ.get("TELEGRAM_CHAT_ID", ""))
+            cs = cs.replace("{{SERVER_NAME}}", os.environ.get("SERVER_NAME", ""))
+            installation_payload["customScript"] = cs
+    except Exception:
+        pass
+
     # If an SSH identity file was provided for monitoring, ensure the same key is injected
     # by selecting/creating the matching sshKeyId in the SCP account.
     ssh_identity = getattr(args, "ssh_identity_file", None)
@@ -999,7 +1117,7 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
     print("=" * 70)
     print("PAYLOAD SUMMARY")
     print("=" * 70)
-    print(json.dumps(installation_payload, indent=2))
+    print(json.dumps(_redact_for_log(installation_payload), indent=2))
     print()
     
     # Ask for confirmation (unless non-interactive)
