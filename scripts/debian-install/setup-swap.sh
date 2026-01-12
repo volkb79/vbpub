@@ -906,10 +906,31 @@ enable_existing_swap_partitions() {
 
     local swap_gpt_guid="0657fd6d-a4ab-43c4-84e5-0933c84b4f4f"
 
-    # First pass: initialize any partitions marked as GPT-swap but not yet formatted.
-    while IFS= read -r part; do
+    # Discover GPT swap partitions in stable order.
+    local max_parts=0
+    if [[ "${SWAP_STRIPE_WIDTH:-}" =~ ^[0-9]+$ ]] && [ "${SWAP_STRIPE_WIDTH:-0}" -gt 0 ]; then
+        max_parts="$SWAP_STRIPE_WIDTH"
+    fi
+
+    mapfile -t swap_parts < <(
+        lsblk -rno PATH,TYPE,PARTTYPE | \
+            awk -v g="$swap_gpt_guid" '$2=="part" {pt=tolower($3); if (pt==g) print $1}' | \
+            sort -V
+    )
+
+    if [ "${#swap_parts[@]}" -eq 0 ]; then
+        return 1
+    fi
+    found=1
+
+    if [ "$max_parts" -gt 0 ] && [ "${#swap_parts[@]}" -gt "$max_parts" ]; then
+        log_info "Limiting activation to SWAP_STRIPE_WIDTH=$max_parts (found ${#swap_parts[@]} GPT swap partitions)"
+        swap_parts=("${swap_parts[@]:0:$max_parts}")
+    fi
+
+    # Initialize and activate only the selected partitions.
+    for part in "${swap_parts[@]}"; do
         [[ -z "$part" ]] && continue
-        found=1
 
         local type
         type=$(blkid -s TYPE -o value "$part" 2>/dev/null || true)
@@ -920,15 +941,6 @@ enable_existing_swap_partitions() {
                 continue
             }
         fi
-    done < <(
-        lsblk -rno PATH,TYPE,PARTTYPE | \
-            awk -v g="$swap_gpt_guid" '$2=="part" {pt=tolower($3); if (pt==g) print $1}'
-    )
-
-    # Second pass: activate swap partitions (by FSTYPE=swap) and persist in fstab.
-    while IFS= read -r part; do
-        [[ -z "$part" ]] && continue
-        found=1
 
         if ! swapon --noheadings --show=NAME 2>/dev/null | awk '{print $1}' | grep -qx "$part"; then
             log_info "Enabling existing swap partition: $part"
@@ -949,7 +961,7 @@ enable_existing_swap_partitions() {
                 echo "${part} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
             fi
         fi
-    done < <(lsblk -rno PATH,TYPE,FSTYPE | awk '$2=="part" && $3=="swap" {print $1}')
+    done
 
     [[ "$found" -eq 1 ]]
 }

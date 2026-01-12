@@ -167,6 +167,7 @@ import glob
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -227,6 +228,9 @@ COMPRESSION_TEST_TIMEOUT_SEC = 180  # Maximum time per compression test (3 minut
 # FIO test configuration constants
 FIO_TEST_FILE_SIZE = '1G'  # Test file size for fio benchmarks
 
+# GPT partition type GUID for Linux swap (used by create-swap-partitions.sh and setup-swap.sh)
+SWAP_GPT_GUID = '0657fd6d-a4ab-43c4-84e5-0933c84b4f4f'
+
 # System RAM tier thresholds for auto-detection
 RAM_TIER_LOW_GB = 4    # Systems below this use ZRAM
 RAM_TIER_HIGH_GB = 16  # Systems above this use ZSWAP (but so do medium tier)
@@ -257,6 +261,60 @@ def log_debug_ts(msg):
 def log_success_ts(msg):
     """Log success message with timestamp"""
     print(f"{Colors.GREEN}[SUCCESS]{Colors.NC} {format_timestamp()} {msg}", flush=True)
+
+
+def _append_warning(results: dict, msg: str) -> None:
+    """Attach a warning to a result dict without clobbering existing warnings."""
+    if not msg:
+        return
+
+    try:
+        warnings = results.get('warnings')
+        if isinstance(warnings, list):
+            warnings.append(msg)
+            return
+        if warnings is None:
+            results['warnings'] = [msg]
+            return
+    except Exception:
+        pass
+
+    prev = results.get('warning')
+    if isinstance(prev, str) and prev.strip():
+        results['warning'] = f"{prev.strip()}; {msg}"
+    else:
+        results['warning'] = msg
+
+
+def recommend_swap_stripe_width(cpu_cores: int | None, disk_swap_total_gb: int | None = None) -> int:
+    """Heuristic for swap striping width (number of parallel swap devices).
+
+    IMPORTANT: This is *not* derived from fio numjobs. fio's numjobs represents I/O concurrency
+    against a single target file, not the number of swap devices.
+
+    Mirrors the default policy in setup-swap.sh.
+    """
+    cores = int(cpu_cores or 0)
+    if cores >= 16:
+        width = 16
+    elif cores >= 8:
+        width = 8
+    elif cores >= 4:
+        width = 4
+    else:
+        width = 2
+
+    if disk_swap_total_gb is not None:
+        try:
+            cap = int(disk_swap_total_gb)
+            if cap > 0 and width > cap:
+                width = cap
+        except Exception:
+            pass
+
+    if width < 1:
+        width = 1
+    return int(width)
 
 
 def log_info(msg):
@@ -615,6 +673,12 @@ def set_sysctl_int(name, value):
 def get_system_info():
     """Get system information"""
     info = {}
+
+    # Hostname
+    try:
+        info['hostname'] = socket.gethostname() or 'unknown'
+    except Exception:
+        info['hostname'] = 'unknown'
     
     # RAM
     with open('/proc/meminfo') as f:
@@ -639,6 +703,19 @@ def get_system_info():
     
     # CPU
     info['cpu_cores'] = os.cpu_count()
+
+    # CPU model
+    try:
+        cpu_model = None
+        with open('/proc/cpuinfo', 'r') as f:
+            for line in f:
+                if line.lower().startswith('model name'):
+                    cpu_model = line.split(':', 1)[1].strip()
+                    break
+        if cpu_model:
+            info['cpu_model'] = cpu_model
+    except Exception:
+        pass
     
     # Current page-cluster
     try:
@@ -1385,10 +1462,22 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
             results['compr_size_mb'] = round(compr_size / 1024 / 1024, 2)
             results['mem_used_mb'] = round(mem_used / 1024 / 1024, 2)
 
-            # Compression ratio: should be 1.5 - 4.0 typically
+            # Compression ratio: should be ~1.5 - 4.0 typically
             ratio = orig_size / compr_size
             if ratio < COMPRESSION_RATIO_MIN or ratio > COMPRESSION_RATIO_SUSPICIOUS:
-                log_warn(f"Suspicious compression ratio: {ratio:.2f}x (expected {COMPRESSION_RATIO_MIN}-{COMPRESSION_RATIO_MAX}x for typical data)")
+                msg = (
+                    f"Suspicious compression ratio: {ratio:.2f}x "
+                    f"(expected {COMPRESSION_RATIO_MIN}-{COMPRESSION_RATIO_MAX}x for typical data)"
+                )
+                log_warn(msg)
+                _append_warning(results, msg)
+            elif ratio > COMPRESSION_RATIO_MAX:
+                msg = (
+                    f"High compression ratio: {ratio:.2f}x "
+                    f"(above typical {COMPRESSION_RATIO_MAX}x; workload may be unusually compressible)"
+                )
+                log_warn(msg)
+                _append_warning(results, msg)
 
             results['compression_ratio'] = round(ratio, 2)
 
@@ -1841,17 +1930,18 @@ bs={block_size}k
         recommended_cluster = block_to_cluster.get(best_combined['block_size_kb'], 3)
         results['optimal']['recommended_page_cluster'] = recommended_cluster
         
-        # Stripe width recommendation should match the best observed configuration.
-        # Keep max_successful as a diagnostic upper bound.
+        # IMPORTANT: fio numjobs in this matrix is I/O concurrency against a single target,
+        # not the number of swap devices.
+        # Preserve matrix "best numjobs" for diagnostics only.
         valid_results = [r for r in results['matrix'] if 'error' not in r]
-        max_successful = max([r['concurrency'] for r in valid_results]) if valid_results else 1
-        results['optimal']['recommended_swap_stripe_width'] = int(best_combined['concurrency'])
-        results['optimal']['max_tested_swap_stripe_width'] = int(max_successful)
-        
+        max_successful_numjobs = max([r['concurrency'] for r in valid_results]) if valid_results else 1
+        results['optimal']['recommended_fio_numjobs'] = int(best_combined['concurrency'])
+        results['optimal']['max_tested_fio_numjobs'] = int(max_successful_numjobs)
+
         log_info(f"Recommended settings:")
         log_info(f"  SWAP_PAGE_CLUSTER={recommended_cluster} (for {best_combined['block_size_kb']}KB blocks)")
-        log_info(f"  SWAP_STRIPE_WIDTH={results['optimal']['recommended_swap_stripe_width']} (best combined throughput)")
-        log_info(f"  (Max tested successfully: {max_successful})")
+        log_info(f"  FIO_NUMJOBS={results['optimal']['recommended_fio_numjobs']} (matrix best combined)")
+        log_info(f"  (Max fio numjobs tested successfully: {max_successful_numjobs})")
     
     # Cleanup
     if os.path.exists(test_dir):
@@ -1864,6 +1954,311 @@ bs={block_size}k
     results['elapsed_sec'] = round(elapsed, 1)
     log_info(f"✓ Matrix test completed in {elapsed:.1f}s")
     
+    return results
+
+
+def _run_cmd(args, timeout=None):
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+
+
+def discover_gpt_swap_partitions(limit=None):
+    """Discover GPT swap partitions (may be unformatted) in stable order."""
+    try:
+        proc = _run_cmd(['lsblk', '-rno', 'PATH,TYPE,PARTTYPE'], timeout=10)
+        if proc.returncode != 0:
+            return []
+        parts = []
+        for line in (proc.stdout or '').splitlines():
+            fields = line.strip().split(None, 2)
+            if len(fields) != 3:
+                continue
+            path, typ, parttype = fields
+            if typ != 'part':
+                continue
+            if (parttype or '').strip().lower() == SWAP_GPT_GUID:
+                parts.append(path)
+        # Stable sort: vda10 after vda2, nvme0n1p10 after p2
+        parts = sorted(parts, key=lambda s: [int(t) if t.isdigit() else t for t in __import__('re').split(r'(\d+)', s)])
+        if isinstance(limit, int) and limit > 0:
+            return parts[:limit]
+        return parts
+    except Exception:
+        return []
+
+
+def _fio_sum_bw_and_lat(data):
+    """Sum bw and compute avg mean lat (us) across fio jobs."""
+    jobs = data.get('jobs') or []
+    if not isinstance(jobs, list) or not jobs:
+        return 0.0, 0.0, 0.0, 0.0
+
+    total_read_bw_kib = 0.0
+    total_write_bw_kib = 0.0
+    read_lat_us_sum = 0.0
+    write_lat_us_sum = 0.0
+    lat_count = 0
+
+    for job in jobs:
+        read = job.get('read') or {}
+        write = job.get('write') or {}
+        total_read_bw_kib += float(read.get('bw', 0.0) or 0.0)
+        total_write_bw_kib += float(write.get('bw', 0.0) or 0.0)
+
+        rlat = (read.get('lat_ns') or {}).get('mean')
+        wlat = (write.get('lat_ns') or {}).get('mean')
+        if isinstance(rlat, (int, float)):
+            read_lat_us_sum += float(rlat) / 1000.0
+        if isinstance(wlat, (int, float)):
+            write_lat_us_sum += float(wlat) / 1000.0
+        lat_count += 1
+
+    read_mb_s = total_read_bw_kib / 1024.0
+    write_mb_s = total_write_bw_kib / 1024.0
+    read_lat_us = (read_lat_us_sum / lat_count) if lat_count else 0.0
+    write_lat_us = (write_lat_us_sum / lat_count) if lat_count else 0.0
+    return read_mb_s, write_mb_s, read_lat_us, write_lat_us
+
+
+def test_swap_partitions_stripe_matrix(
+    runtime_sec=5,
+    block_sizes=None,
+    device_counts=None,
+    numjobs_per_device_levels=None,
+    per_device_size_mb=256,
+    max_partitions=None,
+):
+    """Benchmark real swap partitions as block devices.
+
+    This matrix independently varies:
+    - device_count: number of swap partitions used (proxy for SWAP_STRIPE_WIDTH)
+    - numjobs_per_device: fio concurrency per device
+    - block_size: I/O size (proxy for vm.page-cluster)
+
+    Requires GPT-swap partitions (type GUID) already present.
+    """
+    start_time = time.time()
+
+    parts = discover_gpt_swap_partitions(limit=max_partitions)
+    if not parts:
+        return {
+            'error': 'No GPT swap partitions found (create them first via create-swap-partitions.sh)'
+        }
+
+    # Safety checks: do not run fio against mounted devices.
+    for p in parts:
+        try:
+            mp = _run_cmd(['lsblk', '-rno', 'MOUNTPOINT', p], timeout=5)
+            if (mp.stdout or '').strip():
+                return {'error': f'Refusing to benchmark mounted device: {p}'}
+        except Exception:
+            pass
+
+    # Swap I/O is typically 4K pages, with clustered reads often landing in the ~4–32K range.
+    # Default to that window unless explicitly overridden by the caller.
+    if block_sizes is None:
+        block_sizes = [4, 8, 16, 32]
+    if device_counts is None:
+        device_counts = [1, 2, 4, 8, 16]
+    if numjobs_per_device_levels is None:
+        numjobs_per_device_levels = [1, 2, 4]
+
+    max_devices_available = len(parts)
+    device_counts = [d for d in device_counts if isinstance(d, int) and 1 <= d <= max_devices_available]
+    if not device_counts:
+        device_counts = [max_devices_available]
+
+    numjobs_per_device_levels = [n for n in numjobs_per_device_levels if isinstance(n, int) and n >= 1]
+    if not numjobs_per_device_levels:
+        numjobs_per_device_levels = [1]
+
+    total_combinations = len(block_sizes) * len(device_counts) * len(numjobs_per_device_levels)
+    log_step_ts(f"Swap Partition Stripe Matrix ({total_combinations} combinations)")
+    log_info(f"Detected swap partitions: {max_devices_available}")
+    log_info(f"Device counts: {device_counts}")
+    log_info(f"Numjobs per device: {numjobs_per_device_levels}")
+    log_info(f"Block sizes: {block_sizes} KB")
+    log_info(f"Runtime per test: {runtime_sec}s")
+
+    results = {
+        'timestamp': datetime.now().isoformat(),
+        'swap_partitions': parts,
+        'runtime_sec': int(runtime_sec),
+        'per_device_size_mb': int(per_device_size_mb),
+        'fio_workload': {
+            'rw': 'randrw',
+            'rwmixread': 50,
+            'direct': 1,
+            'ioengine': 'libaio',
+            'iodepth': 32,
+            'time_based': True,
+        },
+        'block_sizes': block_sizes,
+        'device_counts': device_counts,
+        'numjobs_per_device_levels': numjobs_per_device_levels,
+        'matrix': [],
+    }
+
+    test_num = 0
+    for bs in block_sizes:
+        for dev_count in device_counts:
+            for numjobs in numjobs_per_device_levels:
+                test_num += 1
+                progress_str = f"[{test_num}/{total_combinations}]"
+                log_info_ts(f"{progress_str} Testing {dev_count} devices × {numjobs} jobs/dev @ {bs}KB...")
+
+                selected = parts[:dev_count]
+
+                fio_job_lines = [
+                    "[global]",
+                    "ioengine=libaio",
+                    "direct=1",
+                    "time_based",
+                    f"runtime={runtime_sec}",
+                    "group_reporting",
+                    "randrepeat=0",
+                    "norandommap",
+                    "iodepth=32",
+                    f"numjobs={numjobs}",
+                    f"bs={bs}k",
+                    "rw=randrw",
+                    "rwmixread=50",
+                    f"size={per_device_size_mb}m",
+                    "",
+                ]
+
+                for idx, dev in enumerate(selected, start=1):
+                    fio_job_lines.extend([
+                        f"[dev{idx}]",
+                        f"filename={dev}",
+                        "",
+                    ])
+
+                try:
+                    job_path = '/tmp/fio_swap_partitions_matrix.job'
+                    with open(job_path, 'w') as f:
+                        f.write("\n".join(fio_job_lines))
+
+                    proc = subprocess.run(
+                        ['fio', '--output-format=json', job_path],
+                        capture_output=True,
+                        text=True,
+                        timeout=300,
+                    )
+                    if proc.returncode != 0:
+                        raise subprocess.CalledProcessError(proc.returncode, 'fio', proc.stderr)
+
+                    data = json.loads(proc.stdout)
+                    read_mb_s, write_mb_s, read_lat_us, write_lat_us = _fio_sum_bw_and_lat(data)
+                    entry = {
+                        'block_size_kb': bs,
+                        'device_count': dev_count,
+                        'numjobs_per_device': numjobs,
+                        'read_mb_per_sec': round(read_mb_s, 2),
+                        'write_mb_per_sec': round(write_mb_s, 2),
+                        'combined_mb_per_sec': round(read_mb_s + write_mb_s, 2),
+                        'read_latency_us': round(read_lat_us, 2),
+                        'write_latency_us': round(write_lat_us, 2),
+                    }
+                    results['matrix'].append(entry)
+                    log_info(f"  Total: ↑{write_mb_s:.1f} ↓{read_mb_s:.1f} MB/s")
+                except subprocess.TimeoutExpired:
+                    results['matrix'].append({
+                        'block_size_kb': bs,
+                        'device_count': dev_count,
+                        'numjobs_per_device': numjobs,
+                        'error': 'Timeout after 300s',
+                        'read_mb_per_sec': 0,
+                        'write_mb_per_sec': 0,
+                        'combined_mb_per_sec': 0,
+                    })
+                except subprocess.CalledProcessError as e:
+                    stderr = (e.stderr or '')
+                    results['matrix'].append({
+                        'block_size_kb': bs,
+                        'device_count': dev_count,
+                        'numjobs_per_device': numjobs,
+                        'error': f"fio failed: {stderr[:120]}",
+                        'read_mb_per_sec': 0,
+                        'write_mb_per_sec': 0,
+                        'combined_mb_per_sec': 0,
+                    })
+                except Exception as e:
+                    results['matrix'].append({
+                        'block_size_kb': bs,
+                        'device_count': dev_count,
+                        'numjobs_per_device': numjobs,
+                        'error': str(e)[:120],
+                        'read_mb_per_sec': 0,
+                        'write_mb_per_sec': 0,
+                        'combined_mb_per_sec': 0,
+                    })
+
+    valid = [r for r in results['matrix'] if isinstance(r, dict) and 'error' not in r]
+    if valid:
+        def _latency_weighted_us(row):
+            # Reads are usually on the critical path (page faults), writes often amortize.
+            rlat = float(row.get('read_latency_us', 0) or 0)
+            wlat = float(row.get('write_latency_us', 0) or 0)
+            lat = (0.7 * rlat) + (0.3 * wlat)
+            # Guard against missing/zero values.
+            return lat if lat > 0 else 1.0
+
+        def _score(row):
+            # Higher is better: throughput per unit latency.
+            bw = float(row.get('combined_mb_per_sec', 0) or 0)
+            return bw / _latency_weighted_us(row)
+
+        # Pick the best-performing point by score, then choose the smallest device_count
+        # within 95% of best score for a pragmatic "good enough" recommendation.
+        best = max(valid, key=_score)
+        best_score = float(_score(best) or 0.0)
+
+        threshold = best_score * 0.95
+        near_best = [r for r in valid if float(_score(r) or 0.0) >= threshold]
+        chosen = min(
+            near_best,
+            key=lambda r: (int(r.get('device_count', 1)), int(r.get('numjobs_per_device', 1)), int(r.get('block_size_kb', 4)))
+        )
+
+        # Keep top-3 candidates for reporting.
+        top = sorted(
+            valid,
+            key=lambda r: (-float(_score(r) or 0.0), int(r.get('device_count', 1)), int(r.get('numjobs_per_device', 1)), int(r.get('block_size_kb', 4)))
+        )[:3]
+
+        block_to_cluster = {4: 0, 8: 1, 16: 2, 32: 3, 64: 4, 128: 5}
+        cluster = block_to_cluster.get(int(chosen.get('block_size_kb', 4)), 0)
+
+        results['optimal'] = {
+            'best_combined': chosen,
+            'top_candidates': top,
+            'best_score': round(best_score, 6),
+            'recommended_swap_stripe_width': int(chosen.get('device_count', 1)),
+            'recommended_fio_numjobs_per_device': int(chosen.get('numjobs_per_device', 1)),
+            'recommended_page_cluster': int(cluster),
+        }
+
+        log_step_ts("Swap partition stripe matrix complete")
+        try:
+            c_lat = _latency_weighted_us(chosen)
+            c_bw = float(chosen.get('combined_mb_per_sec', 0) or 0)
+            log_info(
+                "Recommended settings (latency-aware): "
+                + f"SWAP_STRIPE_WIDTH={results['optimal']['recommended_swap_stripe_width']}, "
+                + f"SWAP_PAGE_CLUSTER_DISK={results['optimal']['recommended_page_cluster']}, "
+                + f"chosen_score={_score(chosen):.4f} (mbps/us), "
+                + f"chosen_bw={c_bw:.0f} MB/s, chosen_lat~={c_lat:.1f}us"
+            )
+        except Exception:
+            log_info(
+                "Recommended settings: "
+                + f"SWAP_STRIPE_WIDTH={results['optimal']['recommended_swap_stripe_width']}, "
+                + f"FIO_NUMJOBS_PER_DEVICE={results['optimal']['recommended_fio_numjobs_per_device']}, "
+                + f"SWAP_PAGE_CLUSTER_DISK={results['optimal']['recommended_page_cluster']}"
+            )
+
+    elapsed = time.time() - start_time
+    results['elapsed_sec'] = round(elapsed, 1)
     return results
 
 def compare_memory_only():
@@ -3406,22 +3801,15 @@ def export_shell_config(results, output_file):
                 f.write("ZRAM_ALLOCATOR=zsmalloc\n\n")
         
         # Optimal stripe width
-        # Prefer matrix-derived concurrency (modern path) over deprecated standalone concurrency test.
+        # IMPORTANT: Do not derive SWAP_STRIPE_WIDTH from the single-target matrix fio numjobs.
         stripe_width = None
         try:
-            matrix_opt = None
-            if isinstance(results.get('matrix'), dict):
-                matrix_opt = (results['matrix'].get('optimal') or {})
-            if isinstance(matrix_opt, dict):
-                for k in ('best_combined', 'best_read', 'best_write'):
-                    v = (matrix_opt.get(k) or {}).get('concurrency')
-                    if isinstance(v, int) and v > 0:
-                        stripe_width = v
-                        break
-                if stripe_width is None:
-                    v = matrix_opt.get('recommended_swap_stripe_width')
-                    if isinstance(v, int) and v > 0:
-                        stripe_width = v
+            sm = results.get('swap_partitions_matrix')
+            if isinstance(sm, dict):
+                opt = sm.get('optimal') or {}
+                v = opt.get('recommended_swap_stripe_width')
+                if isinstance(v, int) and v > 0:
+                    stripe_width = v
         except Exception:
             stripe_width = None
 
@@ -3439,6 +3827,10 @@ def export_shell_config(results, output_file):
         if isinstance(stripe_width, int) and stripe_width > 0:
             f.write(f"# Optimal swap stripe width (devices): {stripe_width}\n")
             f.write(f"SWAP_STRIPE_WIDTH={stripe_width}\n")
+        else:
+            # Let setup-swap.sh choose/auto-detect if we didn't measure it.
+            f.write("# SWAP_STRIPE_WIDTH not measured; let setup-swap.sh auto-detect\n")
+            f.write("SWAP_STRIPE_WIDTH=auto\n")
     
     log_info(f"Configuration saved to {output_file}")
 
@@ -3495,16 +3887,22 @@ def generate_benchmark_summary_report(results, output_file):
             f.write(f"✓ Allocator:           {best_alloc['allocator']} ")
             f.write(f"({best_alloc.get('efficiency_pct', 0):.1f}% efficiency)\n")
         
-        # Prefer matrix-derived stripe width
+        # Matrix "concurrency" is fio numjobs (I/O concurrency), not swap-device count.
         if isinstance(matrix_opt, dict) and isinstance((matrix_opt.get('best_combined') or {}).get('concurrency'), int):
-            stripe = matrix_opt['best_combined']['concurrency']
-            f.write(f"✓ Stripe Width:        {stripe} devices (matrix best)\n")
-        elif 'concurrency' in results and results['concurrency']:
-            best_concur = max(
-                results['concurrency'],
-                key=lambda x: x.get('write_mb_per_sec', 0) + x.get('read_mb_per_sec', 0),
-            )
-            f.write(f"✓ Stripe Width:        {best_concur['num_files']} devices (deprecated test)\n")
+            numjobs = matrix_opt['best_combined']['concurrency']
+            f.write(f"✓ Matrix Best:         {numjobs} fio jobs (numjobs; matrix best)\n")
+
+        stripe = None
+        spm = results.get('swap_partitions_matrix')
+        if isinstance(spm, dict):
+            opt = spm.get('optimal') or {}
+            v = opt.get('recommended_swap_stripe_width')
+            if isinstance(v, int) and v > 0:
+                stripe = v
+        if isinstance(stripe, int) and stripe > 0:
+            f.write(f"✓ Stripe Width:        {stripe} swap devices (measured)\n")
+        else:
+            f.write("✓ Stripe Width:        auto (not measured)\n")
         
         f.write("\n")
         
@@ -3630,24 +4028,17 @@ def generate_swap_config_report(results, output_file):
         f.write(f"RAM Swap:        {int(ram_gb * 0.5)}GB (50% of RAM)\n")
         f.write(f"Disk Swap:       {int(ram_gb * 1.0)}GB (overflow protection)\n")
         
-        # Prefer matrix-derived stripe width
         stripe_width = None
-        if isinstance(results.get('matrix'), dict):
-            matrix_opt = (results['matrix'].get('optimal') or {})
-            if isinstance(matrix_opt, dict):
-                for k in ('best_combined', 'best_read', 'best_write'):
-                    v = (matrix_opt.get(k) or {}).get('concurrency')
-                    if isinstance(v, int) and v > 0:
-                        stripe_width = v
-                        break
-        if stripe_width is None and 'concurrency' in results and results['concurrency']:
-            best_concur = max(
-                results['concurrency'],
-                key=lambda x: x.get('write_mb_per_sec', 0) + x.get('read_mb_per_sec', 0),
-            )
-            stripe_width = best_concur.get('num_files')
+        spm = results.get('swap_partitions_matrix')
+        if isinstance(spm, dict):
+            opt = spm.get('optimal') or {}
+            v = opt.get('recommended_swap_stripe_width')
+            if isinstance(v, int) and v > 0:
+                stripe_width = v
         if stripe_width:
-            f.write(f"Stripe Width:    {stripe_width} devices\n")
+            f.write(f"Stripe Width:    {stripe_width} devices (measured)\n")
+        else:
+            f.write("Stripe Width:    auto (not measured)\n")
         
         f.write("\n")
         
@@ -3664,12 +4055,7 @@ def generate_swap_config_report(results, output_file):
         f.write("• Disk backing required: Prevents OOM situations\n")
         
         if stripe_width:
-            cpu_cores = system_info.get('cpu_cores', 4)
-            f.write(f"• {stripe_width} swap devices: ")
-            if stripe_width >= cpu_cores:
-                f.write("Matches/exceeds CPU core count for parallelism\n")
-            else:
-                f.write("Optimal for this workload\n")
+            f.write(f"• {stripe_width} swap devices: Derived from swap-partition stripe benchmark\n")
         
         f.write("\n")
         
@@ -3704,7 +4090,11 @@ def generate_swap_config_report(results, output_file):
         warnings_found = False
         if 'compressors' in results:
             for comp in results['compressors']:
-                if 'warning' in comp:
+                if isinstance(comp.get('warnings'), list) and comp['warnings']:
+                    for w in comp['warnings']:
+                        f.write(f"⚠ {w}\n")
+                        warnings_found = True
+                elif 'warning' in comp and comp.get('warning'):
                     f.write(f"⚠ {comp['warning']}\n")
                     warnings_found = True
         
@@ -4609,7 +4999,8 @@ def format_benchmark_html(results):
     
     # Concurrency tests with scaling chart
     if 'concurrency' in results and results['concurrency']:
-        html += "<b>⚡ Concurrency Scaling:</b>\n"
+        html += "<b>⚡ fio Job Scaling (single target):</b>\n"
+        html += "<i>Note: this varies fio worker count against one swap target; it is NOT swap device count.</i>\n"
         # Only compute max_total from successful tests
         successful_tests = [c for c in results['concurrency'] if 'error' not in c]
         if successful_tests:
@@ -4641,17 +5032,20 @@ def format_benchmark_html(results):
     # Matrix test results (block size × concurrency)
     if 'matrix' in results and isinstance(results['matrix'], dict) and 'optimal' in results['matrix']:
         matrix = results['matrix']
-        html += "<b>🎯 Optimal Configuration:</b>\n\n"
+        html += "<b>🎯 Optimal I/O Parameters (single target):</b>\n\n"
         
         # Show disk I/O optimization results
         html += "  <b>📀 Disk I/O Optimized:</b>\n"
+        html += "  <i>fio randrw 50/50 against one test target (not multi-device striping)</i>\n"
         if 'best_combined' in matrix.get('optimal', {}):
             best = matrix['optimal']['best_combined']
             html += f"  Best: {best['block_size_kb']}KB × {best['concurrency']} jobs = {best['throughput_mb_per_sec']:.0f} MB/s\n"
         
-        if 'recommended_swap_stripe_width' in matrix.get('optimal', {}):
-            rec_width = matrix['optimal']['recommended_swap_stripe_width']
-            html += f"  SWAP_STRIPE_WIDTH={rec_width} ✅\n"
+        # Stripe width is measured separately via real swap-partition benchmarking.
+        spm = results.get('swap_partitions_matrix')
+        if isinstance(spm, dict) and isinstance((spm.get('optimal') or {}).get('recommended_swap_stripe_width'), int):
+            rec_width = spm['optimal']['recommended_swap_stripe_width']
+            html += f"  SWAP_STRIPE_WIDTH={rec_width} ✅ (measured on real partitions)\n"
         
         # Show ZSWAP-specific configuration
         html += "\n  <b>💾 ZSWAP Configuration:</b>\n"
@@ -4665,9 +5059,70 @@ def format_benchmark_html(results):
             best = matrix['optimal']['best_combined']
             html += f"  <i>{best['block_size_kb']}KB readahead wastes bandwidth</i>\n"
         
-        html += "\n  ⚠️ <i>Matrix test shows DISK performance.</i>\n"
-        html += "  <i>For ZSWAP+disk hybrid, use page-cluster=0.</i>\n"
+        html += "\n  ⚠️ <i>Above matrix measures disk I/O tuning (fio against a single target).</i>\n"
+        html += "  <i>Swap device striping (multiple partitions) is tested separately below.</i>\n"
         html += "\n"
+
+    # Swap partition striping matrix (real partitions)
+    spm = results.get('swap_partitions_matrix')
+    if isinstance(spm, dict) and 'error' not in spm:
+        html += "<b>🧪 Disk Swap Striping Benchmark (real partitions):</b>\n"
+        parts = spm.get('swap_partitions') or []
+        bs_list = spm.get('block_sizes') or []
+        dev_counts = spm.get('device_counts') or []
+        jobs_levels = spm.get('numjobs_per_device_levels') or []
+        runtime_sec = spm.get('runtime_sec')
+        per_dev_mb = spm.get('per_device_size_mb')
+        workload = spm.get('fio_workload') or {}
+
+        if parts:
+            html += f"  Detected GPT swap partitions: {len(parts)}\n"
+        if dev_counts and jobs_levels and bs_list:
+            html += f"  Tested: devices={dev_counts}, jobs/dev={jobs_levels}, bs={bs_list}KB\n"
+        if runtime_sec and per_dev_mb:
+            html += f"  Workload: fio randrw 50/50, direct=1, runtime={runtime_sec}s, size={per_dev_mb}MB per device\n"
+        elif runtime_sec:
+            html += f"  Workload: fio randrw 50/50, direct=1, runtime={runtime_sec}s\n"
+
+        opt = spm.get('optimal') or {}
+        chosen = opt.get('best_combined') or {}
+        rec_width = opt.get('recommended_swap_stripe_width')
+        rec_jobs = opt.get('recommended_fio_numjobs_per_device')
+        best_score = opt.get('best_score')
+        if isinstance(rec_width, int) and rec_width > 0:
+            html += f"  Selected SWAP_STRIPE_WIDTH={rec_width} ✅\n"
+            if parts and len(parts) > rec_width:
+                html += f"  Install behavior: repartition swap space to exactly {rec_width} partitions\n"
+        if isinstance(rec_jobs, int) and rec_jobs > 0:
+            html += f"  (fio tuning) jobs/dev={rec_jobs}  <i>not a system setting</i>\n"
+        if chosen.get('combined_mb_per_sec') is not None:
+            html += (
+                f"  Chosen point: {chosen.get('device_count','?')} dev × {chosen.get('numjobs_per_device','?')} jobs/dev @ {chosen.get('block_size_kb','?')}KB = "
+                + f"{chosen.get('combined_mb_per_sec', 0):.0f} MB/s\n"
+            )
+        if isinstance(best_score, (int, float)) and best_score:
+            html += f"  Selection rule: smallest device_count within 95% of best score (throughput/latency)\n"
+
+        top = opt.get('top_candidates') or []
+        if isinstance(top, list) and top:
+            html += "  Top candidates (best score first):\n"
+            for idx, row in enumerate(top[:3], start=1):
+                try:
+                    bw = float(row.get('combined_mb_per_sec', 0) or 0)
+                    rlat = float(row.get('read_latency_us', 0) or 0)
+                    wlat = float(row.get('write_latency_us', 0) or 0)
+                    lat = (0.7 * rlat) + (0.3 * wlat)
+                    score = (bw / lat) if lat > 0 else 0.0
+                    html += (
+                        f"    #{idx}: {int(row.get('device_count', 1))} dev × {int(row.get('numjobs_per_device', 1))} jobs/dev "
+                        + f"@ {int(row.get('block_size_kb', 4))}KB — {bw:.0f} MB/s, lat~{lat:.1f}µs, score={score:.4f}\n"
+                    )
+                except Exception:
+                    pass
+        html += "\n"
+    elif isinstance(spm, dict) and 'error' in spm:
+        html += "<b>🧪 Disk Swap Striping Benchmark (real partitions):</b>\n"
+        html += f"  ⚠️ <i>Skipped/failed: {spm.get('error','unknown error')}</i>\n\n"
     
     # ZSWAP vs ZRAM comparison
     if 'zswap_vs_zram' in results and 'error' not in results['zswap_vs_zram']:
@@ -4960,6 +5415,10 @@ Examples:
                        help='[DEPRECATED] Test concurrency with N swap files. Use --test-matrix instead for comprehensive testing')
     parser.add_argument('--test-matrix', action='store_true',
                        help='Test block size × concurrency matrix to find optimal configuration')
+    parser.add_argument('--test-swap-partitions-matrix', action='store_true',
+                       help='Test real GPT swap partitions as block devices to recommend SWAP_STRIPE_WIDTH')
+    parser.add_argument('--swap-partitions-max', type=int, metavar='N', default=0,
+                       help='Max GPT swap partitions to consider (default: 0 = all found)')
     parser.add_argument('--test-zswap', action='store_true',
                        help='Run comprehensive ZSWAP benchmarks (requires swap backing device)')
     parser.add_argument('--zswap-device', metavar='DEVICE', default='/dev/vda4',
@@ -5090,6 +5549,9 @@ Examples:
     
     if args.test_matrix or args.test_all:
         # Matrix test counts as one comprehensive test
+        total_tests += 1
+
+    if args.test_all or args.test_swap_partitions_matrix:
         total_tests += 1
     
     if args.test_zswap:
@@ -5231,6 +5693,19 @@ Examples:
         except Exception as e:
             log_error(f"Matrix test failed: {e}")
             results['matrix'] = {'error': str(e)}
+
+    # Swap partition stripe matrix (real multi-device test)
+    if args.test_all or args.test_swap_partitions_matrix:
+        try:
+            log_info_ts("\n=== Running Swap Partition Stripe Matrix ===")
+            max_parts = args.swap_partitions_max if args.swap_partitions_max and args.swap_partitions_max > 0 else None
+            results['swap_partitions_matrix'] = test_swap_partitions_stripe_matrix(
+                runtime_sec=args.duration,
+                max_partitions=max_parts,
+            )
+        except Exception as e:
+            log_error(f"Swap partition stripe matrix failed: {e}")
+            results['swap_partitions_matrix'] = {'error': str(e)}
     
     # ZSWAP benchmarks
     if args.test_zswap:

@@ -17,6 +17,12 @@ PRESERVE_ROOT_SIZE_GB="${PRESERVE_ROOT_SIZE_GB:-10}"
 ALLOW_ROOT_SHRINK="${ALLOW_ROOT_SHRINK:-yes}"
 OFFLINE_SHRINK_EXIT_CODE=42
 
+# New flow support:
+# - Create a fixed number of swap partitions up-front (default 16)
+# - Optionally skip mkswap/swapon/fstab so benchmarks can run on raw partitions
+SWAP_PARTITION_COUNT="${SWAP_PARTITION_COUNT:-16}"
+ACTIVATE_SWAP="${ACTIVATE_SWAP:-yes}"  # yes/no
+
 # Stage1 pre-shrink support (shrink root offline now; decide swap later)
 PRE_SHRINK_ONLY="${PRE_SHRINK_ONLY:-no}"  # yes/no
 PRE_SHRINK_ROOT_EXTRA_GB="${PRE_SHRINK_ROOT_EXTRA_GB:-10}"  # keep used + extra GB
@@ -50,6 +56,12 @@ for arg in "$@"; do
     case "$arg" in
         --pre-shrink-only)
             PRE_SHRINK_ONLY=yes
+            ;;
+        --no-activate)
+            ACTIVATE_SWAP=no
+            ;;
+        --swap-partition-count=*)
+            SWAP_PARTITION_COUNT="${arg#*=}"
             ;;
     esac
 done
@@ -93,37 +105,29 @@ select_benchmark_results_file() {
 
 OPTIMAL_DEVICES=1
 if [ "$PRE_SHRINK_ONLY" != "yes" ]; then
-    # Find the most recent *complete* benchmark results file (newest that contains matrix.optimal).
+    # New flow default: create a fixed number of swap partitions up-front.
+    # If benchmark JSON exists, we still allow it to override, but do not require it.
     RESULTS_FILE="$(select_benchmark_results_file || true)"
-    if [ -z "$RESULTS_FILE" ] || [ ! -f "$RESULTS_FILE" ]; then
-        log_error "No usable benchmark results found at: $BENCHMARK_RESULTS"
-        log_error "Need one file with: .matrix.optimal.best_*\.concurrency or .matrix.optimal.recommended_swap_stripe_width"
-        log_info "Run: sudo ./benchmark.py --test-all"
-        exit 1
-    fi
+    if [ -n "$RESULTS_FILE" ] && [ -f "$RESULTS_FILE" ]; then
+        log_info "Using benchmark results: $RESULTS_FILE"
 
-    log_info "Using benchmark results: $RESULTS_FILE"
-
-    # Extract benchmark-optimal stripe width / device count.
-    OPTIMAL_DEVICES=$(jq -r '.matrix.optimal.best_combined.concurrency // .matrix.optimal.best_read.concurrency // .matrix.optimal.best_write.concurrency // empty' "$RESULTS_FILE" 2>/dev/null || true)
-    if [[ -z "$OPTIMAL_DEVICES" || "$OPTIMAL_DEVICES" = "null" ]]; then
+        # Extract benchmark-optimal stripe width / device count (legacy fields).
         OPTIMAL_DEVICES=$(jq -r '.matrix.optimal.recommended_swap_stripe_width // empty' "$RESULTS_FILE" 2>/dev/null || true)
+        if [[ -n "$OPTIMAL_DEVICES" && "$OPTIMAL_DEVICES" != "null" && "$OPTIMAL_DEVICES" =~ ^[0-9]+$ && "$OPTIMAL_DEVICES" -gt 0 ]]; then
+            log_info "Benchmark-recommended swap stripe width: $OPTIMAL_DEVICES"
+        else
+            OPTIMAL_DEVICES=""
+        fi
     fi
 
-    if [[ -z "$OPTIMAL_DEVICES" || "$OPTIMAL_DEVICES" = "null" ]]; then
-        log_error "No benchmark-optimal swap stripe width found in benchmark results"
-        log_error "Expected one of: .matrix.optimal.best_*\.concurrency or .matrix.optimal.recommended_swap_stripe_width"
-        log_error "Inspect: jq '.matrix.optimal' $RESULTS_FILE"
-        exit 1
+    if [ -z "${OPTIMAL_DEVICES:-}" ]; then
+        if [[ ! "$SWAP_PARTITION_COUNT" =~ ^[0-9]+$ ]] || [ "$SWAP_PARTITION_COUNT" -lt 1 ]; then
+            log_error "Invalid SWAP_PARTITION_COUNT=$SWAP_PARTITION_COUNT"
+            exit 1
+        fi
+        OPTIMAL_DEVICES="$SWAP_PARTITION_COUNT"
+        log_info "No usable benchmark stripe width; using fixed SWAP_PARTITION_COUNT=$OPTIMAL_DEVICES"
     fi
-
-    if [[ ! "$OPTIMAL_DEVICES" =~ ^[0-9]+$ ]] || [ "$OPTIMAL_DEVICES" -lt 1 ]; then
-        log_error "Invalid benchmark-optimal device count: '$OPTIMAL_DEVICES'"
-        log_error "Inspect: jq '.matrix.optimal' $RESULTS_FILE"
-        exit 1
-    fi
-
-    log_info "Benchmark-optimal swap device count: $OPTIMAL_DEVICES"
 else
     log_step "Pre-shrink-only mode: reserving disk tail space; swap layout will be decided later"
 fi
@@ -882,116 +886,137 @@ case "$FS_TYPE" in
         ;;
 esac
 
-# Format and enable swap partitions
-log_step "Formatting and enabling swap partitions..."
-
-# Ensure we are not using any swap while repartitioning / reformatting.
-swapoff -a 2>/dev/null || true
-
-# Rewrite /etc/fstab swap entries so repeated runs don't accumulate stale PARTUUIDs.
-if [ -f /etc/fstab ]; then
-    FSTAB_BACKUP="/etc/fstab.backup.$(date +%Y%m%d_%H%M%S)"
-    cp /etc/fstab "$FSTAB_BACKUP"
-    awk '
-        /^[[:space:]]*#/ {print; next}
-        NF>=3 && $3=="swap" {next}
-        {print}
-    ' /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
-    log_info "Cleaned swap entries from /etc/fstab (backup: $FSTAB_BACKUP)"
-fi
-
-missing_dev=0
+# Write a stable list of expected swap partition device paths (useful for benchmarks).
+mkdir -p /etc/vbpub 2>/dev/null || true
+SWAP_LIST_FILE="/etc/vbpub/swap-partitions.list"
+: > "$SWAP_LIST_FILE"
 for i in $(seq 1 "$SWAP_DEVICES"); do
     SWAP_PART_NUM=$((ROOT_PART_NUM + i))
-    
     if [[ "$ROOT_DISK" =~ nvme ]]; then
-        SWAP_PARTITION="/dev/${ROOT_DISK}p${SWAP_PART_NUM}"
+        echo "/dev/${ROOT_DISK}p${SWAP_PART_NUM}" >> "$SWAP_LIST_FILE"
     else
-        SWAP_PARTITION="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
-    fi
-    
-    log_info "Processing swap partition ${i}/${SWAP_DEVICES}: ${SWAP_PARTITION}"
-    
-    # Wait for device node
-    for retry in {1..10}; do
-        if [ -b "$SWAP_PARTITION" ]; then
-            break
-        fi
-        log_info "Waiting for ${SWAP_PARTITION} (attempt ${retry}/10)..."
-        sleep 1
-    done
-    
-    if [ ! -b "$SWAP_PARTITION" ]; then
-        log_error "Device ${SWAP_PARTITION} not found"
-        missing_dev=1
-        continue
-    fi
-    
-    # Format as swap
-    log_info "Formatting ${SWAP_PARTITION} as swap..."
-    if mkswap "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
-        log_success "Formatted swap partition ${i}"
-    else
-        log_error "Failed to format swap partition ${i}"
-        continue
-    fi
-    
-    # Enable swap
-    log_info "Enabling swap partition ${i}..."
-    if swapon -p "$SWAP_PRIORITY" "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
-        log_success "Enabled swap partition ${i}"
-    else
-        log_error "Failed to enable swap partition ${i}"
-        continue
-    fi
-    
-    # Add to /etc/fstab using PARTUUID
-    PARTUUID=$(lsblk -no PARTUUID "$SWAP_PARTITION" 2>/dev/null | tr -d ' ')
-    if [ -z "$PARTUUID" ]; then
-        PARTUUID=$(blkid -s PARTUUID -o value "$SWAP_PARTITION" 2>/dev/null || true)
-    fi
-    if [ -z "$PARTUUID" ]; then
-        log_error "Failed to resolve PARTUUID for ${SWAP_PARTITION}; refusing to write unstable fstab entry"
-        missing_dev=1
-        continue
-    fi
-
-    if ! grep -q "^PARTUUID=${PARTUUID}\\b" /etc/fstab 2>/dev/null; then
-        echo "PARTUUID=${PARTUUID} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
-        log_info "Added swap ${i} to /etc/fstab (PARTUUID=${PARTUUID})"
-    else
-        log_info "Swap ${i} already in /etc/fstab"
+        echo "/dev/${ROOT_DISK}${SWAP_PART_NUM}" >> "$SWAP_LIST_FILE"
     fi
 done
+log_info "Wrote swap partition list: $SWAP_LIST_FILE"
 
-if [ "$missing_dev" -ne 0 ]; then
-    log_error "One or more swap partitions failed to appear or be configured"
-    log_error "Do not reboot until you verify the partition table and swap devices"
-    exit 1
+if [ "$ACTIVATE_SWAP" = "yes" ]; then
+    # Format and enable swap partitions
+    log_step "Formatting and enabling swap partitions..."
+
+    # Ensure we are not using any swap while repartitioning / reformatting.
+    swapoff -a 2>/dev/null || true
+
+    # Rewrite /etc/fstab swap entries so repeated runs don't accumulate stale PARTUUIDs.
+    if [ -f /etc/fstab ]; then
+        FSTAB_BACKUP="/etc/fstab.backup.$(date +%Y%m%d_%H%M%S)"
+        cp /etc/fstab "$FSTAB_BACKUP"
+        awk '
+            /^[[:space:]]*#/ {print; next}
+            NF>=3 && $3=="swap" {next}
+            {print}
+        ' /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
+        log_info "Cleaned swap entries from /etc/fstab (backup: $FSTAB_BACKUP)"
+    fi
+
+    missing_dev=0
+    for i in $(seq 1 "$SWAP_DEVICES"); do
+        SWAP_PART_NUM=$((ROOT_PART_NUM + i))
+
+        if [[ "$ROOT_DISK" =~ nvme ]]; then
+            SWAP_PARTITION="/dev/${ROOT_DISK}p${SWAP_PART_NUM}"
+        else
+            SWAP_PARTITION="/dev/${ROOT_DISK}${SWAP_PART_NUM}"
+        fi
+
+        log_info "Processing swap partition ${i}/${SWAP_DEVICES}: ${SWAP_PARTITION}"
+
+        # Wait for device node
+        for retry in {1..10}; do
+            if [ -b "$SWAP_PARTITION" ]; then
+                break
+            fi
+            log_info "Waiting for ${SWAP_PARTITION} (attempt ${retry}/10)..."
+            sleep 1
+        done
+
+        if [ ! -b "$SWAP_PARTITION" ]; then
+            log_error "Device ${SWAP_PARTITION} not found"
+            missing_dev=1
+            continue
+        fi
+
+        # Format as swap
+        log_info "Formatting ${SWAP_PARTITION} as swap..."
+        if mkswap "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
+            log_success "Formatted swap partition ${i}"
+        else
+            log_error "Failed to format swap partition ${i}"
+            continue
+        fi
+
+        # Enable swap
+        log_info "Enabling swap partition ${i}..."
+        if swapon -p "$SWAP_PRIORITY" "$SWAP_PARTITION" 2>&1 | tee -a "$LOG_FILE"; then
+            log_success "Enabled swap partition ${i}"
+        else
+            log_error "Failed to enable swap partition ${i}"
+            continue
+        fi
+
+        # Add to /etc/fstab using PARTUUID
+        PARTUUID=$(lsblk -no PARTUUID "$SWAP_PARTITION" 2>/dev/null | tr -d ' ')
+        if [ -z "$PARTUUID" ]; then
+            PARTUUID=$(blkid -s PARTUUID -o value "$SWAP_PARTITION" 2>/dev/null || true)
+        fi
+        if [ -z "$PARTUUID" ]; then
+            log_error "Failed to resolve PARTUUID for ${SWAP_PARTITION}; refusing to write unstable fstab entry"
+            missing_dev=1
+            continue
+        fi
+
+        if ! grep -q "^PARTUUID=${PARTUUID}\\b" /etc/fstab 2>/dev/null; then
+            echo "PARTUUID=${PARTUUID} none swap sw,pri=${SWAP_PRIORITY} 0 0" >> /etc/fstab
+            log_info "Added swap ${i} to /etc/fstab (PARTUUID=${PARTUUID})"
+        else
+            log_info "Swap ${i} already in /etc/fstab"
+        fi
+    done
+
+    if [ "$missing_dev" -ne 0 ]; then
+        log_error "One or more swap partitions failed to appear or be configured"
+        log_error "Do not reboot until you verify the partition table and swap devices"
+        exit 1
+    fi
+
+    # Show final status
+    log_step "Final Status"
+
+    log_info "Root filesystem:"
+    df -h / | tee -a "$LOG_FILE"
+
+    log_info ""
+    log_info "Active swap devices:"
+    swapon --show | tee -a "$LOG_FILE"
+
+    log_info ""
+    log_info "/etc/fstab swap entries:"
+    grep "swap" /etc/fstab | tee -a "$LOG_FILE"
+
+    log_success "Swap partition creation complete!"
+    log_info "Created ${SWAP_DEVICES} swap partitions totaling ${TOTAL_SWAP_USED_MIB}MiB (target ${TOTAL_SWAP_TARGET_MIB}MiB)"
+    log_info "Backup partition table: $BACKUP_FILE"
+    log_info "Log file: $LOG_FILE"
+
+    echo ""
+    log_info "Next steps:"
+    log_info "  1. Verify: swapon --show"
+    log_info "  2. Test: free -h"
+    log_info "  3. If using ZSWAP, configure: sudo ./setup-swap.sh"
+    log_info "  4. Run latency tests: sudo ./benchmark.py --test-zswap-latency"
+else
+    log_step "Partitioning complete (no-activate mode)"
+    log_info "Created ${SWAP_DEVICES} swap partitions totaling ${TOTAL_SWAP_USED_MIB}MiB (target ${TOTAL_SWAP_TARGET_MIB}MiB)"
+    log_info "Skipped mkswap/swapon/fstab updates (ACTIVATE_SWAP=no)"
+    log_info "Swap partition list: $SWAP_LIST_FILE"
 fi
-
-# Show final status
-log_step "Final Status"
-
-log_info "Root filesystem:"
-df -h / | tee -a "$LOG_FILE"
-
-log_info ""
-log_info "Active swap devices:"
-swapon --show | tee -a "$LOG_FILE"
-
-log_info ""
-log_info "/etc/fstab swap entries:"
-grep "swap" /etc/fstab | tee -a "$LOG_FILE"
-
-log_success "Swap partition creation complete!"
-log_info "Created ${SWAP_DEVICES} swap partitions totaling ${TOTAL_SWAP_USED_MIB}MiB (target ${TOTAL_SWAP_TARGET_MIB}MiB)"
-log_info "Backup partition table: $BACKUP_FILE"
-log_info "Log file: $LOG_FILE"
-
-echo ""
-log_info "Next steps:"
-log_info "  1. Verify: swapon --show"
-log_info "  2. Test: free -h"
-log_info "  3. If using ZSWAP, configure: sudo ./setup-swap.sh"
-log_info "  4. Run latency tests: sudo ./benchmark.py --test-zswap-latency"

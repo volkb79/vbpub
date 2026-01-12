@@ -53,6 +53,7 @@ ZSWAP_ZPOOL="${ZSWAP_ZPOOL:-zbud}"  # zbud (most reliable), z3fold, zsmalloc
 SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE:-auto}"  # files_in_root, partitions_swap, partitions_zvol, files_in_partitions, none (auto-detected if not set)
 SWAP_DISK_TOTAL_GB="${SWAP_DISK_TOTAL_GB:-auto}"  # Total disk-based swap (auto = calculated)
 SWAP_STRIPE_WIDTH="${SWAP_STRIPE_WIDTH:-auto}"  # Number of parallel swap devices (for I/O striping)
+SWAP_PARTITION_COUNT="${SWAP_PARTITION_COUNT:-16}"  # Pre-create this many swap partitions (benchmark chooses how many to activate)
 SWAP_PRIORITY="${SWAP_PRIORITY:-10}"  # Priority for disk swap (lower than RAM)
 EXTEND_ROOT="${EXTEND_ROOT:-yes}"
 
@@ -164,6 +165,27 @@ stage1_reboot() {
     fi
 
     log_warn "Rebooting now"
+    systemctl reboot || reboot
+}
+
+stage2_reboot() {
+    sync || true
+
+    if [ "$NEVER_REBOOT" = "yes" ]; then
+        log_warn "NEVER_REBOOT=yes; refusing to reboot automatically"
+        return 0
+    fi
+
+    # Stage2 can also be invoked in cloud-init-ish contexts (e.g. provider tasks).
+    # Use the same delayed reboot pattern for safety.
+    if is_cloud_init_context; then
+        local delay_seconds="${STAGE2_REBOOT_DELAY_SECONDS:-60}"
+        log_warn "Cloud-init context detected; scheduling reboot in ${delay_seconds}s"
+        ( sleep "$delay_seconds"; systemctl reboot || reboot ) >/dev/null 2>&1 &
+        return 0
+    fi
+
+    log_warn "Rebooting now (stage2)"
     systemctl reboot || reboot
 }
 
@@ -359,6 +381,10 @@ DEBUG_MODE="${DEBUG_MODE}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID}"
 
+# Stage control
+AUTO_REBOOT_AFTER_STAGE1="${AUTO_REBOOT_AFTER_STAGE1}"
+NEVER_REBOOT="${NEVER_REBOOT}"
+
 # Preserve bootstrap choices
 RUN_USER_CONFIG="${RUN_USER_CONFIG}"
 RUN_APT_CONFIG="${RUN_APT_CONFIG}"
@@ -384,6 +410,7 @@ ZSWAP_ZPOOL="${ZSWAP_ZPOOL}"
 SWAP_BACKING_TYPE="${SWAP_BACKING_TYPE}"
 SWAP_DISK_TOTAL_GB="${SWAP_DISK_TOTAL_GB}"
 SWAP_STRIPE_WIDTH="${SWAP_STRIPE_WIDTH}"
+SWAP_PARTITION_COUNT="${SWAP_PARTITION_COUNT}"
 SWAP_PRIORITY="${SWAP_PRIORITY}"
 EXTEND_ROOT="${EXTEND_ROOT}"
 ZFS_POOL="${ZFS_POOL}"
@@ -533,10 +560,13 @@ run_stage1() {
         set -e
         if [ "$rc" -eq 42 ]; then
             log_warn "Offline pre-shrink scheduled via initramfs for next reboot"
+            tg_send "🪚 Stage1: offline pre-shrink scheduled (filesystem resize will run early at next boot before stage2)."
         elif [ "$rc" -eq 0 ]; then
             log_info "No pre-shrink needed"
+            tg_send "✅ Stage1: no offline pre-shrink needed."
         else
             log_warn "Pre-shrink scheduling failed (rc=$rc); continuing without it"
+            tg_send "⚠️ Stage1 warning: pre-shrink scheduling failed (rc=$rc). Stage2 may still run, but partition creation could require a later reboot."
         fi
     else
         log_info "==> Pre-shrink skipped (PRE_SHRINK_ONLY=$PRE_SHRINK_ONLY)"
@@ -562,6 +592,7 @@ run_stage2() {
     fi
 
     log_info "==> Running stage2 (long-running / resume-safe)"
+    tg_send "▶️ vbpub stage2 started on $(hostname -f 2>/dev/null || hostname). Running: packages → swap partition prep → benchmarks → final swap setup (then optional docker/ssh/geekbench)."
 
     install_stage2_packages
 
@@ -570,43 +601,22 @@ run_stage2() {
     export ZRAM_COMPRESSOR ZRAM_ALLOCATOR ZRAM_PRIORITY
     export ZSWAP_COMPRESSOR ZSWAP_ZPOOL
     export SWAP_DISK_TOTAL_GB SWAP_BACKING_TYPE SWAP_STRIPE_WIDTH
+    export SWAP_PARTITION_COUNT
     export SWAP_PRIORITY EXTEND_ROOT
     export ZFS_POOL
     export TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID LOG_FILE
     export DEBUG_MODE
     export PRESERVE_ROOT_SIZE_GB
 
-    # Benchmarks
-    if [ "$RUN_BENCHMARKS" = "yes" ] && ! state_has benchmarks_done; then
-        log_info "==> Running system benchmarks (stage2)"
-        BENCHMARK_OUTPUT="/tmp/benchmark-results-$(date +%Y%m%d-%H%M%S).json"
-        BENCHMARK_CONFIG="/tmp/benchmark-optimal-config.sh"
-
-        if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-            BENCHMARK_ARGS="--test-all --duration $BENCHMARK_DURATION --output $BENCHMARK_OUTPUT --shell-config $BENCHMARK_CONFIG --telegram"
-        else
-            BENCHMARK_ARGS="--test-all --duration $BENCHMARK_DURATION --output $BENCHMARK_OUTPUT --shell-config $BENCHMARK_CONFIG"
-        fi
-
-        if ./benchmark.py $BENCHMARK_ARGS 2>&1 | tee -a "$LOG_FILE"; then
-            log_info "✓ Benchmarks complete"
-            export SWAP_BENCHMARK_CONFIG="$BENCHMARK_CONFIG"
-            state_set benchmarks_done
-        else
-            log_warn "Benchmarks had issues (non-critical, continuing)"
-            state_set benchmarks_failed
-        fi
-    else
-        log_info "==> Benchmarks skipped (RUN_BENCHMARKS=$RUN_BENCHMARKS or already done)"
-    fi
-
     # Partition creation (may schedule offline resize + require reboot)
+    # New flow: pre-create a fixed set of swap partitions first, then benchmark those partitions.
     if [ "$CREATE_SWAP_PARTITIONS" = "yes" ] && ! state_has partitions_done && ! state_has partitions_failed; then
-        log_info "==> Creating optimized swap partitions (stage2)"
+        log_info "==> Creating swap partitions (stage2; no-activate; count=${SWAP_PARTITION_COUNT})"
+        tg_send "🧩 Stage2: creating ${SWAP_PARTITION_COUNT} GPT swap partitions (no activate yet) so benchmarks can test real devices."
         log_root_layout
 
         set +e
-        ./create-swap-partitions.sh 2>&1 | tee -a "$LOG_FILE"
+        ./create-swap-partitions.sh --no-activate --swap-partition-count="$SWAP_PARTITION_COUNT" 2>&1 | tee -a "$LOG_FILE"
         rc=${PIPESTATUS[0]}
         set -e
 
@@ -617,11 +627,98 @@ run_stage2() {
         elif [ "$rc" -eq 42 ]; then
             log_warn "Offline ext* resize required; reboot is required to continue stage2"
             state_set partitions_reboot_scheduled
-            log_warn "NEVER_REBOOT=$NEVER_REBOOT; not rebooting automatically. Reboot manually when ready."
+            if [ "$NEVER_REBOOT" = "yes" ]; then
+                tg_send "⚠️ Stage2 paused: an offline filesystem resize was scheduled (pre-shrink/repartition). Reboot is required to continue, but NEVER_REBOOT=yes so reboot is NOT automatic."
+                log_warn "NEVER_REBOOT=$NEVER_REBOOT; not rebooting automatically. Reboot manually when ready."
+            else
+                tg_send "🔁 Stage2 paused: an offline filesystem resize was scheduled (pre-shrink/repartition). Rebooting to continue stage2 automatically."
+                stage2_reboot
+            fi
             return 0
         else
             log_error "✗ Swap partition creation failed (rc=$rc)"
             state_set partitions_failed
+            tg_send "❌ Stage2 warning: swap partition creation failed (rc=$rc). Continuing without pre-created partitions; benchmarks may fall back to auto settings."
+        fi
+    fi
+
+    # Benchmarks
+    if [ "$RUN_BENCHMARKS" = "yes" ] && ! state_has benchmarks_done; then
+        log_info "==> Running system benchmarks (stage2)"
+        tg_send "🧪 Stage2: running swap/IO benchmarks (fio + memory tests). This will choose swap settings based on measured results."
+        BENCHMARK_OUTPUT="/tmp/benchmark-results-$(date +%Y%m%d-%H%M%S).json"
+        BENCHMARK_CONFIG="/tmp/benchmark-optimal-config.sh"
+
+        # If swap partitions exist, let benchmark.py use them to recommend SWAP_STRIPE_WIDTH.
+        local swap_parts_arg=""
+        if [[ "${SWAP_PARTITION_COUNT:-}" =~ ^[0-9]+$ ]] && [ "${SWAP_PARTITION_COUNT:-0}" -gt 0 ]; then
+            swap_parts_arg="--swap-partitions-max ${SWAP_PARTITION_COUNT}"
+        fi
+
+        if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            BENCHMARK_ARGS="--test-all --duration $BENCHMARK_DURATION $swap_parts_arg --output $BENCHMARK_OUTPUT --shell-config $BENCHMARK_CONFIG --telegram"
+        else
+            BENCHMARK_ARGS="--test-all --duration $BENCHMARK_DURATION $swap_parts_arg --output $BENCHMARK_OUTPUT --shell-config $BENCHMARK_CONFIG"
+        fi
+
+        if ./benchmark.py $BENCHMARK_ARGS 2>&1 | tee -a "$LOG_FILE"; then
+            log_info "✓ Benchmarks complete"
+            export SWAP_BENCHMARK_CONFIG="$BENCHMARK_CONFIG"
+            state_set benchmarks_done
+            tg_send "✅ Stage2: benchmarks complete. Applying recommended swap configuration now."
+
+            # Source the exported config so stage2 can act on decisions immediately.
+            # shellcheck disable=SC1090
+            if [ -f "$BENCHMARK_CONFIG" ]; then
+                . "$BENCHMARK_CONFIG" || true
+            fi
+        else
+            log_warn "Benchmarks had issues (non-critical, continuing)"
+            state_set benchmarks_failed
+            tg_send "⚠️ Stage2 warning: benchmarks had issues. Continuing with swap setup using defaults/auto where needed."
+        fi
+    else
+        log_info "==> Benchmarks skipped (RUN_BENCHMARKS=$RUN_BENCHMARKS or already done)"
+    fi
+
+    # Repartition swap space to the benchmark-chosen stripe width.
+    # Goal: end state has exactly N swap partitions (not N-of-M enabled).
+    if state_has benchmarks_done && state_has partitions_done && ! state_has partitions_final_done && ! state_has partitions_final_failed; then
+        if [[ "${SWAP_STRIPE_WIDTH:-}" =~ ^[0-9]+$ ]] && [ "${SWAP_STRIPE_WIDTH:-0}" -gt 0 ]; then
+            if [ "${SWAP_STRIPE_WIDTH}" -ne "${SWAP_PARTITION_COUNT}" ]; then
+                log_info "==> Repartitioning swap space to optimal stripe width (N=${SWAP_STRIPE_WIDTH})"
+                tg_send "🧩 Stage2: repartitioning swap space to ${SWAP_STRIPE_WIDTH} swap partitions (benchmark-chosen stripe width)."
+
+                set +e
+                ./create-swap-partitions.sh --no-activate --swap-partition-count="$SWAP_STRIPE_WIDTH" 2>&1 | tee -a "$LOG_FILE"
+                rc=${PIPESTATUS[0]}
+                set -e
+
+                if [ "$rc" -eq 0 ]; then
+                    log_info "✓ Swap partitions repartitioned to ${SWAP_STRIPE_WIDTH}"
+                    state_set partitions_final_done
+                elif [ "$rc" -eq 42 ]; then
+                    log_warn "Offline ext* resize required after repartition; reboot is required to continue stage2"
+                    state_set partitions_final_reboot_scheduled
+                    if [ "$NEVER_REBOOT" = "yes" ]; then
+                        tg_send "⚠️ Stage2 paused: offline filesystem resize scheduled while finalizing swap partitions. Reboot is required to continue, but NEVER_REBOOT=yes so reboot is NOT automatic."
+                        log_warn "NEVER_REBOOT=$NEVER_REBOOT; not rebooting automatically. Reboot manually when ready."
+                    else
+                        tg_send "🔁 Stage2 paused: offline filesystem resize scheduled while finalizing swap partitions. Rebooting to continue stage2 automatically."
+                        stage2_reboot
+                    fi
+                    return 0
+                else
+                    log_error "✗ Final swap repartition failed (rc=$rc)"
+                    state_set partitions_final_failed
+                    tg_send "❌ Stage2 warning: failed to finalize swap partitions to ${SWAP_STRIPE_WIDTH} (rc=$rc). Continuing with existing partitions."
+                fi
+            else
+                state_set partitions_final_done
+            fi
+        else
+            log_info "==> SWAP_STRIPE_WIDTH not measured; skipping swap repartition finalization"
+            state_set partitions_final_done
         fi
     fi
 
@@ -631,6 +728,17 @@ run_stage2() {
         if ./setup-swap.sh 2>&1 | tee -a "$LOG_FILE"; then
             log_info "✓ Swap configured"
             state_set swap_done
+            if command -v swapon >/dev/null 2>&1; then
+                local swap_state
+                swap_state=$(swapon --show=NAME,TYPE,SIZE,USED,PRIO --noheadings 2>/dev/null | head -50 || true)
+                if [ -n "$swap_state" ]; then
+                    tg_send "💾 Stage2: swap active (name type size used prio):\n${swap_state}"
+                else
+                    tg_send "💾 Stage2: swap configured and active."
+                fi
+            else
+                tg_send "💾 Stage2: swap configured."
+            fi
         else
             log_error "✗ Swap config failed"
             exit 1
@@ -828,16 +936,47 @@ main() {
     
     # Run benchmarks BEFORE swap setup for smart auto-configuration
     if [ "$RUN_BENCHMARKS" = "yes" ]; then
+        # New flow: create swap partitions first so benchmarks can run on real devices.
+        if [ "$CREATE_SWAP_PARTITIONS" = "yes" ]; then
+            log_info "==> Creating swap partitions (no-activate; count=${SWAP_PARTITION_COUNT})"
+            log_info "This will modify disk partition table (root may be resized)"
+
+            log_info "==> Root layout BEFORE repartitioning"
+            log_root_layout
+
+            export PRESERVE_ROOT_SIZE_GB SWAP_PARTITION_COUNT
+            set +e
+            ./create-swap-partitions.sh --no-activate --swap-partition-count="$SWAP_PARTITION_COUNT" 2>&1 | tee -a "$LOG_FILE"
+            rc=${PIPESTATUS[0]}
+            set -e
+
+            if [ "$rc" -eq 0 ]; then
+                log_info "✓ Swap partitions created successfully"
+                log_info "==> Root layout AFTER repartitioning"
+                log_root_layout
+            elif [ "$rc" -eq 42 ]; then
+                log_warn "Swap partitioning requires offline ext* resize. Scheduled initramfs job for next reboot."
+                log_warn "Continuing bootstrap without forcing a reboot."
+            else
+                log_error "✗ Swap partition creation failed"
+                log_warn "Continuing without repartitioned swap"
+            fi
+        fi
+
         log_info "==> Running system benchmarks (for smart swap auto-configuration)"
         BENCHMARK_DURATION="${BENCHMARK_DURATION:-5}"  # Default to 5 seconds per test
         BENCHMARK_OUTPUT="/tmp/benchmark-results-$(date +%Y%m%d-%H%M%S).json"
         BENCHMARK_CONFIG="/tmp/benchmark-optimal-config.sh"
         
         # Run benchmark with telegram notification if configured, and export optimal config
+        swap_parts_arg=""
+        if [[ "${SWAP_PARTITION_COUNT:-}" =~ ^[0-9]+$ ]] && [ "${SWAP_PARTITION_COUNT:-0}" -gt 0 ]; then
+            swap_parts_arg="--swap-partitions-max ${SWAP_PARTITION_COUNT}"
+        fi
         if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-            BENCHMARK_ARGS="--test-all --duration $BENCHMARK_DURATION --output $BENCHMARK_OUTPUT --shell-config $BENCHMARK_CONFIG --telegram"
+            BENCHMARK_ARGS="--test-all --duration $BENCHMARK_DURATION $swap_parts_arg --output $BENCHMARK_OUTPUT --shell-config $BENCHMARK_CONFIG --telegram"
         else
-            BENCHMARK_ARGS="--test-all --duration $BENCHMARK_DURATION --output $BENCHMARK_OUTPUT --shell-config $BENCHMARK_CONFIG"
+            BENCHMARK_ARGS="--test-all --duration $BENCHMARK_DURATION $swap_parts_arg --output $BENCHMARK_OUTPUT --shell-config $BENCHMARK_CONFIG"
         fi
         
         if ./benchmark.py $BENCHMARK_ARGS 2>&1 | tee -a "$LOG_FILE"; then
@@ -846,49 +985,16 @@ main() {
             # Optimal configuration exported to $BENCHMARK_CONFIG for use by setup-swap.sh
             export SWAP_BENCHMARK_CONFIG="$BENCHMARK_CONFIG"
             
-            # Phase 2: Create optimized swap partitions based on matrix test results
-            if [ "$CREATE_SWAP_PARTITIONS" = "yes" ] && [ -f "$BENCHMARK_OUTPUT" ]; then
-                log_info "==> Creating optimized swap partitions from benchmark results"
-                log_info "This will modify disk partition table (root may be resized)"
-
-                log_info "==> Root layout BEFORE repartitioning"
-                log_root_layout
-                
-                export PRESERVE_ROOT_SIZE_GB
-                set +e
-                ./create-swap-partitions.sh 2>&1 | tee -a "$LOG_FILE"
-                rc=${PIPESTATUS[0]}
-                set -e
-
-                if [ "$rc" -eq 0 ]; then
-                    log_info "✓ Swap partitions created successfully"
-
-                    log_info "==> Root layout AFTER repartitioning"
-                    log_root_layout
-                    
-                    # Phase 3: Run ZSWAP latency tests with real partitions
-                    if [ "$TEST_ZSWAP_LATENCY" = "yes" ]; then
-                        log_info "==> Testing ZSWAP latency with real disk backing"
-                        if ./benchmark.py --test-zswap-latency 2>&1 | tee -a "$LOG_FILE"; then
-                            log_info "✓ ZSWAP latency test complete"
-                        else
-                            log_warn "ZSWAP latency test had issues (non-critical)"
-                        fi
-                    else
-                        log_info "==> ZSWAP latency test skipped (TEST_ZSWAP_LATENCY=$TEST_ZSWAP_LATENCY)"
-                    fi
-                elif [ "$rc" -eq 42 ]; then
-                    log_warn "Swap partitioning requires offline ext* resize. Scheduled initramfs job for next reboot."
-                    log_warn "Continuing bootstrap without forcing a reboot."
+            # Optional: Run ZSWAP latency tests with real partitions
+            if [ "$TEST_ZSWAP_LATENCY" = "yes" ]; then
+                log_info "==> Testing ZSWAP latency with real disk backing"
+                if ./benchmark.py --test-zswap-latency 2>&1 | tee -a "$LOG_FILE"; then
+                    log_info "✓ ZSWAP latency test complete"
                 else
-                    log_error "✗ Swap partition creation failed"
-                    log_warn "Continuing with existing swap configuration"
+                    log_warn "ZSWAP latency test had issues (non-critical)"
                 fi
-            elif [ "$CREATE_SWAP_PARTITIONS" = "yes" ]; then
-                log_warn "CREATE_SWAP_PARTITIONS=yes but benchmark results not found"
-                log_warn "Skipping partition creation (requires matrix test results)"
             else
-                log_info "==> Swap partition creation skipped (CREATE_SWAP_PARTITIONS=$CREATE_SWAP_PARTITIONS)"
+                log_info "==> ZSWAP latency test skipped (TEST_ZSWAP_LATENCY=$TEST_ZSWAP_LATENCY)"
             fi
         else
             log_warn "Benchmarks had issues (non-critical, continuing)"

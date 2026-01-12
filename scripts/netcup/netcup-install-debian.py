@@ -56,7 +56,9 @@ import argparse
 import subprocess
 import threading
 import time
-import requests
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 from pathlib import Path
@@ -154,12 +156,89 @@ def _redact_for_log(value: Any) -> Any:
         return [_redact_for_log(v) for v in value]
     return value
 
+
+def _strip_jsonc_comments(text: str) -> str:
+    """Strip // and /* */ comments from JSON-with-comments (JSONC).
+
+    This is a small, dependency-free helper so our payload files can include
+    human-friendly comments while still parsing as JSON.
+    """
+
+    out: List[str] = []
+    i = 0
+    in_string = False
+    string_quote = ""
+    escape = False
+
+    while i < len(text):
+        ch = text[i]
+
+        if in_string:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == string_quote:
+                in_string = False
+                string_quote = ""
+            i += 1
+            continue
+
+        # Not in string
+        if ch in ("\"", "'"):
+            in_string = True
+            string_quote = ch
+            out.append(ch)
+            i += 1
+            continue
+
+        # Line comment
+        if ch == "/" and i + 1 < len(text) and text[i + 1] == "/":
+            i += 2
+            while i < len(text) and text[i] not in ("\n", "\r"):
+                i += 1
+            continue
+
+        # Block comment
+        if ch == "/" and i + 1 < len(text) and text[i + 1] == "*":
+            i += 2
+            while i + 1 < len(text) and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i = i + 2 if i + 1 < len(text) else len(text)
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
 # Load .env file if it exists
-def load_env_file():
-    """Load environment variables from .env file"""
-    env_file = Path.cwd() / ".env"
-    if env_file.exists():
-        with open(env_file) as f:
+def load_env_file() -> None:
+    """Load environment variables from a local .env file (no external deps).
+
+    Search order:
+      1) current working directory
+      2) directory containing this script (scripts/netcup)
+      3) repo root (two levels up from this script)
+
+    This makes it safe to run the script from repo root while keeping the
+    canonical .env next to the netcup tooling.
+    """
+
+    script_dir = Path(__file__).resolve().parent
+    candidates = [
+        Path.cwd() / ".env",
+        script_dir / ".env",
+        script_dir.parent.parent / ".env",
+    ]
+
+    env_file: Optional[Path] = next((p for p in candidates if p.exists()), None)
+    if env_file is None:
+        return
+
+    try:
+        with env_file.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
@@ -184,6 +263,10 @@ def load_env_file():
                     # runs deterministic (CLI flags are the intended override channel).
                     key = key.strip()
                     os.environ[key] = value
+    except OSError:
+        # Best-effort only; the caller will error out later if required vars are missing.
+        return
+
 
 load_env_file()
 
@@ -238,17 +321,33 @@ def get_access_token(refresh_token: str) -> str:
     """Get fresh access token using refresh token"""
     log_debug("Refreshing access token...")
 
-    response = requests.post(
-        f"{KEYCLOAK_URL}/token",
-        data={
+    data = urllib.parse.urlencode(
+        {
             "client_id": "scp",
             "refresh_token": refresh_token,
             "grant_type": "refresh_token",
-        },
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        f"{KEYCLOAK_URL}/token",
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
-    response.raise_for_status()
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        raise RuntimeError(f"Token request failed: HTTP {e.code}: {body[:500]}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Token request network error: {e}")
 
-    token_data = response.json()
+    token_data = json.loads(raw)
     access_token = token_data.get("access_token")
 
     if not access_token:
@@ -256,6 +355,54 @@ def get_access_token(refresh_token: str) -> str:
 
     log_debug(f"Access token obtained (expires in {token_data.get('expires_in', 'unknown')} seconds)")
     return access_token
+
+
+class HTTPStatusError(RuntimeError):
+    def __init__(self, status: int, message: str, body: str = ""):
+        super().__init__(message)
+        self.status = int(status)
+        self.body = body
+
+
+def _http_json(
+    method: str,
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
+    timeout: float = 30.0,
+) -> Any:
+    if params:
+        q = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+        if q:
+            url = url + ("&" if "?" in url else "?") + q
+
+    hdrs: Dict[str, str] = {"Accept": "application/json"}
+    if headers:
+        hdrs.update(headers)
+
+    data = None
+    if json_body is not None:
+        data = json.dumps(json_body).encode("utf-8")
+        hdrs.setdefault("Content-Type", "application/json")
+
+    req = urllib.request.Request(url, data=data, method=method.upper(), headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=float(timeout)) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            if not raw.strip():
+                return {}
+            return json.loads(raw)
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        raise HTTPStatusError(int(getattr(e, "code", 0) or 0), f"HTTP {getattr(e, 'code', '?')} for {url}", body)
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error for {url}: {e}")
 
 
 def parse_args():
@@ -285,6 +432,53 @@ These can be set in a .env file in the current directory.
         "--payload",
         metavar="FILE",
         help="Path to JSON payload file for direct installation (skips interactive gathering)"
+    )
+
+    parser.add_argument(
+        "--attach-only",
+        action="store_true",
+        help=(
+            "Do not call Netcup APIs. Only SSH-attach to a host and stream stage1/stage2 bootstrap logs, "
+            "reconnecting across disconnects/reboots."
+        ),
+    )
+    parser.add_argument(
+        "--attach-task-uuid",
+        default=None,
+        help=(
+            "Optional identifier used to name local capture files in --attach-only mode. "
+            "Default: a timestamp-based id."
+        ),
+    )
+    parser.add_argument(
+        "--simulate-disconnect-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Testing aid: in attach mode, intentionally terminate the SSH tail after N seconds to "
+            "force the reconnect/reattach loop."
+        ),
+    )
+    parser.add_argument(
+        "--attach-initial-delay",
+        type=float,
+        default=0.0,
+        help="In --attach-only mode, wait N seconds before the first SSH probe (default: 0).",
+    )
+    parser.add_argument(
+        "--attach-max-wait-seconds",
+        type=float,
+        default=300.0,
+        help="In --attach-only mode, wait up to N seconds for SSH to become usable (default: 300).",
+    )
+    parser.add_argument(
+        "--stage2-wait-seconds",
+        type=float,
+        default=1800.0,
+        help=(
+            "In --attach-only mode, also wait for /var/lib/vbpub/bootstrap/stage2_done (default: 1800). "
+            "Set to 0 to disable waiting."
+        ),
     )
 
     parser.add_argument(
@@ -558,6 +752,7 @@ class _SSHBootstrapFollower:
         poll_interval: float,
         initial_delay: float = 10.0,
         max_wait_seconds: float = 300.0,
+        simulate_disconnect_seconds: Optional[float] = None,
     ) -> None:
         self.task_uuid = task_uuid
         self.host = host
@@ -566,6 +761,11 @@ class _SSHBootstrapFollower:
         self.poll_interval = max(1.0, float(poll_interval))
         self.initial_delay = max(0.0, float(initial_delay))
         self.max_wait_seconds = max(5.0, float(max_wait_seconds))
+        self.simulate_disconnect_seconds = (
+            None
+            if simulate_disconnect_seconds is None
+            else max(0.0, float(simulate_disconnect_seconds))
+        )
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._proc: Optional[subprocess.Popen[str]] = None
@@ -682,25 +882,29 @@ class _SSHBootstrapFollower:
                 # - stage2: systemd journal for vbpub-bootstrap-stage2.service (survives cloud-init being disabled)
                 tail_remote = (
                     "bash -lc 'set -euo pipefail; "
-                    "echo \"[attach] Streaming stage1+stage2 logs\"; "
-                    "tail_stage1(){ P=/root/custom_script.output; "
+                    "echo "
+                    "  \"[attach] Streaming stage1+stage2 logs (one SSH session)\"; "
+                    "prefix(){ tag=\"$1\"; while IFS= read -r line; do printf \"[%s] %s\\n\" \"$tag\" \"$line\"; done; }; "
+                    "tail_stage1(){ "
+                    "  P=/root/custom_script.output; "
                     "  if [ ! -f \"$P\" ]; then "
                     "    echo \"[attach] Waiting for log to appear: $P\"; "
                     "    for i in $(seq 1 300); do [ -f \"$P\" ] && break; sleep 1; done; "
                     "  fi; "
-                    "  if [ -f \"$P\" ]; then echo \"[attach] Tailing: $P\"; tail -n 200 -F \"$P\"; "
-                    "  else echo \"[attach] No stage1 log at $P\"; fi; "
+                    "  if [ -f \"$P\" ]; then "
+                    "    echo \"[attach] Tailing: $P\"; "
+                    "    tail -n 200 -F \"$P\" 2>&1 | prefix stage1; "
+                    "  else "
+                    "    echo \"[attach] No stage1 log at $P\" | prefix stage1; "
+                    "  fi; "
                     "}; "
                     "tail_stage2(){ "
-                    "  if ! command -v journalctl >/dev/null 2>&1; then echo \"[attach] journalctl not available\"; return 0; fi; "
-                    "  echo \"[attach] Tailing: journalctl -u vbpub-bootstrap-stage2.service\"; "
-                    "  # Wait until the unit exists / emits logs (best effort). "
+                    "  if ! command -v journalctl >/dev/null 2>&1; then echo \"[attach] journalctl not available\" | prefix stage2; return 0; fi; "
+                    "  echo \"[attach] Tailing: journalctl -u vbpub-bootstrap-stage2.service\" | prefix stage2; "
                     "  for i in $(seq 1 600); do journalctl -u vbpub-bootstrap-stage2.service -n 1 --no-pager >/dev/null 2>&1 && break; sleep 1; done; "
-                    "  journalctl -u vbpub-bootstrap-stage2.service -n 200 -f --no-pager || true; "
+                    "  journalctl -u vbpub-bootstrap-stage2.service -n 200 -f --no-pager 2>&1 | prefix stage2; "
                     "}; "
-                    "(tail_stage1 2>&1 | sed -u \"s/^/[stage1] /\") & "
-                    "(tail_stage2 2>&1 | sed -u \"s/^/[stage2] /\") & "
-                    "wait'"
+                    "tail_stage1 & tail_stage2 & wait'"
                 )
 
                 cmd_tail = _build_ssh_cmd_base(self.host, self.user, self.identity_file) + [tail_remote]
@@ -716,6 +920,25 @@ class _SSHBootstrapFollower:
                     _log(f"[attach] Failed to start SSH tail: {e}", lf)
                     time.sleep(self.poll_interval)
                     continue
+
+                if self.simulate_disconnect_seconds and self.simulate_disconnect_seconds > 0:
+                    proc = self._proc
+
+                    def _simulate_disconnect() -> None:
+                        time.sleep(float(self.simulate_disconnect_seconds))
+                        if self._stop.is_set():
+                            return
+                        try:
+                            if proc and proc.poll() is None:
+                                _log(
+                                    f"[attach] Simulating disconnect: terminating SSH tail after {self.simulate_disconnect_seconds:.1f}s",
+                                    lf,
+                                )
+                                proc.terminate()
+                        except Exception:
+                            pass
+
+                    threading.Thread(target=_simulate_disconnect, daemon=True).start()
 
                 assert self._proc.stdout is not None
                 try:
@@ -950,30 +1173,30 @@ class NetcupSCPClient:
     def __init__(self, access_token: str, refresh_token: Optional[str] = None):
         self.base_url = BASE_URL
         self.refresh_token = refresh_token
-        self.session = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Bearer {access_token}",
-            "Accept":  "application/json",
-            "Content-Type": "application/json",
-        })
+        self.access_token = access_token
 
     def refresh_access_token(self) -> None:
         if not self.refresh_token:
             raise RuntimeError("No refresh token available for access token refresh")
         new_access_token = get_access_token(self.refresh_token)
-        self.session.headers.update({"Authorization": f"Bearer {new_access_token}"})
+        self.access_token = new_access_token
+
+    def _auth_headers(self) -> Dict[str, str]:
+        return {"Authorization": f"Bearer {self.access_token}"}
 
     def get(self, endpoint: str, params: Optional[Dict] = None) -> Any:
         """Make GET request to API"""
         url = f"{self.base_url}{endpoint}"
         log_debug(f"GET {url} {params or ''}")
-        response = self.session.get(url, params=params, timeout=30)
-        if response.status_code == 401 and self.refresh_token:
-            log_debug("401 Unauthorized; refreshing token and retrying once")
-            self.refresh_access_token()
-            response = self.session.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        result = response.json()
+        try:
+            result = _http_json("GET", url, headers=self._auth_headers(), params=params)
+        except HTTPStatusError as e:
+            if e.status == 401 and self.refresh_token:
+                log_debug("401 Unauthorized; refreshing token and retrying once")
+                self.refresh_access_token()
+                result = _http_json("GET", url, headers=self._auth_headers(), params=params)
+            else:
+                raise
         log_debug(f"Response: {json.dumps(_redact_for_log(result), indent=2)}")
         return result
 
@@ -982,13 +1205,15 @@ class NetcupSCPClient:
         url = f"{self.base_url}{endpoint}"
         log_debug(f"POST {url}")
         log_debug(f"Payload: {json.dumps(_redact_for_log(data), indent=2)}")
-        response = self.session.post(url, json=data, timeout=30)
-        if response.status_code == 401 and self.refresh_token:
-            log_debug("401 Unauthorized; refreshing token and retrying once")
-            self.refresh_access_token()
-            response = self.session.post(url, json=data, timeout=30)
-        response.raise_for_status()
-        result = response.json()
+        try:
+            result = _http_json("POST", url, headers=self._auth_headers(), json_body=data)
+        except HTTPStatusError as e:
+            if e.status == 401 and self.refresh_token:
+                log_debug("401 Unauthorized; refreshing token and retrying once")
+                self.refresh_access_token()
+                result = _http_json("POST", url, headers=self._auth_headers(), json_body=data)
+            else:
+                raise
         log_debug(f"Response: {json.dumps(_redact_for_log(result), indent=2)}")
         return result
 
@@ -997,38 +1222,35 @@ class NetcupSCPClient:
         url = f"{self.base_url}{endpoint}"
         log_debug(f"PATCH {url} {params or ''}")
         log_debug(f"Payload: {json.dumps(_redact_for_log(data), indent=2)}")
-        response = self.session.patch(
-            url,
-            params=params,
-            json=data,
-            headers={"Content-Type": "application/merge-patch+json"},
-            timeout=30,
-        )
-        if response.status_code == 401 and self.refresh_token:
-            log_debug("401 Unauthorized; refreshing token and retrying once")
-            self.refresh_access_token()
-            response = self.session.patch(
-                url,
-                params=params,
-                json=data,
-                headers={"Content-Type": "application/merge-patch+json"},
-                timeout=30,
-            )
-        response.raise_for_status()
-        result = response.json() if response.content else {}
+        headers = self._auth_headers()
+        headers["Content-Type"] = "application/merge-patch+json"
+        try:
+            result = _http_json("PATCH", url, headers=headers, params=params, json_body=data)
+        except HTTPStatusError as e:
+            if e.status == 401 and self.refresh_token:
+                log_debug("401 Unauthorized; refreshing token and retrying once")
+                self.refresh_access_token()
+                headers = self._auth_headers()
+                headers["Content-Type"] = "application/merge-patch+json"
+                result = _http_json("PATCH", url, headers=headers, params=params, json_body=data)
+            else:
+                raise
         log_debug(f"Response: {json.dumps(_redact_for_log(result), indent=2)}")
         return result
 
     def get_user_info(self) -> Dict:
         """Get user information from OIDC userinfo endpoint"""
-        log_debug(f"GET {KEYCLOAK_URL}/userinfo")
-        response = self.session.get(f"{KEYCLOAK_URL}/userinfo", timeout=30)
-        if response.status_code == 401 and self.refresh_token:
-            log_debug("401 Unauthorized; refreshing token and retrying once")
-            self.refresh_access_token()
-            response = self.session.get(f"{KEYCLOAK_URL}/userinfo", timeout=30)
-        response.raise_for_status()
-        result = response.json()
+        url = f"{KEYCLOAK_URL}/userinfo"
+        log_debug(f"GET {url}")
+        try:
+            result = _http_json("GET", url, headers=self._auth_headers())
+        except HTTPStatusError as e:
+            if e.status == 401 and self.refresh_token:
+                log_debug("401 Unauthorized; refreshing token and retrying once")
+                self.refresh_access_token()
+                result = _http_json("GET", url, headers=self._auth_headers())
+            else:
+                raise
         log_debug(f"Response: {json.dumps(_redact_for_log(result), indent=2)}")
         return result
 
@@ -1043,8 +1265,9 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
     # Load payload
     print(f"Loading payload from: {payload_path}")
     try:
-        with open(payload_path) as f:
-            installation_payload = json.load(f)
+        with open(payload_path, "r", encoding="utf-8") as f:
+            raw_payload = f.read()
+        installation_payload = json.loads(_strip_jsonc_comments(raw_payload))
     except FileNotFoundError:
         print(f"❌ ERROR: Payload file not found: {payload_path}", file=sys.stderr)
         sys.exit(1)
@@ -1136,8 +1359,9 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
     print("Starting installation...")
     try:
         result = client.post(f"/api/v1/servers/{server_id}/image", installation_payload)
-        
-        print(json.dumps(result, indent=2))
+
+        # Avoid leaking secrets (some APIs may include passwords/tokens).
+        print(json.dumps(_redact_for_log(result), indent=2))
         print()
         
         if "uuid" in result:
@@ -1159,14 +1383,14 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
                     ssh_identity_file=ssh_identity,
                     attach_bootstrap=getattr(args, "attach_bootstrap", True),
                 )
-    except requests.HTTPError as e:
-        status = getattr(getattr(e, "response", None), "status_code", None)
+    except HTTPStatusError as e:
+        status = getattr(e, "status", None)
 
         # If the server is locked because an image installation is already running,
         # fall back to monitoring the active task.
         if status == 409:
             try:
-                error_data = e.response.json() if e.response is not None else None
+                error_data = json.loads(e.body) if e.body else None
             except Exception:
                 error_data = None
 
@@ -1204,18 +1428,56 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
                 sys.exit(1)
 
         print(f"❌ HTTP Error: {e}", file=sys.stderr)
-        if e.response is not None and e.response.text:
+        if getattr(e, "body", ""):
             try:
-                error_data = e.response.json()
-                print(f"Response: {json.dumps(error_data, indent=2)}", file=sys.stderr)
+                error_data = json.loads(e.body)
+                print(f"Response: {json.dumps(_redact_for_log(error_data), indent=2)}", file=sys.stderr)
             except Exception:
-                print(f"Response: {e.response.text}", file=sys.stderr)
+                print(f"Response: {e.body[:2000]}", file=sys.stderr)
         sys.exit(1)
 
 
 def main():
     global args
     args = parse_args()
+
+    if getattr(args, "attach_only", False):
+        if not getattr(args, "ssh_host", None):
+            print("ERROR: --attach-only requires --ssh-host (or NETCUP_SSH_HOST)", file=sys.stderr)
+            sys.exit(2)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        attach_task_uuid = getattr(args, "attach_task_uuid", None) or f"attach-only-{ts}"
+        follower = _SSHBootstrapFollower(
+            task_uuid=attach_task_uuid,
+            host=getattr(args, "ssh_host"),
+            user=getattr(args, "ssh_user", "root"),
+            identity_file=getattr(args, "ssh_identity_file", None),
+            poll_interval=getattr(args, "poll_interval", 5.0),
+            initial_delay=getattr(args, "attach_initial_delay", 0.0),
+            max_wait_seconds=getattr(args, "attach_max_wait_seconds", 300.0),
+            simulate_disconnect_seconds=getattr(args, "simulate_disconnect_seconds", None),
+        )
+        follower.start()
+        try:
+            wait_seconds = float(getattr(args, "stage2_wait_seconds", 0.0) or 0.0)
+            if wait_seconds > 0:
+                _wait_for_stage2_done(
+                    host=getattr(args, "ssh_host"),
+                    user=getattr(args, "ssh_user", "root"),
+                    identity_file=getattr(args, "ssh_identity_file", None),
+                    poll_interval=getattr(args, "poll_interval", 5.0),
+                    max_wait_seconds=wait_seconds,
+                    monitor_log_path=follower.local_log_path,
+                )
+            else:
+                print("[attach-only] Streaming until Ctrl-C (stage2 wait disabled).")
+                while True:
+                    time.sleep(1)
+        except KeyboardInterrupt:
+            print("\nInterrupted; stopping attach.")
+        finally:
+            follower.stop()
+        return
     
     # Check for refresh token
     refresh_token = os.environ.get("NETCUP_REFRESH_TOKEN")
@@ -1265,7 +1527,7 @@ def main():
                 {"state": "OFF"},
                 params={"stateOption": "POWEROFF"},
             )
-            print(json.dumps(result, indent=2))
+            print(json.dumps(_redact_for_log(result), indent=2))
             return
 
         # 2. Get server details (for disk info and hostname)
@@ -1510,7 +1772,7 @@ def main():
         try:
             result = client.post(f"/api/v1/servers/{server_id}/image", installation_payload)
 
-            print(json.dumps(result, indent=2))
+            print(json.dumps(_redact_for_log(result), indent=2))
             print()
 
             if "uuid" in result:
@@ -1533,11 +1795,11 @@ def main():
                         ssh_identity_file=ssh_identity,
                         attach_bootstrap=getattr(args, "attach_bootstrap", True),
                     )
-        except requests.HTTPError as e:
-            status = getattr(getattr(e, "response", None), "status_code", None)
+        except HTTPStatusError as e:
+            status = getattr(e, "status", None)
             if status == 409:
                 try:
-                    error_data = e.response.json() if e.response is not None else None
+                    error_data = json.loads(e.body) if getattr(e, "body", "") else None
                 except Exception:
                     error_data = None
 
@@ -1567,14 +1829,14 @@ def main():
                         return
             raise
 
-    except requests.HTTPError as e:
+    except HTTPStatusError as e:
         print(f"❌ HTTP Error: {e}", file=sys.stderr)
-        if e.response.text:
+        if getattr(e, "body", ""):
             try:
-                error_data = e.response.json()
-                print(f"Response: {json.dumps(error_data, indent=2)}", file=sys.stderr)
-            except:
-                print(f"Response: {e.response.text}", file=sys.stderr)
+                error_data = json.loads(e.body)
+                print(f"Response: {json.dumps(_redact_for_log(error_data), indent=2)}", file=sys.stderr)
+            except Exception:
+                print(f"Response: {e.body[:2000]}", file=sys.stderr)
         sys.exit(1)
     except KeyError as e:
         print(f"❌ Missing expected field in API response: {e}", file=sys.stderr)
