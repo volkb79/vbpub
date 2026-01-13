@@ -174,6 +174,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 # Optional telegram client import (for --telegram flag)
 try:
@@ -214,6 +215,36 @@ COMPRESSION_RATIO_MAX = 4.0  # Maximum typical compression ratio
 COMPRESSION_RATIO_SUSPICIOUS = 10.0  # Ratio above this is suspicious
 MIN_VALID_COMPRESSION_RATIO = 1.1  # Minimum ratio to consider valid (below this indicates test failure)
 ZRAM_STABILIZATION_DELAY_SEC = 2  # Time to wait after ZRAM cleanup for system stabilization
+
+
+def _compression_ratio_expectations_for_pattern(pattern: Optional[int]):
+    """Return (min_expected, max_typical, suspicious_high, label) for a mem_pressure pattern.
+
+    mem_pressure pattern_type:
+      0=mixed, 1=random, 2=zeros, 3=sequential
+    """
+
+    # Defaults for historical behavior / unknown pattern.
+    if pattern is None:
+        return (COMPRESSION_RATIO_MIN, COMPRESSION_RATIO_MAX, COMPRESSION_RATIO_SUSPICIOUS, "typical")
+
+    # Random: should be near 1.0 (low compressibility).
+    if pattern == 1:
+        return (0.95, 1.30, 2.00, "random")
+
+    # Mixed: broad, can be moderately compressible.
+    if pattern == 0:
+        return (1.20, 4.00, 8.00, "mixed")
+
+    # Zeros: extremely compressible, very high ratios are expected.
+    if pattern == 2:
+        return (5.00, 50.00, 200.00, "zeros")
+
+    # Sequential: often quite compressible with LZ4 (higher ratios can be normal).
+    if pattern == 3:
+        return (1.50, 20.00, 100.00, "sequential")
+
+    return (COMPRESSION_RATIO_MIN, COMPRESSION_RATIO_MAX, COMPRESSION_RATIO_SUSPICIOUS, "typical")
 
 # Optional: disk-backed guard swapfile for benchmarks (prevents OOM during aggressive tests)
 DEFAULT_GUARD_SWAP_MB = 1024
@@ -1463,19 +1494,20 @@ def benchmark_compression(compressor, allocator='zsmalloc', size_mb=COMPRESSION_
             results['compr_size_mb'] = round(compr_size / 1024 / 1024, 2)
             results['mem_used_mb'] = round(mem_used / 1024 / 1024, 2)
 
-            # Compression ratio: should be ~1.5 - 4.0 typically
             ratio = orig_size / compr_size
-            if ratio < COMPRESSION_RATIO_MIN or ratio > COMPRESSION_RATIO_SUSPICIOUS:
+            exp_min, exp_max, exp_suspicious, exp_label = _compression_ratio_expectations_for_pattern(pattern)
+
+            if ratio < exp_min or ratio > exp_suspicious:
                 msg = (
                     f"Suspicious compression ratio: {ratio:.2f}x "
-                    f"(expected {COMPRESSION_RATIO_MIN}-{COMPRESSION_RATIO_MAX}x for typical data)"
+                    f"(expected {exp_min:.2f}-{exp_max:.2f}x for {exp_label} data)"
                 )
                 log_warn(msg)
                 _append_warning(results, msg)
-            elif ratio > COMPRESSION_RATIO_MAX:
+            elif ratio > exp_max:
                 msg = (
                     f"High compression ratio: {ratio:.2f}x "
-                    f"(above typical {COMPRESSION_RATIO_MAX}x; workload may be unusually compressible)"
+                    f"(above typical {exp_max:.2f}x for {exp_label} data; workload may be unusually compressible)"
                 )
                 log_warn(msg)
                 _append_warning(results, msg)

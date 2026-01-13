@@ -933,17 +933,19 @@ class _SSHBootstrapFollower:
                     time.sleep(self.poll_interval)
                     continue
 
-                if self.simulate_disconnect_seconds and self.simulate_disconnect_seconds > 0:
+                secs_opt = self.simulate_disconnect_seconds
+                if secs_opt is not None and secs_opt > 0:
                     proc = self._proc
+                    secs = float(secs_opt)
 
                     def _simulate_disconnect() -> None:
-                        time.sleep(float(self.simulate_disconnect_seconds))
+                        time.sleep(secs)
                         if self._stop.is_set():
                             return
                         try:
                             if proc and proc.poll() is None:
                                 _log(
-                                    f"[attach] Simulating disconnect: terminating SSH tail after {self.simulate_disconnect_seconds:.1f}s",
+                                    f"[attach] Simulating disconnect: terminating SSH tail after {secs:.1f}s",
                                     lf,
                                 )
                                 proc.terminate()
@@ -1267,8 +1269,12 @@ class NetcupSCPClient:
         return result
 
 
-def install_from_payload(client: NetcupSCPClient, payload_path: str):
-    """Install directly from a payload JSON file"""
+def install_from_payload(client: NetcupSCPClient, payload_path: str, args: argparse.Namespace):
+    """Install directly from a payload JSON file.
+
+    The payload file may contain placeholders like {{TELEGRAM_BOT_TOKEN}} so it
+    can be stored safely. Placeholders are expanded only for the API request.
+    """
     print("=" * 70)
     print("DIRECT INSTALLATION MODE")
     print("=" * 70)
@@ -1290,55 +1296,25 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
     print("✓ Payload loaded successfully")
     print()
 
-    # Allow safe payload files that contain placeholders instead of secrets.
-    # Supported placeholders:
-    #   {{TELEGRAM_BOT_TOKEN}}, {{TELEGRAM_CHAT_ID}}, {{SERVER_NAME}}
-    try:
-        cs = installation_payload.get("customScript")
-        if isinstance(cs, str) and "{{" in cs and "}}" in cs:
-            cs = cs.replace("{{TELEGRAM_BOT_TOKEN}}", os.environ.get("TELEGRAM_BOT_TOKEN", ""))
-            cs = cs.replace("{{TELEGRAM_CHAT_ID}}", os.environ.get("TELEGRAM_CHAT_ID", ""))
-            cs = cs.replace("{{SERVER_NAME}}", os.environ.get("SERVER_NAME", ""))
-            installation_payload["customScript"] = cs
-    except Exception:
-        pass
+    # Expand placeholders only for the API request, while keeping the loaded
+    # payload safe-to-print/save.
+    installation_payload_to_send = _expand_payload_placeholders(installation_payload)
 
-    # If an SSH identity file was provided for monitoring, ensure the same key is injected
-    # by selecting/creating the matching sshKeyId in the SCP account.
-    ssh_identity = getattr(args, "ssh_identity_file", None)
-    if ssh_identity:
-        try:
-            ssh_key_id = _ensure_netcup_ssh_key_id_for_identity(client, ssh_identity)
-            installation_payload["sshKeyIds"] = [ssh_key_id]
-            print(f"✓ Using sshKeyId matching identity file: {ssh_key_id}")
-            print()
-        except Exception as e:
-            print(f"❌ ERROR: failed to resolve sshKeyId for identity file: {e}", file=sys.stderr)
-            sys.exit(1)
-    
-    # Extract server ID from payload or use hostname to find it
+    # Resolve server ID.
     server_id = None
     if "serverId" in installation_payload:
-        server_id = installation_payload.pop("serverId")
-        print(f"Using server ID from payload: {server_id}")
+        server_id = installation_payload.get("serverId")
     else:
-        # Try to find server by the hostname in payload
         hostname = installation_payload.get("hostname")
         if hostname:
-            print(f"Finding server by hostname: {hostname}")
             servers = client.get("/api/v1/servers", params={"name": hostname})
             if servers:
-                server_id = servers[0]["id"]
-                print(f"✓ Found server ID: {server_id}")
-            else:
-                print(f"❌ ERROR: Server with hostname '{hostname}' not found!", file=sys.stderr)
-                sys.exit(1)
-        else:
-            print("❌ ERROR: Payload must contain 'serverId' or 'hostname'", file=sys.stderr)
-            sys.exit(1)
-    
-    print()
-    
+                server_id = servers[0].get("id")
+
+    if not server_id:
+        print("❌ ERROR: Payload must contain 'serverId' (or a resolvable 'hostname')", file=sys.stderr)
+        sys.exit(1)
+
     # Best-effort fetch server details so we can attach via SSH during monitoring.
     server_details = None
     ip_address = None
@@ -1348,13 +1324,13 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
     except Exception:
         pass
 
-    # Display payload summary
+    # Display payload summary.
     print("=" * 70)
     print("PAYLOAD SUMMARY")
     print("=" * 70)
     print(json.dumps(_redact_for_log(installation_payload), indent=2))
     print()
-    
+
     # Ask for confirmation (unless non-interactive)
     if not is_noninteractive(args):
         print("=" * 70)
@@ -1365,17 +1341,17 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
     else:
         print("=" * 70)
         print("Non-interactive mode: starting installation without prompt")
-    
-    # Start installation
+
+    # Start installation.
     print()
     print("Starting installation...")
     try:
-        result = client.post(f"/api/v1/servers/{server_id}/image", installation_payload)
+        result = client.post(f"/api/v1/servers/{server_id}/image", installation_payload_to_send)
 
         # Avoid leaking secrets (some APIs may include passwords/tokens).
         print(json.dumps(_redact_for_log(result), indent=2))
         print()
-        
+
         if "uuid" in result:
             task_uuid = result["uuid"]
             print("=" * 70)
@@ -1392,53 +1368,10 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
                     poll_interval=getattr(args, "poll_interval", 5.0),
                     ssh_host=(getattr(args, "ssh_host", None) or ip_address),
                     ssh_user=getattr(args, "ssh_user", "root"),
-                    ssh_identity_file=ssh_identity,
+                    ssh_identity_file=getattr(args, "ssh_identity_file", None),
                     attach_bootstrap=getattr(args, "attach_bootstrap", True),
                 )
     except HTTPStatusError as e:
-        status = getattr(e, "status", None)
-
-        # If the server is locked because an image installation is already running,
-        # fall back to monitoring the active task.
-        if status == 409:
-            try:
-                error_data = json.loads(e.body) if e.body else None
-            except Exception:
-                error_data = None
-
-            code = error_data.get("code") if isinstance(error_data, dict) else None
-            msg = error_data.get("message") if isinstance(error_data, dict) else None
-            if code == "server.lock.error":
-                sid = locals().get("server_id")
-                if isinstance(sid, int):
-                    active_task = _find_active_task_for_server(client, sid)
-                    if active_task and isinstance(active_task.get("uuid"), str):
-                        task_uuid = active_task["uuid"]
-                        print("⚠ Server is locked (installation already running).")
-                        print(f"✓ Monitoring existing task instead: {task_uuid}")
-
-                        if getattr(args, "monitor", False) or is_noninteractive(args):
-                            ssh_identity = getattr(args, "ssh_identity_file", None)
-                            monitor_task(
-                                client,
-                                task_uuid,
-                                poll_interval=getattr(args, "poll_interval", 5.0),
-                                ssh_host=(getattr(args, "ssh_host", None) or locals().get("ip_address")),
-                                ssh_user=getattr(args, "ssh_user", "root"),
-                                ssh_identity_file=ssh_identity,
-                                attach_bootstrap=getattr(args, "attach_bootstrap", True),
-                            )
-                            return
-
-                        print("Monitor progress with:")
-                        print(f"  python3 monitor-task.py {task_uuid}")
-                        return
-
-                print(f"❌ HTTP Error: {e}", file=sys.stderr)
-                if msg:
-                    print(f"Response: {json.dumps({'code': code, 'message': msg}, indent=2)}", file=sys.stderr)
-                sys.exit(1)
-
         print(f"❌ HTTP Error: {e}", file=sys.stderr)
         if getattr(e, "body", ""):
             try:
@@ -1449,9 +1382,43 @@ def install_from_payload(client: NetcupSCPClient, payload_path: str):
         sys.exit(1)
 
 
+def _expand_payload_placeholders(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of payload with supported placeholders expanded.
+
+    This is used to keep payloads safe-to-print/save (placeholders), while
+    still ensuring the API request sends real values.
+    """
+
+    expanded: Dict[str, Any] = json.loads(json.dumps(payload))
+    try:
+        cs = expanded.get("customScript")
+        if isinstance(cs, str) and "{{" in cs and "}}" in cs:
+            token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+            chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+            server_name = os.environ.get("SERVER_NAME", "")
+
+            if "{{TELEGRAM_BOT_TOKEN}}" in cs and not token:
+                print("⚠ WARNING: TELEGRAM_BOT_TOKEN not set; notifications will be disabled")
+            if "{{TELEGRAM_CHAT_ID}}" in cs and not chat_id:
+                print("⚠ WARNING: TELEGRAM_CHAT_ID not set; notifications will be disabled")
+
+            cs = cs.replace("{{TELEGRAM_BOT_TOKEN}}", token)
+            cs = cs.replace("{{TELEGRAM_CHAT_ID}}", chat_id)
+            cs = cs.replace("{{SERVER_NAME}}", server_name)
+            expanded["customScript"] = cs
+    except Exception:
+        pass
+
+    return expanded
+
+
 def main():
     global args
     args = parse_args()
+
+    if not SERVER_NAME:
+        print("ERROR: missing $SERVER_NAME (set it in scripts/netcup/.env)", file=sys.stderr)
+        sys.exit(1)
 
     if getattr(args, "attach_only", False):
         if not getattr(args, "ssh_host", None):
@@ -1509,7 +1476,7 @@ def main():
     
     # If payload file is provided, use direct installation mode
     if args.payload:
-        install_from_payload(client, args.payload)
+        install_from_payload(client, args.payload, args)
         return
 
     print("=" * 70)
@@ -1747,11 +1714,15 @@ def main():
             **INSTALLATION_CONFIG
         }
 
+        # Expand placeholders only for the API request, while keeping the
+        # payload safe-to-print/save.
+        installation_payload_to_send = _expand_payload_placeholders(installation_payload)
+
         # 7. Display summary
         print("=" * 70)
         print("INSTALLATION PARAMETERS SUMMARY")
         print("=" * 70)
-        print(json.dumps(installation_payload, indent=2))
+        print(json.dumps(_redact_for_log(installation_payload), indent=2))
         print()
 
         # 8. Save payload to file with comments
@@ -1782,7 +1753,7 @@ def main():
         print()
         print("Starting installation...")
         try:
-            result = client.post(f"/api/v1/servers/{server_id}/image", installation_payload)
+            result = client.post(f"/api/v1/servers/{server_id}/image", installation_payload_to_send)
 
             print(json.dumps(_redact_for_log(result), indent=2))
             print()
