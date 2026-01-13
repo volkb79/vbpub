@@ -3983,7 +3983,7 @@ def export_shell_config(results, output_file):
                 f.write("ZSWAP_COMPRESSOR=lz4\n")
                 f.write("ZRAM_COMPRESSOR=lz4\n\n")
         
-        # Best allocator (ignore failed/unreliable runs)
+        # Best allocator (ignore failed/unreliable runs; prefer mixed/default pattern when available)
         if 'allocators' in results and results['allocators']:
             candidates = [
                 r for r in results['allocators']
@@ -3992,7 +3992,11 @@ def export_shell_config(results, output_file):
                 and r.get('reliable', True)
                 and isinstance(r.get('efficiency_pct'), (int, float))
             ]
-            best_alloc = max(candidates, key=lambda x: x.get('efficiency_pct', 0), default=None)
+            mixed = [
+                r for r in candidates
+                if (r.get('pattern_id') == 0) or (str(r.get('data_pattern', '')).lower() == 'mixed')
+            ]
+            best_alloc = max((mixed or candidates), key=lambda x: x.get('efficiency_pct', 0), default=None)
             if best_alloc:
                 f.write(f"# Best allocator: {best_alloc['allocator']}\n")
                 f.write(f"# (Efficiency: {best_alloc.get('efficiency_pct', 0)}%)\n")
@@ -4084,10 +4088,21 @@ def generate_benchmark_summary_report(results, output_file):
             f.write(f"({best_comp.get('compression_ratio', 0):.2f}x compression ratio)\n")
         
         if 'allocators' in results and results['allocators']:
-            best_alloc = max(results['allocators'], 
-                           key=lambda x: x.get('efficiency_pct', 0))
-            f.write(f"✓ Allocator:           {best_alloc['allocator']} ")
-            f.write(f"({best_alloc.get('efficiency_pct', 0):.1f}% efficiency)\n")
+            candidates = [
+                r for r in results['allocators']
+                if isinstance(r, dict)
+                and 'error' not in r
+                and r.get('reliable', True)
+                and isinstance(r.get('efficiency_pct'), (int, float))
+            ]
+            mixed = [
+                r for r in candidates
+                if (r.get('pattern_id') == 0) or (str(r.get('data_pattern', '')).lower() == 'mixed')
+            ]
+            best_alloc = max((mixed or candidates), key=lambda x: x.get('efficiency_pct', 0), default=None)
+            if best_alloc:
+                f.write(f"✓ Allocator:           {best_alloc['allocator']} ")
+                f.write(f"({best_alloc.get('efficiency_pct', 0):.1f}% efficiency)\n")
         
         # Matrix "concurrency" is fio numjobs (I/O concurrency), not swap-device count.
         if isinstance(matrix_opt, dict) and isinstance((matrix_opt.get('best_combined') or {}).get('concurrency'), int):
@@ -4791,117 +4806,101 @@ def generate_charts(results, output_dir='/var/log/debian-install', webp=True):
 
                 valid_rows = [r for r in spm['matrix'] if isinstance(r, dict) and 'error' not in r]
                 if valid_rows:
-                    # For each device_count and block_size_kb, keep the best row by score.
-                    by = {}
+                    metric = (spm.get('optimal') or {}).get('latency_metric') or (spm.get('fio_workload') or {}).get('latency_metric') or 'p99'
+                    mix = (spm.get('fio_workload') or {}).get('rwmixread', '?')
+
+                    # Group rows by (device_count, numjobs_per_device, iodepth).
+                    grouped = {}
                     for r in valid_rows:
                         bs = r.get('block_size_kb')
                         dc = r.get('device_count')
-                        if not isinstance(bs, int) or not isinstance(dc, int):
+                        nj = r.get('numjobs_per_device')
+                        depth = r.get('iodepth')
+                        if not all(isinstance(x, int) for x in (bs, dc, nj, depth)):
                             continue
-                        k = (bs, dc)
-                        cur = by.get(k)
-                        if cur is None or _score(r) > _score(cur):
-                            by[k] = r
+                        grouped.setdefault((dc, nj, depth), []).append(r)
 
-                    block_sizes = sorted({bs for (bs, _) in by.keys()})
-                    device_counts = sorted({dc for (_, dc) in by.keys()})
-
-                    # Chart A: score vs device_count
-                    fig, ax = plt.subplots(figsize=(11, 6))
-                    for bs in block_sizes:
-                        xs = [dc for dc in device_counts if (bs, dc) in by]
-                        ys = [_score(by[(bs, dc)]) for dc in xs]
-                        ax.plot(xs, ys, marker='o', linewidth=2, label=f"{bs}KB")
+                    device_counts = sorted({k[0] for k in grouped.keys()})
 
                     chosen = (spm.get('optimal') or {}).get('best_combined') or {}
                     try:
-                        cbs = int(chosen.get('block_size_kb'))
-                        cdc = int(chosen.get('device_count'))
-                        crow = by.get((cbs, cdc))
-                        if crow:
-                            ax.plot([cdc], [_score(crow)], marker='*', markersize=18, color='gold', markeredgecolor='black', label='Chosen')
-                            cj = int(crow.get('numjobs_per_device', 1) or 1)
-                            cd = int(crow.get('iodepth', 1) or 1)
-                            ax.annotate(
-                                f"jobs/dev={cj}, iodepth={cd}",
-                                xy=(cdc, _score(crow)),
-                                xytext=(8, 10),
-                                textcoords='offset points',
-                                fontsize=9,
-                                bbox=dict(boxstyle='round,pad=0.25', fc='white', alpha=0.7),
-                            )
+                        chosen_dc = int(chosen.get('device_count'))
+                        chosen_bs = int(chosen.get('block_size_kb'))
+                        chosen_nj = int(chosen.get('numjobs_per_device', 1) or 1)
+                        chosen_depth = int(chosen.get('iodepth', 1) or 1)
                     except Exception:
-                        pass
+                        chosen_dc = chosen_bs = chosen_nj = chosen_depth = None
 
-                    metric = (spm.get('optimal') or {}).get('latency_metric') or (spm.get('fio_workload') or {}).get('latency_metric') or 'p99'
-                    mix = (spm.get('fio_workload') or {}).get('rwmixread', '?')
-                    jobs_levels = spm.get('numjobs_per_device_levels') or []
-                    depth_levels = spm.get('iodepth_levels') or []
-                    ax.set_title(
-                        f"Swap Striping Score vs Devices (lat={metric}, rwmixread={mix}%)\n"
-                        + f"(each point is best over jobs/dev∈{jobs_levels}, iodepth∈{depth_levels})",
-                        fontsize=14,
-                        fontweight='bold',
-                    )
-                    ax.set_xlabel('Swap devices (SWAP_STRIPE_WIDTH candidate)', fontsize=12)
-                    ax.set_ylabel('Score (MB/s per µs; higher is better)', fontsize=12)
-                    ax.grid(True, alpha=0.3)
-                    ax.legend(fontsize=10)
+                    # Raw-data charts: x=blocksize, left y=throughput, right y=latency.
+                    # One chart per device_count to keep it readable.
+                    for dc in device_counts:
+                        series_keys = sorted({(nj, depth) for (kdc, nj, depth) in grouped.keys() if kdc == dc})
+                        if not series_keys:
+                            continue
 
-                    chart_file = f"{output_dir}/swap-partitions-matrix-score-{timestamp}.png"
-                    plt.tight_layout()
-                    plt.savefig(chart_file, dpi=150, bbox_inches='tight')
-                    plt.close()
-                    chart_files.append(chart_file)
-                    log_info(f"Generated swap matrix score chart: {chart_file}")
+                        fig, ax1 = plt.subplots(figsize=(12, 6))
+                        ax2 = ax1.twinx()
 
-                    # Chart B: weighted latency vs device_count
-                    fig, ax = plt.subplots(figsize=(11, 6))
-                    for bs in block_sizes:
-                        xs = [dc for dc in device_counts if (bs, dc) in by]
-                        ys = [_lat_w_us(by[(bs, dc)]) for dc in xs]
-                        ax.plot(xs, ys, marker='o', linewidth=2, label=f"{bs}KB")
-                    ax.set_title(
-                        f"Swap Striping Weighted Latency vs Devices (lat={metric})\n"
-                        + f"(each point is best over jobs/dev∈{jobs_levels}, iodepth∈{depth_levels})",
-                        fontsize=14,
-                        fontweight='bold',
-                    )
-                    ax.set_xlabel('Swap devices (SWAP_STRIPE_WIDTH candidate)', fontsize=12)
-                    ax.set_ylabel('Weighted latency (µs; lower is better)', fontsize=12)
-                    ax.grid(True, alpha=0.3)
-                    ax.legend(fontsize=10)
+                        cmap = plt.get_cmap('tab10')
+                        for i, (nj, depth) in enumerate(series_keys):
+                            rows = grouped.get((dc, nj, depth), [])
+                            # Build a map so we only keep one point per block size.
+                            by_bs = {}
+                            for r in rows:
+                                bs = r.get('block_size_kb')
+                                if not isinstance(bs, int):
+                                    continue
+                                # Keep the higher-throughput run if duplicates exist.
+                                cur = by_bs.get(bs)
+                                if cur is None or float(r.get('combined_mb_per_sec', 0) or 0) > float(cur.get('combined_mb_per_sec', 0) or 0):
+                                    by_bs[bs] = r
 
-                    chart_file = f"{output_dir}/swap-partitions-matrix-latency-{timestamp}.png"
-                    plt.tight_layout()
-                    plt.savefig(chart_file, dpi=150, bbox_inches='tight')
-                    plt.close()
-                    chart_files.append(chart_file)
-                    log_info(f"Generated swap matrix latency chart: {chart_file}")
+                            xs = sorted(by_bs.keys())
+                            if not xs:
+                                continue
+                            ys_bw = [float(by_bs[bs].get('combined_mb_per_sec', 0) or 0) for bs in xs]
+                            ys_lat = [_lat_w_us(by_bs[bs]) for bs in xs]
 
-                    # Chart C: throughput vs device_count
-                    fig, ax = plt.subplots(figsize=(11, 6))
-                    for bs in block_sizes:
-                        xs = [dc for dc in device_counts if (bs, dc) in by]
-                        ys = [float(by[(bs, dc)].get('combined_mb_per_sec', 0) or 0) for dc in xs]
-                        ax.plot(xs, ys, marker='o', linewidth=2, label=f"{bs}KB")
-                    ax.set_title(
-                        "Swap Striping Throughput vs Devices\n"
-                        + f"(each point is best over jobs/dev∈{jobs_levels}, iodepth∈{depth_levels})",
-                        fontsize=14,
-                        fontweight='bold',
-                    )
-                    ax.set_xlabel('Swap devices (SWAP_STRIPE_WIDTH candidate)', fontsize=12)
-                    ax.set_ylabel('Throughput (MB/s; higher is better)', fontsize=12)
-                    ax.grid(True, alpha=0.3)
-                    ax.legend(fontsize=10)
+                            color = cmap(i % 10)
+                            label = f"jobs/dev={nj}, iodepth={depth}"
+                            ax1.plot(xs, ys_bw, marker='o', linewidth=2, color=color, label=label)
+                            ax2.plot(xs, ys_lat, marker='x', linestyle='--', linewidth=1.5, color=color, label='_nolegend_')
 
-                    chart_file = f"{output_dir}/swap-partitions-matrix-throughput-{timestamp}.png"
-                    plt.tight_layout()
-                    plt.savefig(chart_file, dpi=150, bbox_inches='tight')
-                    plt.close()
-                    chart_files.append(chart_file)
-                    log_info(f"Generated swap matrix throughput chart: {chart_file}")
+                            # Highlight the chosen point if it belongs to this series.
+                            if chosen_dc == dc and chosen_bs in by_bs and chosen_nj == nj and chosen_depth == depth:
+                                try:
+                                    y_star = float(by_bs[chosen_bs].get('combined_mb_per_sec', 0) or 0)
+                                    ax1.plot([chosen_bs], [y_star], marker='*', markersize=18,
+                                             color='gold', markeredgecolor='black', zorder=10)
+                                    ax1.annotate(
+                                        "chosen",
+                                        xy=(chosen_bs, y_star),
+                                        xytext=(8, 10),
+                                        textcoords='offset points',
+                                        fontsize=9,
+                                        bbox=dict(boxstyle='round,pad=0.25', fc='white', alpha=0.7),
+                                    )
+                                except Exception:
+                                    pass
+
+                        ax1.set_xlabel('Block size (KB)', fontsize=12)
+                        ax1.set_ylabel('Throughput (MB/s; higher is better)', fontsize=12)
+                        ax2.set_ylabel(f"Weighted latency (µs; {metric}; lower is better)", fontsize=12)
+                        ax1.set_title(
+                            f"Swap Partition Stripe Matrix (devices={dc}, rwmixread={mix}%)\n"
+                            + "Solid=throughput (left axis), dashed=latency (right axis)",
+                            fontsize=14,
+                            fontweight='bold',
+                        )
+                        ax1.grid(True, alpha=0.3)
+                        ax1.legend(fontsize=9, loc='upper left')
+
+                        chart_file = f"{output_dir}/swap-partitions-matrix-raw-dc{dc}-{timestamp}.png"
+                        plt.tight_layout()
+                        plt.savefig(chart_file, dpi=150, bbox_inches='tight')
+                        plt.close()
+                        chart_files.append(chart_file)
+                        log_info(f"Generated swap matrix raw chart: {chart_file}")
         except Exception as e:
             log_warn(f"Failed to generate swap-partitions matrix charts: {e}")
         
@@ -5030,12 +5029,36 @@ def generate_charts(results, output_dir='/var/log/debian-install', webp=True):
         if 'allocators' in results and results['allocators'] and len(results['allocators']) > 1:
             try:
                 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-                
-                allocator_names = [a.get('allocator', 'Unknown') for a in results['allocators']]
-                compression_ratios = [a.get('compression_ratio', 0) for a in results['allocators']]
-                efficiencies = [a.get('efficiency_pct', 0) for a in results['allocators']]
-                mem_used = [a.get('mem_used_mb', 0) for a in results['allocators']]
-                compr_size = [a.get('compr_size_mb', 0) for a in results['allocators']]
+
+                # Aggregate allocator results across data patterns to avoid duplicates.
+                raw_allocs = [a for a in results['allocators'] if isinstance(a, dict)]
+                valid_allocs = [
+                    a for a in raw_allocs
+                    if 'error' not in a
+                    and a.get('reliable', True)
+                    and isinstance(a.get('efficiency_pct'), (int, float))
+                    and isinstance(a.get('compression_ratio'), (int, float))
+                    and float(a.get('compression_ratio') or 0) > 0
+                ]
+
+                agg = {}
+                for a in valid_allocs:
+                    name = a.get('allocator') or 'Unknown'
+                    agg.setdefault(name, []).append(a)
+
+                allocator_names = sorted(agg.keys())
+                if len(allocator_names) < 2:
+                    raise ValueError('Need at least 2 allocators for comparison chart')
+                compression_ratios = []
+                efficiencies = []
+                mem_used = []
+                compr_size = []
+                for name in allocator_names:
+                    items = agg[name]
+                    compression_ratios.append(sum(float(i.get('compression_ratio', 0) or 0) for i in items) / max(1, len(items)))
+                    efficiencies.append(sum(float(i.get('efficiency_pct', 0) or 0) for i in items) / max(1, len(items)))
+                    mem_used.append(sum(float(i.get('mem_used_mb', 0) or 0) for i in items) / max(1, len(items)))
+                    compr_size.append(sum(float(i.get('compr_size_mb', 0) or 0) for i in items) / max(1, len(items)))
                 
                 # Calculate overhead for each allocator
                 overhead_mb = [mem_used[i] - compr_size[i] for i in range(len(mem_used))]
@@ -5288,53 +5311,68 @@ def format_benchmark_html(results):
                     pass
         html += "\n"
     
-    # Allocator comparison
+    # Allocator comparison (aggregate across data patterns)
     if 'allocators' in results and results['allocators']:
         html += "<b>💾 Allocator Performance:</b>\n"
-        # Use efficiency percentage for bar chart (shows allocator overhead)
-        # Higher efficiency = better (less overhead)
-        # Note: Negative efficiency indicates overhead (uses more memory than original)
-        max_eff = max(a.get('efficiency_pct', 0) for a in results['allocators'])
-        min_eff = min(a.get('efficiency_pct', 0) for a in results['allocators'])
-        
-        for alloc in results['allocators']:
-            name = alloc.get('allocator', 'N/A')
-            ratio = alloc.get('compression_ratio', 0)
-            eff = alloc.get('efficiency_pct', 0)
-            
-            # Bar shows efficiency: higher is better
-            # For negative efficiency (overhead), show no bar
-            # For zero max_eff, show no bar (avoid division by zero)
-            if max_eff > 0 and eff >= 0:
-                bar_length = int((eff / max_eff) * 10)
-            else:
-                bar_length = 0  # No bar for negative efficiency or zero max_eff
-            bar = '▓' * bar_length + '░' * (10 - bar_length)
-            
-            # Add performance indicators
-            is_best = eff == max_eff and eff > 0
-            is_worst = eff == min_eff
-            marker = " ⭐" if is_best else (" ⚠️" if is_worst and eff < 0 else "")
-            
-            # Calculate percentage difference from best
-            diff_str = ""
-            if not is_best and max_eff > 0:
-                diff_pct = eff - max_eff
-                diff_str = f" ({diff_pct:+.0f}% vs best)"
-            
-            html += f"  {name:8s}: {bar} {ratio:.1f}x ratio, {eff:+.0f}% eff{diff_str}{marker}\n"
-            if _debug_enabled():
-                try:
-                    html += (
-                        "    "
-                        + f"swap_activity_mb={alloc.get('swap_activity_mb','')} "
-                        + f"zram_disksize_mb={alloc.get('zram_disksize_mb','')} "
-                        + f"zram_mem_limit_mb={alloc.get('zram_mem_limit_mb','')} "
-                        + f"guard_swap_delta_kb={alloc.get('guard_swap_used_kb_delta','')}\n"
-                    )
-                except Exception:
-                    pass
-        html += "\n"
+        raw_allocs = [a for a in results['allocators'] if isinstance(a, dict)]
+        valid_allocs = [
+            a for a in raw_allocs
+            if 'error' not in a
+            and a.get('reliable', True)
+            and isinstance(a.get('efficiency_pct'), (int, float))
+            and isinstance(a.get('compression_ratio'), (int, float))
+            and float(a.get('compression_ratio') or 0) > 0
+        ]
+
+        if not valid_allocs:
+            html += "  No reliable allocator results (all failed or insufficient swap activity)\n\n"
+        else:
+            agg = {}
+            for a in valid_allocs:
+                name = a.get('allocator') or 'N/A'
+                agg.setdefault(name, []).append(a)
+
+            summary = []
+            for name, items in agg.items():
+                avg_ratio = sum(float(i.get('compression_ratio', 0) or 0) for i in items) / max(1, len(items))
+                avg_eff = sum(float(i.get('efficiency_pct', 0) or 0) for i in items) / max(1, len(items))
+                patterns = sorted({(i.get('data_pattern') or '').strip() for i in items if i.get('data_pattern')})
+                summary.append({
+                    'allocator': name,
+                    'avg_ratio': avg_ratio,
+                    'avg_eff': avg_eff,
+                    'n': len(items),
+                    'patterns': patterns,
+                })
+
+            # Sort best-first by efficiency.
+            summary.sort(key=lambda x: float(x.get('avg_eff', 0) or 0), reverse=True)
+            max_eff = max(float(x.get('avg_eff', 0) or 0) for x in summary)
+            min_eff = min(float(x.get('avg_eff', 0) or 0) for x in summary)
+
+            for row in summary:
+                name = row['allocator']
+                ratio = float(row.get('avg_ratio', 0) or 0)
+                eff = float(row.get('avg_eff', 0) or 0)
+                patterns = row.get('patterns') or []
+                patterns_str = f" (patterns: {','.join(patterns)})" if patterns else ""
+
+                if max_eff > 0 and eff >= 0:
+                    bar_length = int((eff / max_eff) * 10)
+                else:
+                    bar_length = 0
+                bar = '▓' * bar_length + '░' * (10 - bar_length)
+
+                is_best = (eff == max_eff and max_eff > 0)
+                is_worst = (eff == min_eff)
+                marker = " ⭐" if is_best else (" ⚠️" if is_worst and eff < 0 else "")
+
+                diff_str = ""
+                if not is_best and max_eff > 0:
+                    diff_str = f" ({eff - max_eff:+.0f}% vs best)"
+
+                html += f"  {name:8s}: {bar} {ratio:.1f}x ratio, {eff:+.0f}% eff{diff_str}{marker}{patterns_str}\n"
+            html += "\n"
     
     # Concurrency tests with scaling chart
     if 'concurrency' in results and results['concurrency']:
@@ -5768,8 +5806,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --test-all                         # Recommended: run all benchmarks including matrix test
-  %(prog)s --test-matrix                      # Run comprehensive block size × concurrency matrix
+    %(prog)s --test-all                         # Recommended: run all benchmarks (no legacy single-target matrix)
+    %(prog)s --test-matrix                      # [LEGACY] Run block size × concurrency matrix (single target)
   %(prog)s --test-compressors                 # Test compression algorithms
   %(prog)s --test-allocators                  # Test memory allocators
   %(prog)s --test-latency --latency-size 100  # Run latency tests
@@ -5792,13 +5830,13 @@ Examples:
     parser.add_argument('--test-concurrency', type=int, metavar='N',
                        help='[DEPRECATED] Test concurrency with N swap files. Use --test-matrix instead for comprehensive testing')
     parser.add_argument('--test-matrix', action='store_true',
-                       help='Test block size × concurrency matrix to find optimal configuration')
+                       help='[LEGACY] Test block size × concurrency matrix (single target)')
     parser.add_argument('--test-swap-partitions-matrix', action='store_true',
                        help='Test real GPT swap partitions as block devices to recommend SWAP_STRIPE_WIDTH')
     parser.add_argument('--swap-partitions-max', type=int, metavar='N', default=0,
                        help='Max GPT swap partitions to consider (default: 0 = all found)')
-    parser.add_argument('--swap-partitions-matrix-block-sizes', metavar='LIST', default='4,8,16,32',
-                       help='Block sizes (KB) to test in swap-partitions matrix (comma-separated, default: 4,8,16,32)')
+    parser.add_argument('--swap-partitions-matrix-block-sizes', metavar='LIST', default='4,8,16,32,64,128',
+                       help='Block sizes (KB) to test in swap-partitions matrix (comma-separated, default: 4,8,16,32,64,128)')
     parser.add_argument('--swap-partitions-matrix-iodepths', metavar='LIST', default='1,2',
                        help='IO depths to test for swap-partitions matrix (comma-separated, default: 1,2)')
     parser.add_argument('--swap-partitions-matrix-rwmixread', type=int, metavar='PCT', default=80,
@@ -5842,8 +5880,11 @@ Examples:
                        help='Export shell configuration file')
     parser.add_argument('--telegram', action='store_true',
                        help='Send results to Telegram (requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)')
-    parser.add_argument('--webp', action='store_true',
-                       help='Convert charts to WebP format for smaller file size (requires Pillow)')
+    # Default WebP to reduce Telegram bandwidth; gracefully falls back to PNG if Pillow is missing.
+    parser.add_argument('--webp', dest='webp', action='store_true', default=True,
+                       help='Convert charts to WebP format for smaller file size (default: enabled; requires Pillow)')
+    parser.add_argument('--no-webp', dest='webp', action='store_false',
+                       help='Disable WebP chart conversion (keep PNG)')
     
     args = parser.parse_args()
     
@@ -5978,8 +6019,8 @@ Examples:
     # Calculate total number of tests
     total_tests = 0
     
-    # Note: --test-all now uses matrix test instead of individual block size/concurrency tests
-    # Individual tests are deprecated as they are redundant with matrix test
+    # Note: --test-all focuses on modern tests (swap-partitions stripe matrix, compression/allocator, latency).
+    # Legacy single-target matrix is opt-in via --test-matrix.
     if not args.test_all and args.block_size:
         # Only run if explicitly requested with --block-size (deprecated path)
         total_tests += 1  # single block size test
@@ -6002,8 +6043,8 @@ Examples:
         # Only run if explicitly requested with --test-concurrency (deprecated path)
         total_tests += 1  # single concurrency test
     
-    if args.test_matrix or args.test_all:
-        # Matrix test counts as one comprehensive test
+    if args.test_matrix:
+        # Legacy single-target matrix test counts as one test
         total_tests += 1
 
     if args.test_all or args.test_swap_partitions_matrix:
@@ -6138,8 +6179,8 @@ Examples:
                 'read_mb_per_sec': 0
             })
     
-    # Matrix testing (block size × concurrency)
-    if args.test_matrix or args.test_all:
+    # Legacy single-target matrix testing (block size × concurrency)
+    if args.test_matrix:
         try:
             log_info_ts("\n=== Running Block Size × Concurrency Matrix Test ===")
             results['matrix'] = test_blocksize_concurrency_matrix(

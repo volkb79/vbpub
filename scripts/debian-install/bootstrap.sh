@@ -332,7 +332,7 @@ install_stage2_packages() {
 
     local core_packages="vim less man-db python3-pip"
     local additional_packages="ripgrep fd-find tree fzf httpie netcat-traditional"
-    local system_packages="fio sysstat python3-matplotlib"
+    local system_packages="fio sysstat python3-matplotlib python3-pil"
 
     apt_install_packages "Installing core + benchmark packages..." "$core_packages $system_packages"
     apt_install_packages "Installing additional tools..." "$additional_packages"

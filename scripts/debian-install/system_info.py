@@ -222,6 +222,24 @@ class SystemInfo:
     def get_kernel_params(self):
         """Get comprehensive kernel parameters related to swap, memory, and THP"""
         params = {}
+
+        # Optional: defaults captured by setup-swap.sh prior to tuning.
+        # Format: KEY=VALUE (one per line)
+        defaults = {}
+        try:
+            defaults_path = Path('/var/lib/vbpub/bootstrap/sysctl-defaults.env')
+            if defaults_path.exists():
+                for line in defaults_path.read_text().splitlines():
+                    line = line.strip()
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    k, v = line.split('=', 1)
+                    k = k.strip()
+                    v = v.strip()
+                    if k:
+                        defaults[k] = v
+        except Exception:
+            defaults = {}
         
         # List of kernel parameters to collect (comprehensive for swap/memory tuning)
         param_names = [
@@ -256,7 +274,11 @@ class SystemInfo:
                     timeout=5
                 )
                 if result.returncode == 0:
-                    params[param] = result.stdout.strip()
+                    val = result.stdout.strip()
+                    if defaults and param in defaults and defaults[param] not in ('', 'N/A') and val not in ('', 'N/A'):
+                        params[param] = f"{val} (default {defaults[param]})"
+                    else:
+                        params[param] = val
             except Exception:
                 params[param] = 'N/A'
         
