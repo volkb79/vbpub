@@ -305,7 +305,7 @@ INSTALLATION_CONFIG = {
         "DEBUG_MODE=no BOOTSTRAP_STAGE=stage1 AUTO_REBOOT_AFTER_STAGE1=auto NEVER_REBOOT=no "
         "TELEGRAM_BOT_TOKEN={{TELEGRAM_BOT_TOKEN}} TELEGRAM_CHAT_ID={{TELEGRAM_CHAT_ID}} bash"
     ),
-    "rootPartitionFullDiskSize": True,
+    "rootPartitionFullDiskSize": False,
     "sshPasswordAuthentication": False,
     "emailToExecutingUser": True,
 }

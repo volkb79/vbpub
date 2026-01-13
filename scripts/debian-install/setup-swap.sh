@@ -2057,22 +2057,21 @@ configure_kernel_params() {
     # Record sysctl defaults (pre-tuning) for reporting.
     # This enables Telegram reports to show: "value (default X)".
     local defaults_file="/var/lib/vbpub/bootstrap/sysctl-defaults.env"
-    if [ ! -f "$defaults_file" ]; then
-        mkdir -p "$(dirname "$defaults_file")" 2>/dev/null || true
-        {
-            echo "vm.swappiness=$(sysctl -n vm.swappiness 2>/dev/null || echo N/A)"
-            echo "vm.page-cluster=$(sysctl -n vm.page-cluster 2>/dev/null || echo N/A)"
-            echo "vm.vfs_cache_pressure=$(sysctl -n vm.vfs_cache_pressure 2>/dev/null || echo N/A)"
-            echo "vm.watermark_scale_factor=$(sysctl -n vm.watermark_scale_factor 2>/dev/null || echo N/A)"
-            echo "vm.dirty_ratio=$(sysctl -n vm.dirty_ratio 2>/dev/null || echo N/A)"
-            echo "vm.dirty_background_ratio=$(sysctl -n vm.dirty_background_ratio 2>/dev/null || echo N/A)"
-            echo "vm.dirty_expire_centisecs=$(sysctl -n vm.dirty_expire_centisecs 2>/dev/null || echo N/A)"
-            echo "vm.dirty_writeback_centisecs=$(sysctl -n vm.dirty_writeback_centisecs 2>/dev/null || echo N/A)"
-            echo "vm.min_free_kbytes=$(sysctl -n vm.min_free_kbytes 2>/dev/null || echo N/A)"
-            echo "vm.overcommit_memory=$(sysctl -n vm.overcommit_memory 2>/dev/null || echo N/A)"
-            echo "vm.overcommit_ratio=$(sysctl -n vm.overcommit_ratio 2>/dev/null || echo N/A)"
-        } >"$defaults_file" 2>/dev/null || true
-    fi
+    mkdir -p "$(dirname "$defaults_file")" 2>/dev/null || true
+    {
+        echo "# captured_at=$(date -Is 2>/dev/null || date)"
+        echo "vm.swappiness=$(sysctl -n vm.swappiness 2>/dev/null || echo N/A)"
+        echo "vm.page-cluster=$(sysctl -n vm.page-cluster 2>/dev/null || echo N/A)"
+        echo "vm.vfs_cache_pressure=$(sysctl -n vm.vfs_cache_pressure 2>/dev/null || echo N/A)"
+        echo "vm.watermark_scale_factor=$(sysctl -n vm.watermark_scale_factor 2>/dev/null || echo N/A)"
+        echo "vm.dirty_ratio=$(sysctl -n vm.dirty_ratio 2>/dev/null || echo N/A)"
+        echo "vm.dirty_background_ratio=$(sysctl -n vm.dirty_background_ratio 2>/dev/null || echo N/A)"
+        echo "vm.dirty_expire_centisecs=$(sysctl -n vm.dirty_expire_centisecs 2>/dev/null || echo N/A)"
+        echo "vm.dirty_writeback_centisecs=$(sysctl -n vm.dirty_writeback_centisecs 2>/dev/null || echo N/A)"
+        echo "vm.min_free_kbytes=$(sysctl -n vm.min_free_kbytes 2>/dev/null || echo N/A)"
+        echo "vm.overcommit_memory=$(sysctl -n vm.overcommit_memory 2>/dev/null || echo N/A)"
+        echo "vm.overcommit_ratio=$(sysctl -n vm.overcommit_ratio 2>/dev/null || echo N/A)"
+    } >"$defaults_file" 2>/dev/null || true
     
     # Calculate optimal swappiness
     local swappiness=60

@@ -213,8 +213,13 @@ class TelegramClient:
                 
                 for idx, file_path in enumerate(valid_files):
                     attach_name = f"file{idx}"
+
+                    # IMPORTANT:
+                    # - If we send as type=photo, Telegram will often recompress/convert (e.g., PNG/WebP -> JPEG).
+                    # - Sending as type=document preserves the original file format and avoids quality loss.
+                    media_type = 'document'
                     media_item = {
-                        'type': 'photo',  # Telegram treats images as photos in media groups
+                        'type': media_type,
                         'media': f'attach://{attach_name}'
                     }
                     

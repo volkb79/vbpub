@@ -166,6 +166,7 @@ import argparse
 import glob
 import json
 import os
+import math
 import shutil
 import socket
 import subprocess
@@ -2115,7 +2116,7 @@ def test_swap_partitions_stripe_matrix(
         device_counts = [1, 2, 4, 8, 16]
     if numjobs_per_device_levels is None:
         # Latency-oriented default: keep per-device parallelism modest.
-        numjobs_per_device_levels = [1, 2]
+        numjobs_per_device_levels = [1, 2, 3]
     if iodepth_levels is None:
         # Latency-oriented default: shallow queues, closer to page-fault critical path.
         iodepth_levels = [1, 2]
@@ -4886,6 +4887,14 @@ def generate_charts(results, output_dir='/var/log/debian-install', webp=True):
                         ax1.set_xlabel('Block size (KB)', fontsize=12)
                         ax1.set_ylabel('Throughput (MB/s; higher is better)', fontsize=12)
                         ax2.set_ylabel(f"Weighted latency (µs; {metric}; lower is better)", fontsize=12)
+
+                        # Exponential/log2 x-axis to make powers-of-two block sizes readable.
+                        try:
+                            ax1.set_xscale('log', base=2)
+                            ax1.set_xticks(xs)
+                            ax1.set_xticklabels([f"2^{int(round(math.log2(x)))}" for x in xs])
+                        except Exception:
+                            pass
                         ax1.set_title(
                             f"Swap Partition Stripe Matrix (devices={dc}, rwmixread={mix}%)\n"
                             + "Solid=throughput (left axis), dashed=latency (right axis)",
@@ -4901,6 +4910,96 @@ def generate_charts(results, output_dir='/var/log/debian-install', webp=True):
                         plt.close()
                         chart_files.append(chart_file)
                         log_info(f"Generated swap matrix raw chart: {chart_file}")
+
+                    # Focus chart: only 4KB blocksize; show throughput+latency for combinations
+                    # of (devices, jobs/dev). Render one chart per iodepth to keep it readable.
+                    bs_focus = 4
+                    focus_rows = [r for r in valid_rows if r.get('block_size_kb') == bs_focus]
+                    if focus_rows:
+                        by_depth_nj = {}
+                        for r in focus_rows:
+                            dc = r.get('device_count')
+                            nj = r.get('numjobs_per_device')
+                            depth = r.get('iodepth')
+                            if not all(isinstance(x, int) for x in (dc, nj, depth)):
+                                continue
+                            by_dc = by_depth_nj.setdefault((depth, nj), {})
+                            cur = by_dc.get(dc)
+                            if cur is None or float(r.get('combined_mb_per_sec', 0) or 0) > float(cur.get('combined_mb_per_sec', 0) or 0):
+                                by_dc[dc] = r
+
+                        focus_depths = sorted({k[0] for k in by_depth_nj.keys()})
+                        for depth in focus_depths:
+                            njs = sorted({nj for (d, nj) in by_depth_nj.keys() if d == depth})
+                            if not njs:
+                                continue
+
+                            fig, ax1 = plt.subplots(figsize=(12, 6))
+                            ax2 = ax1.twinx()
+
+                            all_xs = set()
+
+                            cmap = plt.get_cmap('tab10')
+                            for i, nj in enumerate(njs):
+                                by_dc = by_depth_nj.get((depth, nj), {})
+                                xs = sorted(by_dc.keys())
+                                if not xs:
+                                    continue
+                                all_xs.update(xs)
+                                ys_bw = [float(by_dc[dc].get('combined_mb_per_sec', 0) or 0) for dc in xs]
+                                ys_lat = [_lat_w_us(by_dc[dc]) for dc in xs]
+
+                                color = cmap(i % 10)
+                                label = f"jobs/dev={nj}"
+                                ax1.plot(xs, ys_bw, marker='o', linewidth=2, color=color, label=label)
+                                ax2.plot(xs, ys_lat, marker='x', linestyle='--', linewidth=1.5, color=color, label='_nolegend_')
+
+                                # Highlight chosen point if it belongs to this series and the 4KB focus.
+                                if chosen_bs == bs_focus and chosen_depth == depth and chosen_nj == nj and chosen_dc in by_dc:
+                                    try:
+                                        y_star = float(by_dc[chosen_dc].get('combined_mb_per_sec', 0) or 0)
+                                        ax1.plot([chosen_dc], [y_star], marker='*', markersize=18,
+                                                 color='gold', markeredgecolor='black', zorder=10)
+                                        ax1.annotate(
+                                            "chosen",
+                                            xy=(chosen_dc, y_star),
+                                            xytext=(8, 10),
+                                            textcoords='offset points',
+                                            fontsize=9,
+                                            bbox=dict(boxstyle='round,pad=0.25', fc='white', alpha=0.7),
+                                        )
+                                    except Exception:
+                                        pass
+
+                            ax1.set_xlabel('Devices (swap partitions)', fontsize=12)
+                            ax1.set_ylabel('Throughput (MB/s; higher is better)', fontsize=12)
+                            ax2.set_ylabel(f"Weighted latency (µs; {metric}; lower is better)", fontsize=12)
+
+                            # Devices are typically powers of two; use log2 axis for readability.
+                            try:
+                                ax1.set_xscale('log', base=2)
+                                ticks = sorted(int(x) for x in all_xs if isinstance(x, int) and x > 0)
+                                if ticks:
+                                    ax1.set_xticks(ticks)
+                                    ax1.set_xticklabels([f"2^{int(round(math.log2(x)))}" for x in ticks])
+                            except Exception:
+                                pass
+
+                            ax1.set_title(
+                                f"Swap Stripe Matrix @ {bs_focus}KB (iodepth={depth}, rwmixread={mix}%)\n"
+                                + "Solid=throughput (left axis), dashed=latency (right axis)",
+                                fontsize=14,
+                                fontweight='bold',
+                            )
+                            ax1.grid(True, alpha=0.3)
+                            ax1.legend(fontsize=9, loc='upper left')
+
+                            chart_file = f"{output_dir}/swap-partitions-matrix-4k-devices-vs-jobs-depth{depth}-{timestamp}.png"
+                            plt.tight_layout()
+                            plt.savefig(chart_file, dpi=150, bbox_inches='tight')
+                            plt.close()
+                            chart_files.append(chart_file)
+                            log_info(f"Generated swap matrix 4KB focus chart: {chart_file}")
         except Exception as e:
             log_warn(f"Failed to generate swap-partitions matrix charts: {e}")
         
