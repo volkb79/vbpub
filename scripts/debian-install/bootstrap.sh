@@ -96,6 +96,27 @@ log_debug() {
     fi
 }
 
+# Temporarily disable bash xtrace to avoid leaking secrets (tokens, IDs) into logs.
+# Use like:
+#   local had_xtrace; had_xtrace=$(xtrace_pause)
+#   ... sensitive checks ...
+#   xtrace_resume "$had_xtrace"
+xtrace_pause() {
+    if [[ $- == *x* ]]; then
+        set +x
+        echo 1
+    else
+        echo 0
+    fi
+}
+
+xtrace_resume() {
+    local had_xtrace="${1:-0}"
+    if [ "$had_xtrace" = "1" ]; then
+        set -x
+    fi
+}
+
 select_log_file_for_stage() {
     # Only keep LOG_FILE fixed if the caller explicitly provided it.
     if [ -n "${CALLER_LOG_FILE:-}" ]; then
@@ -241,11 +262,15 @@ run_logged() {
 # Test Telegram connectivity
 test_telegram() {
     log_info "Testing Telegram connectivity..."
-    
+
+    local had_xtrace
+    had_xtrace=$(xtrace_pause)
     if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+        xtrace_resume "$had_xtrace"
         log_warn "Telegram not configured (TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set)"
         return 1
     fi
+    xtrace_resume "$had_xtrace"
     
     if [ ! -f "${SCRIPT_DIR}/telegram_client.py" ]; then
         log_error "telegram_client.py not found at ${SCRIPT_DIR}/telegram_client.py"
@@ -265,10 +290,14 @@ test_telegram() {
 # Helper function to send telegram messages using telegram_client.py
 tg_send() {
     local msg="$1"
-    [ -z "$TELEGRAM_BOT_TOKEN" ] && return 0
-    [ -z "$TELEGRAM_CHAT_ID" ] && return 0
+
+    local had_xtrace
+    had_xtrace=$(xtrace_pause)
+    [ -z "$TELEGRAM_BOT_TOKEN" ] && { xtrace_resume "$had_xtrace"; return 0; }
+    [ -z "$TELEGRAM_CHAT_ID" ] && { xtrace_resume "$had_xtrace"; return 0; }
     # Only try to send if the script exists (repo must be cloned first)
-    [ ! -f "${SCRIPT_DIR}/telegram_client.py" ] && return 0
+    [ ! -f "${SCRIPT_DIR}/telegram_client.py" ] && { xtrace_resume "$had_xtrace"; return 0; }
+    xtrace_resume "$had_xtrace"
     python3 "${SCRIPT_DIR}/telegram_client.py" --send "$msg" 2>/dev/null || true
 }
 
@@ -276,10 +305,14 @@ tg_send() {
 tg_send_file() {
     local file="$1"
     local caption="${2:-}"
-    [ -z "$TELEGRAM_BOT_TOKEN" ] && return 0
-    [ -z "$TELEGRAM_CHAT_ID" ] && return 0
+
+    local had_xtrace
+    had_xtrace=$(xtrace_pause)
+    [ -z "$TELEGRAM_BOT_TOKEN" ] && { xtrace_resume "$had_xtrace"; return 0; }
+    [ -z "$TELEGRAM_CHAT_ID" ] && { xtrace_resume "$had_xtrace"; return 0; }
     # Only try to send if the script exists (repo must be cloned first)
-    [ ! -f "${SCRIPT_DIR}/telegram_client.py" ] && return 0
+    [ ! -f "${SCRIPT_DIR}/telegram_client.py" ] && { xtrace_resume "$had_xtrace"; return 0; }
+    xtrace_resume "$had_xtrace"
     if [ -n "$caption" ]; then
         python3 "${SCRIPT_DIR}/telegram_client.py" --file "$file" --caption "$caption" 2>/dev/null || true
     else

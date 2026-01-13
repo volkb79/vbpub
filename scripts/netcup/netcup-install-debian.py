@@ -51,6 +51,7 @@ curl 'https://www.servercontrolpanel.de/realms/scp/protocol/openid-connect/token
 import os
 import sys
 import json
+import re
 import socket
 import argparse
 import subprocess
@@ -296,11 +297,14 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 INSTALLATION_CONFIG = {
     "locale": "en_US.UTF-8",
     "timezone": "Europe/Berlin",
-    # IMPORTANT: Do NOT trigger reboots from our bootstrap logic during cloud-init.
-    # Netcup/cloud-init owns the reboot after the post-install/customScript finishes.
-    # Stage1 should prepare the system and schedule stage2 (systemd unit + marker gating),
-    # then cloud-init's normal reboot will bring the machine back and stage2 will run.
-    "customScript":  f"curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | DEBUG_MODE=yes BOOTSTRAP_STAGE=stage1 AUTO_REBOOT_AFTER_STAGE1=no NEVER_REBOOT=yes TELEGRAM_BOT_TOKEN={TELEGRAM_BOT_TOKEN} TELEGRAM_CHAT_ID={TELEGRAM_CHAT_ID} bash",
+    # Stage1 may need a reboot to apply offline resize/repartition steps and to start stage2.
+    # Our bootstrap script handles cloud-init contexts safely by scheduling a delayed reboot.
+    # Keep DEBUG_MODE off by default to avoid leaking secrets via bash xtrace.
+    "customScript": (
+        "curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | "
+        "DEBUG_MODE=no BOOTSTRAP_STAGE=stage1 AUTO_REBOOT_AFTER_STAGE1=auto NEVER_REBOOT=no "
+        "TELEGRAM_BOT_TOKEN={{TELEGRAM_BOT_TOKEN}} TELEGRAM_CHAT_ID={{TELEGRAM_CHAT_ID}} bash"
+    ),
     "rootPartitionFullDiskSize": True,
     "sshPasswordAuthentication": False,
     "emailToExecutingUser": True,
@@ -549,6 +553,14 @@ def _fmt_ts(ts: Optional[str]) -> str:
     if not ts:
         return ""
     return ts
+
+
+_RE_TELEGRAM_BOT_TOKEN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b")
+
+
+def _redact_secrets(text: str) -> str:
+    # Telegram bot tokens are secrets; avoid printing or persisting them.
+    return _RE_TELEGRAM_BOT_TOKEN.sub("***REDACTED_TELEGRAM_BOT_TOKEN***", text)
 
 
 def _extract_primary_ipv4(server_details: Dict[str, Any]) -> Optional[str]:
@@ -945,7 +957,7 @@ class _SSHBootstrapFollower:
                     for line in self._proc.stdout:
                         if self._stop.is_set():
                             break
-                        out_line = f"[remote] {line}"
+                        out_line = _redact_secrets(f"[remote] {line}")
                         sys.stdout.write(out_line)
                         sys.stdout.flush()
                         lf.write(out_line)
