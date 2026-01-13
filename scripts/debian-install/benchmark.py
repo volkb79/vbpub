@@ -2347,14 +2347,13 @@ def test_swap_partitions_stripe_matrix(
             bw = float(row.get('combined_mb_per_sec', 0) or 0)
             return bw / _latency_weighted_us(row)
 
-        # Pick the best-performing point by score, then choose the smallest device_count
-        # within 95% of best score for a pragmatic "good enough" recommendation.
+        # Compute overall best (across all block sizes).
         best = max(valid, key=_score)
         best_score = float(_score(best) or 0.0)
 
         threshold = best_score * 0.95
         near_best = [r for r in valid if float(_score(r) or 0.0) >= threshold]
-        chosen = min(
+        chosen_overall = min(
             near_best,
             key=lambda r: (
                 int(r.get('device_count', 1)),
@@ -2364,7 +2363,7 @@ def test_swap_partitions_stripe_matrix(
             )
         )
 
-        # Keep top-3 candidates for reporting.
+        # Keep top-3 candidates for reporting (overall).
         top = sorted(
             valid,
             key=lambda r: (
@@ -2377,18 +2376,6 @@ def test_swap_partitions_stripe_matrix(
         )[:3]
 
         block_to_cluster = {4: 0, 8: 1, 16: 2, 32: 3, 64: 4, 128: 5}
-        cluster = block_to_cluster.get(int(chosen.get('block_size_kb', 4)), 0)
-
-        results['optimal'] = {
-            'best_combined': chosen,
-            'top_candidates': top,
-            'best_score': round(best_score, 6),
-            'recommended_swap_stripe_width': int(chosen.get('device_count', 1)),
-            'recommended_fio_numjobs_per_device': int(chosen.get('numjobs_per_device', 1)),
-            'recommended_fio_iodepth': int(chosen.get('iodepth', 1)),
-            'recommended_page_cluster': int(cluster),
-            'latency_metric': latency_metric,
-        }
 
         # Also compute per-block-size optima so we can answer "what if only 4KB accesses?"
         try:
@@ -2421,6 +2408,37 @@ def test_swap_partitions_stripe_matrix(
                 results['optimal_by_block_size_kb'] = opt_by_bs
         except Exception:
             pass
+
+        # Selection policy: choose stripe width based on 4KiB-only results when available,
+        # because swap traffic is page-sized and latency-sensitive.
+        chosen = chosen_overall
+        selection_policy = 'any_block_size'
+        try:
+            opt4 = (results.get('optimal_by_block_size_kb') or {}).get('4')
+            if isinstance(opt4, dict) and isinstance(opt4.get('chosen_point'), dict):
+                chosen = opt4['chosen_point']
+                selection_policy = '4k_only'
+        except Exception:
+            pass
+
+        cluster = block_to_cluster.get(int(chosen.get('block_size_kb', 4)), 0)
+
+        results['optimal'] = {
+            # Recommended point (policy-selected; default: 4k_only when available)
+            'best_combined': chosen,
+            'selection_policy': selection_policy,
+
+            # Overall best information kept for reporting/debugging
+            'best_combined_overall': chosen_overall,
+            'top_candidates': top,
+            'best_score': round(best_score, 6),
+
+            'recommended_swap_stripe_width': int(chosen.get('device_count', 1)),
+            'recommended_fio_numjobs_per_device': int(chosen.get('numjobs_per_device', 1)),
+            'recommended_fio_iodepth': int(chosen.get('iodepth', 1)),
+            'recommended_page_cluster': int(cluster),
+            'latency_metric': latency_metric,
+        }
 
         log_step_ts("Swap partition stripe matrix complete")
         try:
@@ -4802,12 +4820,29 @@ def generate_charts(results, output_dir='/var/log/debian-install', webp=True):
                         crow = by.get((cbs, cdc))
                         if crow:
                             ax.plot([cdc], [_score(crow)], marker='*', markersize=18, color='gold', markeredgecolor='black', label='Chosen')
+                            cj = int(crow.get('numjobs_per_device', 1) or 1)
+                            cd = int(crow.get('iodepth', 1) or 1)
+                            ax.annotate(
+                                f"jobs/dev={cj}, iodepth={cd}",
+                                xy=(cdc, _score(crow)),
+                                xytext=(8, 10),
+                                textcoords='offset points',
+                                fontsize=9,
+                                bbox=dict(boxstyle='round,pad=0.25', fc='white', alpha=0.7),
+                            )
                     except Exception:
                         pass
 
                     metric = (spm.get('optimal') or {}).get('latency_metric') or (spm.get('fio_workload') or {}).get('latency_metric') or 'p99'
                     mix = (spm.get('fio_workload') or {}).get('rwmixread', '?')
-                    ax.set_title(f"Swap Striping Score vs Devices (lat={metric}, rwmixread={mix}%)", fontsize=14, fontweight='bold')
+                    jobs_levels = spm.get('numjobs_per_device_levels') or []
+                    depth_levels = spm.get('iodepth_levels') or []
+                    ax.set_title(
+                        f"Swap Striping Score vs Devices (lat={metric}, rwmixread={mix}%)\n"
+                        + f"(each point is best over jobs/dev∈{jobs_levels}, iodepth∈{depth_levels})",
+                        fontsize=14,
+                        fontweight='bold',
+                    )
                     ax.set_xlabel('Swap devices (SWAP_STRIPE_WIDTH candidate)', fontsize=12)
                     ax.set_ylabel('Score (MB/s per µs; higher is better)', fontsize=12)
                     ax.grid(True, alpha=0.3)
@@ -4826,7 +4861,12 @@ def generate_charts(results, output_dir='/var/log/debian-install', webp=True):
                         xs = [dc for dc in device_counts if (bs, dc) in by]
                         ys = [_lat_w_us(by[(bs, dc)]) for dc in xs]
                         ax.plot(xs, ys, marker='o', linewidth=2, label=f"{bs}KB")
-                    ax.set_title(f"Swap Striping Weighted Latency vs Devices (lat={metric})", fontsize=14, fontweight='bold')
+                    ax.set_title(
+                        f"Swap Striping Weighted Latency vs Devices (lat={metric})\n"
+                        + f"(each point is best over jobs/dev∈{jobs_levels}, iodepth∈{depth_levels})",
+                        fontsize=14,
+                        fontweight='bold',
+                    )
                     ax.set_xlabel('Swap devices (SWAP_STRIPE_WIDTH candidate)', fontsize=12)
                     ax.set_ylabel('Weighted latency (µs; lower is better)', fontsize=12)
                     ax.grid(True, alpha=0.3)
@@ -4845,7 +4885,12 @@ def generate_charts(results, output_dir='/var/log/debian-install', webp=True):
                         xs = [dc for dc in device_counts if (bs, dc) in by]
                         ys = [float(by[(bs, dc)].get('combined_mb_per_sec', 0) or 0) for dc in xs]
                         ax.plot(xs, ys, marker='o', linewidth=2, label=f"{bs}KB")
-                    ax.set_title("Swap Striping Throughput vs Devices", fontsize=14, fontweight='bold')
+                    ax.set_title(
+                        "Swap Striping Throughput vs Devices\n"
+                        + f"(each point is best over jobs/dev∈{jobs_levels}, iodepth∈{depth_levels})",
+                        fontsize=14,
+                        fontweight='bold',
+                    )
                     ax.set_xlabel('Swap devices (SWAP_STRIPE_WIDTH candidate)', fontsize=12)
                     ax.set_ylabel('Throughput (MB/s; higher is better)', fontsize=12)
                     ax.grid(True, alpha=0.3)

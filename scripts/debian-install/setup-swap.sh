@@ -901,10 +901,37 @@ enable_existing_swap_partitions() {
     #
     # Important: GPT swap partitions can exist without a swap signature (FSTYPE blank).
     # In that case, initialize them with mkswap first.
+    #
+    # Note: after online partition table writes, some systems keep stale /dev nodes and
+    # fail to create new ones until we explicitly refresh the kernel/udev view.
     local found=0
     local part
 
     local swap_gpt_guid="0657fd6d-a4ab-43c4-84e5-0933c84b4f4f"
+
+    # Refresh partition device nodes for the root disk (best-effort).
+    local root_part root_disk
+    root_part=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+    if [[ -n "$root_part" ]]; then
+        if [[ "$root_part" =~ nvme ]]; then
+            root_disk=$(echo "$root_part" | sed -E 's|/dev/||; s|p[0-9]+$||')
+        elif [[ "$root_part" =~ /dev/mapper ]]; then
+            root_disk=""
+        else
+            root_disk=$(echo "$root_part" | sed -E 's|/dev/||; s|[0-9]+$||')
+        fi
+        if [[ -n "$root_disk" && -b "/dev/$root_disk" ]]; then
+            blockdev --rereadpt "/dev/$root_disk" >/dev/null 2>&1 || true
+            if command -v partx >/dev/null 2>&1; then
+                partx -d "/dev/$root_disk" >/dev/null 2>&1 || true
+                partx -a "/dev/$root_disk" >/dev/null 2>&1 || true
+            fi
+            if command -v udevadm >/dev/null 2>&1; then
+                udevadm trigger --subsystem-match=block --sysname-match="${root_disk}*" --action=change >/dev/null 2>&1 || true
+                udevadm settle >/dev/null 2>&1 || true
+            fi
+        fi
+    fi
 
     # Discover GPT swap partitions in stable order.
     local max_parts=0
@@ -932,15 +959,14 @@ enable_existing_swap_partitions() {
     for part in "${swap_parts[@]}"; do
         [[ -z "$part" ]] && continue
 
-        local type
-        type=$(blkid -s TYPE -o value "$part" 2>/dev/null || true)
-        if [[ "$type" != "swap" ]]; then
-            log_info "Initializing swap signature on: $part"
-            mkswap "$part" >/dev/null 2>&1 || {
-                log_warn "Failed to mkswap $part"
-                continue
-            }
-        fi
+        # Always (re)initialize swap headers: partitions can be resized/recreated
+        # while keeping an old swap signature, which would make the kernel see the
+        # wrong swap size.
+        log_info "Initializing swap signature on: $part"
+        mkswap -f "$part" >/dev/null 2>&1 || {
+            log_warn "Failed to mkswap $part"
+            continue
+        }
 
         if ! swapon --noheadings --show=NAME 2>/dev/null | awk '{print $1}' | grep -qx "$part"; then
             log_info "Enabling existing swap partition: $part"
@@ -2235,7 +2261,7 @@ setup_swap_solution() {
             if enable_existing_swap_partitions; then
                 log_info "Swap partitions activated"
             else
-                log_error "No swap partitions detected (FSTYPE=swap)."
+                log_error "No GPT swap partitions detected to enable."
                 log_error "Run create-swap-partitions.sh (requires benchmark results) or set SWAP_BACKING_TYPE=files_in_root."
                 return 1
             fi

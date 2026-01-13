@@ -821,10 +821,20 @@ if command -v partx >/dev/null 2>&1; then
     else
         log_warn "partx reported errors (expected for in-use disk)"
     fi
+
+    # Some environments keep stale partition device nodes around (e.g. /dev/vda8..)
+    # and fail to create new ones (e.g. /dev/vda4..). A delete+add refresh is more
+    # reliable than -u alone.
+    log_info "Using partx refresh (delete+add)..."
+    partx -d "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
+    partx -a "/dev/$ROOT_DISK" 2>&1 | tee -a "$LOG_FILE" || true
 fi
 
-# Settle udev events so device nodes show up (when possible)
+# Trigger/settle udev so device nodes show up (when possible)
 if command -v udevadm >/dev/null 2>&1; then
+    # Trigger a change event for this disk and all its partitions.
+    # This helps ensure /dev nodes are created/removed to match the current table.
+    udevadm trigger --subsystem-match=block --sysname-match="${ROOT_DISK}*" --action=change 2>&1 | tee -a "$LOG_FILE" || true
     udevadm settle 2>&1 | tee -a "$LOG_FILE" || true
 fi
 
@@ -841,13 +851,13 @@ else
 fi
 
 for retry in {1..20}; do
-    if lsblk -n -o NAME "/dev/$ROOT_DISK" 2>/dev/null | grep -q "^${expected_last_name}$"; then
+    if [ -b "/dev/${expected_last_name}" ]; then
         break
     fi
     sleep 1
 done
 
-if ! lsblk -n -o NAME "/dev/$ROOT_DISK" 2>/dev/null | grep -q "^${expected_last_name}$"; then
+if [ ! -b "/dev/${expected_last_name}" ]; then
     log_warn "Kernel does not yet show expected last partition: /dev/${expected_last_name}"
     log_warn "Continuing, but swap partition formatting may fail until nodes appear"
 fi
