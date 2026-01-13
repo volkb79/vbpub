@@ -627,9 +627,11 @@ run_stage2() {
         elif [ "$rc" -eq 42 ]; then
             log_warn "Offline ext* resize required; reboot is required to continue stage2"
             state_set partitions_reboot_scheduled
-            if [ "$NEVER_REBOOT" = "yes" ]; then
-                tg_send "⚠️ Stage2 paused: an offline filesystem resize was scheduled (pre-shrink/repartition). Reboot is required to continue, but NEVER_REBOOT=yes so reboot is NOT automatic."
-                log_warn "NEVER_REBOOT=$NEVER_REBOOT; not rebooting automatically. Reboot manually when ready."
+            # NEVER_REBOOT is primarily for stage1/cloud-init safety. Stage2 may reboot when needed
+            # unless explicitly disabled via NEVER_REBOOT_STAGE2=yes.
+            if [ "${NEVER_REBOOT_STAGE2:-no}" = "yes" ]; then
+                tg_send "⚠️ Stage2 paused: an offline filesystem resize was scheduled (pre-shrink/repartition). Reboot is required to continue, but NEVER_REBOOT_STAGE2=yes so reboot is NOT automatic."
+                log_warn "NEVER_REBOOT_STAGE2=yes; not rebooting automatically. Reboot manually when ready."
             else
                 tg_send "🔁 Stage2 paused: an offline filesystem resize was scheduled (pre-shrink/repartition). Rebooting to continue stage2 automatically."
                 stage2_reboot
@@ -700,9 +702,9 @@ run_stage2() {
                 elif [ "$rc" -eq 42 ]; then
                     log_warn "Offline ext* resize required after repartition; reboot is required to continue stage2"
                     state_set partitions_final_reboot_scheduled
-                    if [ "$NEVER_REBOOT" = "yes" ]; then
-                        tg_send "⚠️ Stage2 paused: offline filesystem resize scheduled while finalizing swap partitions. Reboot is required to continue, but NEVER_REBOOT=yes so reboot is NOT automatic."
-                        log_warn "NEVER_REBOOT=$NEVER_REBOOT; not rebooting automatically. Reboot manually when ready."
+                    if [ "${NEVER_REBOOT_STAGE2:-no}" = "yes" ]; then
+                        tg_send "⚠️ Stage2 paused: offline filesystem resize scheduled while finalizing swap partitions. Reboot is required to continue, but NEVER_REBOOT_STAGE2=yes so reboot is NOT automatic."
+                        log_warn "NEVER_REBOOT_STAGE2=yes; not rebooting automatically. Reboot manually when ready."
                     else
                         tg_send "🔁 Stage2 paused: offline filesystem resize scheduled while finalizing swap partitions. Rebooting to continue stage2 automatically."
                         stage2_reboot

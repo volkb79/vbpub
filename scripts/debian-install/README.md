@@ -40,6 +40,26 @@ curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-i
   SWAP_ARCH=7 USE_PARTITION=yes EXTEND_ROOT=yes bash
 ```
 
+#### Netcup/cloud-init constraint (important)
+
+On Netcup, stage1 should be treated like a cloud-init/postinstall hook:
+
+- **Do not reboot from stage1.** Let cloud-init finish afterwards and reboot when it wants to.
+- Stage1 may exit non-zero; what matters operationally is that it **returns control to cloud-init** (no hanging, no self-restart).
+
+If you get stuck in a bad state, the workaround is to `poweroff` from inside the VM (not a UI reboot).
+
+#### Reboots: stage1 vs stage2
+
+- Stage1 should generally avoid reboots (to let cloud-init finish), unless you explicitly opt into it.
+- Stage2 may require a reboot to perform offline filesystem shrink/repartition (ext* cannot shrink online).
+
+Controls:
+
+- `AUTO_REBOOT_AFTER_STAGE1=yes|no`: whether stage1 reboots after scheduling offline work.
+- `NEVER_REBOOT=yes`: legacy global "never reboot" switch (primarily for stage1/cloud-init safety).
+- `NEVER_REBOOT_STAGE2=yes`: prevents stage2 auto-reboots even when required; stage2 will pause and require a manual reboot.
+
 ### Manual Installation
 
 ```bash

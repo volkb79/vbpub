@@ -147,6 +147,17 @@ else
     log_step "Pre-shrink-only mode: reserving disk tail space; swap layout will be decided later"
 fi
 
+# In pre-shrink-only mode we still need a valid device count so we can compute the
+# amount of tail space to reserve (total swap target rounded to a per-device size).
+# If stage1 hasn't produced benchmark results yet, fall back to SWAP_PARTITION_COUNT.
+if [ -z "${OPTIMAL_DEVICES:-}" ]; then
+    if [[ "${SWAP_PARTITION_COUNT:-}" =~ ^[0-9]+$ ]] && [ "${SWAP_PARTITION_COUNT}" -ge 1 ]; then
+        OPTIMAL_DEVICES="$SWAP_PARTITION_COUNT"
+    else
+        OPTIMAL_DEVICES="1"
+    fi
+fi
+
 # Get system specifications
 RAM_TOTAL_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
 log_info "MemTotal: ${RAM_TOTAL_KB} kB"
@@ -164,7 +175,7 @@ SWAP_DEVICES="$OPTIMAL_DEVICES"
 TOTAL_SWAP_TARGET_MIB=$((TOTAL_SWAP_GB * 1024))
 
 # Guard rails for tiny systems / weird benchmark output.
-if [ "$SWAP_DEVICES" -lt 1 ]; then
+if [[ ! "$SWAP_DEVICES" =~ ^[0-9]+$ ]] || [ "$SWAP_DEVICES" -lt 1 ]; then
     SWAP_DEVICES=1
 fi
 

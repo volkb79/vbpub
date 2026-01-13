@@ -1760,6 +1760,10 @@ def test_blocksize_concurrency_matrix(block_sizes=None, concurrency_levels=None,
     
     # Create test directory
     os.makedirs(test_dir, exist_ok=True)
+
+    # Show the underlying fio invocation once so users understand the mechanism.
+    # The job file is regenerated for each (block_size, concurrency) combination.
+    log_info_ts("fio command (job regenerated per test): fio --output-format=json /tmp/fio_matrix.job")
     
     # Test each combination
     test_num = 0
@@ -1791,8 +1795,6 @@ bs={block_size}k
             try:
                 with open('/tmp/fio_matrix.job', 'w') as f:
                     f.write(fio_job)
-                
-                log_debug_ts(f"fio command: fio --output-format=json /tmp/fio_matrix.job")
                 
                 result = subprocess.run(
                     ['fio', '--output-format=json', '/tmp/fio_matrix.job'],
@@ -2108,7 +2110,7 @@ def test_swap_partitions_stripe_matrix(
     # Swap I/O is typically 4K pages, with clustered reads often landing in the ~4–32K range.
     # Default to that window unless explicitly overridden by the caller.
     if block_sizes is None:
-        block_sizes = [4, 8, 16, 32]
+        block_sizes = [4, 8, 16, 32, 64, 128]
     if device_counts is None:
         device_counts = [1, 2, 4, 8, 16]
     if numjobs_per_device_levels is None:
@@ -2182,6 +2184,11 @@ def test_swap_partitions_stripe_matrix(
         'matrix': [],
     }
 
+    # Show the underlying fio invocation once so users understand the mechanism.
+    # The job file is regenerated for each (bs, device_count, numjobs, iodepth) combination.
+    job_path = '/tmp/fio_swap_partitions_matrix.job'
+    log_info_ts(f"fio command (job regenerated per test): fio --output-format=json {job_path}")
+
     test_num = 0
     def _device_size_mb(dev_path):
         try:
@@ -2241,7 +2248,6 @@ def test_swap_partitions_stripe_matrix(
                         ])
 
                     try:
-                        job_path = '/tmp/fio_swap_partitions_matrix.job'
                         with open(job_path, 'w') as f:
                             f.write("\n".join(fio_job_lines))
 
@@ -5325,6 +5331,7 @@ def format_benchmark_html(results):
         # Show disk I/O optimization results
         html += "  <b>📀 Disk I/O Optimized:</b>\n"
         html += "  <i>fio randrw 50/50 against one test target (not multi-device striping)</i>\n"
+        html += "  fio command: <code>fio --output-format=json /tmp/fio_matrix.job</code> (job regenerated per test)\n"
         if 'best_combined' in matrix.get('optimal', {}):
             best = matrix['optimal']['best_combined']
             html += f"  Best: {best['block_size_kb']}KB × {best['concurrency']} jobs = {best['throughput_mb_per_sec']:.0f} MB/s\n"
@@ -5386,6 +5393,8 @@ def format_benchmark_html(results):
                 html += f"  Workload: fio randrw rwmixread={mix_str}, direct=1, runtime={runtime_sec}s, size={per_dev_mb}MB per device\n"
             else:
                 html += f"  Workload: fio randrw rwmixread={mix_str}, direct=1, runtime={runtime_sec}s\n"
+
+        html += "  fio command: <code>fio --output-format=json /tmp/fio_swap_partitions_matrix.job</code> (job regenerated per test)\n"
 
         opt = spm.get('optimal') or {}
         chosen = opt.get('best_combined') or {}
