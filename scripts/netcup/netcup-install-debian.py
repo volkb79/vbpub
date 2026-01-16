@@ -534,7 +534,11 @@ These can be set in a .env file in the current directory.
     parser.add_argument(
         "--ssh-identity-file",
         default=os.environ.get("NETCUP_SSH_IDENTITY_FILE"),
-        help="Path to SSH identity file to use for attach (optional; override via NETCUP_SSH_IDENTITY_FILE)."
+        help=(
+            "Path to LOCAL SSH identity file used for attach/monitoring (optional; override via "
+            "NETCUP_SSH_IDENTITY_FILE). This should be the client key pre-seeded during install, "
+            "not the host-generated key from bootstrap stage2."
+        )
     )
     return parser.parse_args()
 
@@ -1694,8 +1698,30 @@ def main():
         ssh_identity = getattr(args, "ssh_identity_file", None)
         if ssh_identity:
             ssh_key_id = _ensure_netcup_ssh_key_id_for_identity(client, ssh_identity)
-            ssh_key_ids = [ssh_key_id]
-            print(f"   ✓ Using sshKeyId matching identity file: {ssh_key_id}")
+            if ssh_keys:
+                # Preserve existing SSH keys (including the pre-seeded/default one)
+                # while also adding the identity-file key for deterministic attach.
+                ordered_ids: List[int] = []
+                seen_ids = set()
+                for key in ssh_keys:
+                    try:
+                        key_id = int(key["id"])
+                    except Exception:
+                        continue
+                    if key_id not in seen_ids:
+                        ordered_ids.append(key_id)
+                        seen_ids.add(key_id)
+                if ssh_key_id not in seen_ids:
+                    ordered_ids.append(ssh_key_id)
+                    seen_ids.add(ssh_key_id)
+                ssh_key_ids = ordered_ids
+                if len(ssh_key_ids) == 1:
+                    print(f"   ✓ Using sshKeyId matching identity file: {ssh_key_ids[0]}")
+                else:
+                    print(f"   ✓ Using SSH Key IDs (existing + identity): {', '.join(str(x) for x in ssh_key_ids)}")
+            else:
+                ssh_key_ids = [ssh_key_id]
+                print(f"   ✓ Using sshKeyId matching identity file: {ssh_key_id}")
         else:
             if not ssh_keys:
                 ssh_key_ids = None
