@@ -2443,14 +2443,37 @@ def test_swap_partitions_stripe_matrix(
             pass
 
         # Selection policy: choose stripe width based on 4KiB-only results when available,
-        # because swap traffic is page-sized and latency-sensitive.
+        # because swap traffic is page-sized and latency-sensitive. Prefer the most
+        # conservative queueing assumptions (iodepth=1, numjobs/dev=1) when present.
         chosen = chosen_overall
         selection_policy = 'any_block_size'
         try:
             opt4 = (results.get('optimal_by_block_size_kb') or {}).get('4')
             if isinstance(opt4, dict) and isinstance(opt4.get('chosen_point'), dict):
-                chosen = opt4['chosen_point']
                 selection_policy = '4k_only'
+                chosen = opt4['chosen_point']
+
+            # Conservative override: if 4K tests include iodepth=1 and numjobs/dev=1,
+            # select the best among those to avoid assuming deep queues or parallel jobs.
+            conservative = [
+                r for r in valid
+                if int(r.get('block_size_kb', -1)) == 4
+                and int(r.get('iodepth', 1)) == 1
+                and int(r.get('numjobs_per_device', 1)) == 1
+            ]
+            if conservative:
+                best_cons = max(conservative, key=_score)
+                best_cons_score = float(_score(best_cons) or 0.0)
+                threshold_cons = best_cons_score * 0.95
+                near_cons = [r for r in conservative if float(_score(r) or 0.0) >= threshold_cons]
+                chosen = min(
+                    near_cons,
+                    key=lambda r: (
+                        int(r.get('device_count', 1)),
+                        int(r.get('block_size_kb', 4)),
+                    )
+                )
+                selection_policy = '4k_iodepth1_numjobs1'
         except Exception:
             pass
 

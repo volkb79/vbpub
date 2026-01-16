@@ -90,6 +90,18 @@ def _format_update(update: Dict[str, Any]) -> str:
     return f"[{chat_title}] {from_user}: {text}"
 
 
+def _emit(line: str, log_file: Optional[Path]) -> None:
+    print(line)
+    if not log_file:
+        return
+    try:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        with log_file.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
 def fetch_updates(
     token: str,
     *,
@@ -115,6 +127,8 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=30, help="Long-poll timeout seconds (default: 30)")
     parser.add_argument("--offset-file", default=".telegram.offset", help="File to persist update offset")
     parser.add_argument("--no-offset-file", action="store_true", help="Disable offset persistence")
+    parser.add_argument("--log-file", default="telegram_debug_reader.log", help="Log file path (default: telegram_debug_reader.log)")
+    parser.add_argument("--no-log", action="store_true", help="Disable log file output")
     parser.add_argument("--chat-id", type=int, help="Filter by chat id (overrides TELEGRAM_CHAT_ID)")
     parser.add_argument("--print-raw", action="store_true", help="Print raw JSON updates")
     args = parser.parse_args()
@@ -133,6 +147,7 @@ def main() -> int:
             chat_id = None
 
     offset_file = None if args.no_offset_file else Path(args.offset_file)
+    log_file = None if args.no_log else Path(args.log_file)
     offset = _load_offset(offset_file)
 
     if not args.once and not args.follow:
@@ -157,9 +172,9 @@ def main() -> int:
                         if upd_chat is None or upd_chat != chat_id:
                             continue
                     if args.print_raw:
-                        print(json.dumps(update, indent=2))
+                        _emit(json.dumps(update, indent=2), log_file)
                     else:
-                        print(_format_update(update))
+                        _emit(_format_update(update), log_file)
 
                 if offset is not None:
                     _save_offset(offset_file, offset)
