@@ -1,0 +1,18 @@
+{
+  // Server ID for: v2202511209318406253
+  "serverId": 804027,
+  // Hostname determined by: reverse DNS lookup on 152.53.166.181
+  "hostname": "v1001.vxxu.de",
+  // Image: Debian 13.2.0 UEFI amd64
+  "imageFlavourId": 128,
+  "diskName": "vda",
+  // SSH key IDs for user 152828
+  //   - ecdsa-sha2-nistp521-20240726-volker.badziong-clouds
+  "sshKeyIds": [22556],
+  "locale": "en_US.UTF-8",
+  "timezone": "Europe/Berlin",
+  "customScript": "curl -fsSL https://raw.githubusercontent.com/volkb79/vbpub/main/scripts/debian-install/bootstrap.sh | DEBUG_MODE=no BOOTSTRAP_STAGE=stage1 AUTO_REBOOT_AFTER_STAGE1=auto NEVER_REBOOT=no TELEGRAM_BOT_TOKEN={{TELEGRAM_BOT_TOKEN}} TELEGRAM_CHAT_ID={{TELEGRAM_CHAT_ID}} bash",
+  "rootPartitionFullDiskSize": false,
+  "sshPasswordAuthentication": false,
+  "emailToExecutingUser": true
+}

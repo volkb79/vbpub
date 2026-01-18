@@ -1,0 +1,6 @@
+**
+!Dockerfile
+!docker-bake.hcl
+!README.md
+!apt/**
+
