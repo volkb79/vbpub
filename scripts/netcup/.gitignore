@@ -1,2 +1,13 @@
 install-debian.json
 remote-logs/
+
+# Local Telegram setup artifacts (contain secrets / offsets)
+.telegram.setup.offset
+.telegram.setup.*
+.telegram.reader.offset
+.telegram.user.session*
+*.session
+*.session-journal
+
+# Local env files (secrets)
+.env

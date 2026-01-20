@@ -21,15 +21,74 @@ except ImportError:
 class TelegramClient:
     """Telegram messaging client with automatic source attribution"""
     
-    def __init__(self, bot_token=None, chat_id=None):
+    def __init__(self, bot_token=None, chat_id=None, thread_id=None):
         self.bot_token = bot_token or os.environ.get('TELEGRAM_BOT_TOKEN')
         self.chat_id = chat_id or os.environ.get('TELEGRAM_CHAT_ID')
+        # Optional: post into a forum topic thread (supergroups with topics enabled).
+        # Bot API param: message_thread_id
+        self.thread_id = (
+            thread_id
+            if thread_id is not None
+            else (os.environ.get('TELEGRAM_THREAD_ID') or os.environ.get('TELEGRAM_MESSAGE_THREAD_ID'))
+        )
         
         if not self.bot_token or not self.chat_id:
             raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
         
         self.api_url = f"https://api.telegram.org/bot{self.bot_token}"
         self.system_id = self._get_system_id()
+
+    def create_forum_topic(self, name, icon_color=None, icon_custom_emoji_id=None, max_retries=3, retry_delay=2):
+        """Create a forum topic in a supergroup that has Topics enabled.
+
+        Returns:
+            int | None: message_thread_id if successful, else None
+        """
+        url = f"{self.api_url}/createForumTopic"
+        data = {
+            'chat_id': self.chat_id,
+            'name': name,
+        }
+        if icon_color is not None:
+            data['icon_color'] = icon_color
+        if icon_custom_emoji_id is not None:
+            data['icon_custom_emoji_id'] = icon_custom_emoji_id
+
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(url, data=data, timeout=10)
+                response.raise_for_status()
+                payload = response.json()
+                if not payload.get('ok'):
+                    last_error = payload
+                    return None
+                result = payload.get('result', {}) or {}
+                thread_id = result.get('message_thread_id')
+                if thread_id is None:
+                    return None
+                try:
+                    return int(thread_id)
+                except Exception:
+                    return None
+            except requests.exceptions.ConnectionError as e:
+                last_error = f"Connection error: {e}"
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    time.sleep(wait_time)
+                    continue
+            except requests.exceptions.Timeout as e:
+                last_error = f"Timeout error: {e}"
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    time.sleep(wait_time)
+                    continue
+            except requests.exceptions.RequestException as e:
+                last_error = f"Request error: {e}"
+                return None
+
+        print(f"Failed to create forum topic after {max_retries} attempts: {last_error}")
+        return None
     
     def _get_system_id(self):
         """Get system identification (FQDN + IP)"""
@@ -56,7 +115,7 @@ class TelegramClient:
         
         return f"{hostname} ({ip})"
     
-    def send_message(self, text, parse_mode='HTML', prefix_source=True, max_retries=3, retry_delay=2):
+    def send_message(self, text, parse_mode='HTML', prefix_source=True, max_retries=3, retry_delay=2, message_thread_id=None):
         """
         Send text message with automatic source attribution and retry logic
         
@@ -82,6 +141,10 @@ class TelegramClient:
             'text': prefixed_text,
             'parse_mode': parse_mode
         }
+
+        thread_id = message_thread_id if message_thread_id is not None else self.thread_id
+        if thread_id not in (None, ""):
+            data['message_thread_id'] = thread_id
         
         last_error = None
         for attempt in range(max_retries):
@@ -112,7 +175,7 @@ class TelegramClient:
         print(f"Failed to send message after {max_retries} attempts: {last_error}")
         return False
     
-    def send_document(self, file_path, caption=None, prefix_source=True, max_retries=3, retry_delay=2):
+    def send_document(self, file_path, caption=None, prefix_source=True, max_retries=3, retry_delay=2, message_thread_id=None):
         """
         Send document file with retry logic
         
@@ -141,6 +204,11 @@ class TelegramClient:
                 with open(file_path, 'rb') as f:
                     files = {'document': f}
                     data = {'chat_id': self.chat_id}
+
+                    thread_id = message_thread_id if message_thread_id is not None else self.thread_id
+                    if thread_id not in (None, ""):
+                        data['message_thread_id'] = thread_id
+
                     if caption:
                         data['caption'] = caption
                         data['parse_mode'] = 'HTML'
@@ -171,7 +239,7 @@ class TelegramClient:
         print(f"Failed to send document after {max_retries} attempts: {last_error}")
         return False
     
-    def send_media_group(self, file_paths, caption=None, prefix_source=True, max_retries=3, retry_delay=2):
+    def send_media_group(self, file_paths, caption=None, prefix_source=True, max_retries=3, retry_delay=2, message_thread_id=None):
         """
         Send multiple images as a media group (album) in a single message
         
@@ -236,6 +304,10 @@ class TelegramClient:
                         'chat_id': self.chat_id,
                         'media': json.dumps(media)
                     }
+
+                    thread_id = message_thread_id if message_thread_id is not None else self.thread_id
+                    if thread_id not in (None, ""):
+                        data['message_thread_id'] = thread_id
                     
                     response = requests.post(url, data=data, files=files, timeout=60)
                     
@@ -342,27 +414,37 @@ def main():
     parser.add_argument('--send', metavar='TEXT', help='Send message')
     parser.add_argument('--file', metavar='PATH', help='Send file')
     parser.add_argument('--caption', metavar='TEXT', help='Caption for file (used with --file)')
+    parser.add_argument('--thread-id', metavar='ID', help='Optional: Telegram forum topic message_thread_id (or set TELEGRAM_THREAD_ID)')
+    parser.add_argument('--create-topic', metavar='TITLE', help='Create a Telegram forum topic (supergroup with topics enabled) and print message_thread_id')
     parser.add_argument('--bot-token', help='Bot token (or use TELEGRAM_BOT_TOKEN env)')
     parser.add_argument('--chat-id', help='Chat ID (or use TELEGRAM_CHAT_ID env)')
     
     args = parser.parse_args()
     
     try:
-        client = TelegramClient(args.bot_token, args.chat_id)
+        client = TelegramClient(args.bot_token, args.chat_id, thread_id=args.thread_id)
     except ValueError as e:
         print(f"Error: {e}")
         return 1
+
+    if args.create_topic:
+        thread_id = client.create_forum_topic(args.create_topic)
+        if thread_id is None:
+            print("")
+            return 1
+        print(str(thread_id))
+        return 0
     
     if args.test:
         return 0 if client.test_connection() else 1
     
     if args.send:
-        success = client.send_message(args.send)
+        success = client.send_message(args.send, message_thread_id=args.thread_id)
         print("✓ Message sent" if success else "✗ Failed to send message")
         return 0 if success else 1
     
     if args.file:
-        success = client.send_document(args.file, caption=args.caption)
+        success = client.send_document(args.file, caption=args.caption, message_thread_id=args.thread_id)
         print("✓ File sent" if success else "✗ Failed to send file")
         return 0 if success else 1
     

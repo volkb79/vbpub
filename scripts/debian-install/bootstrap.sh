@@ -83,6 +83,12 @@ PRE_SHRINK_ROOT_EXTRA_GB="${PRE_SHRINK_ROOT_EXTRA_GB:-10}"
 # Telegram
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+TELEGRAM_THREAD_ID="${TELEGRAM_THREAD_ID:-}"
+# If TELEGRAM_CHAT_ID points to a forum-enabled supergroup, we can create a topic
+# at install start and send all messages into that topic thread.
+# Values: auto|yes|no
+TELEGRAM_USE_FORUM_TOPIC="${TELEGRAM_USE_FORUM_TOPIC:-auto}"
+TELEGRAM_TOPIC_PREFIX="${TELEGRAM_TOPIC_PREFIX:-vbpub install}"
 
 # Colors
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -301,6 +307,60 @@ tg_send() {
     python3 "${SCRIPT_DIR}/telegram_client.py" --send "$msg" 2>/dev/null || true
 }
 
+tg_init_thread() {
+    local had_xtrace
+    had_xtrace=$(xtrace_pause)
+
+    case "${TELEGRAM_USE_FORUM_TOPIC}" in
+        no) xtrace_resume "$had_xtrace"; return 0 ;;
+        yes|auto) : ;;
+        *) xtrace_resume "$had_xtrace"; return 0 ;;
+    esac
+
+    # Only initialize once.
+    if [ -n "${TELEGRAM_THREAD_ID:-}" ]; then
+        export TELEGRAM_THREAD_ID
+        xtrace_resume "$had_xtrace"
+        return 0
+    fi
+
+    # Only try if telegram is configured and telegram_client exists.
+    if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+        xtrace_resume "$had_xtrace"
+        return 0
+    fi
+    if [ ! -f "${SCRIPT_DIR}/telegram_client.py" ]; then
+        xtrace_resume "$had_xtrace"
+        return 0
+    fi
+
+    # Ensure dependencies are present (telegram_client.py needs requests).
+    if ! python3 -c 'import requests' >/dev/null 2>&1; then
+        xtrace_resume "$had_xtrace"
+        return 0
+    fi
+    xtrace_resume "$had_xtrace"
+
+    local title
+    title="${TELEGRAM_TOPIC_PREFIX} $(hostname -f 2>/dev/null || hostname) ${RUN_TS}"
+
+    # createForumTopic works only on forum-enabled supergroups. If it fails and
+    # we're in 'auto' mode, we just fall back to non-threaded messaging.
+    local thread_id
+    thread_id=$(python3 "${SCRIPT_DIR}/telegram_client.py" --create-topic "$title" 2>>"$LOG_FILE" || true)
+    if [[ "${thread_id:-}" =~ ^[0-9]+$ ]]; then
+        TELEGRAM_THREAD_ID="$thread_id"
+        export TELEGRAM_THREAD_ID
+        mkdir -p "$STATE_DIR" || true
+        printf '%s\n' "$TELEGRAM_THREAD_ID" >"$STATE_DIR/telegram_thread_id" 2>/dev/null || true
+        log_info "Telegram forum topic initialized (message_thread_id=$TELEGRAM_THREAD_ID)"
+    else
+        if [ "${TELEGRAM_USE_FORUM_TOPIC}" = "yes" ]; then
+            log_warn "TELEGRAM_USE_FORUM_TOPIC=yes but forum topic creation failed (chat may not be a forum-enabled supergroup)."
+        fi
+    fi
+}
+
 # Helper function to send files via telegram
 tg_send_file() {
     local file="$1"
@@ -413,6 +473,9 @@ LOG_DIR="${LOG_DIR}"
 DEBUG_MODE="${DEBUG_MODE}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID}"
+TELEGRAM_THREAD_ID="${TELEGRAM_THREAD_ID}"
+TELEGRAM_USE_FORUM_TOPIC="${TELEGRAM_USE_FORUM_TOPIC}"
+TELEGRAM_TOPIC_PREFIX="${TELEGRAM_TOPIC_PREFIX}"
 
 # Stage control
 AUTO_REBOOT_AFTER_STAGE1="${AUTO_REBOOT_AFTER_STAGE1}"
@@ -560,6 +623,9 @@ run_stage1() {
 
     install_stage1_packages
 
+    # Optional: Create a forum topic for this install run so all notifications are grouped.
+    tg_init_thread
+
     # User configuration (aliases etc)
     if [ "$RUN_USER_CONFIG" = "yes" ]; then
         log_info "==> Configuring users (stage1)"
@@ -625,6 +691,7 @@ run_stage2() {
     fi
 
     log_info "==> Running stage2 (long-running / resume-safe)"
+    tg_init_thread
     tg_send "▶️ vbpub stage2 started on $(hostname -f 2>/dev/null || hostname). Running: packages → swap partition prep → benchmarks → final swap setup (then optional docker/ssh/geekbench)."
 
     install_stage2_packages
@@ -637,7 +704,7 @@ run_stage2() {
     export SWAP_PARTITION_COUNT
     export SWAP_PRIORITY EXTEND_ROOT
     export ZFS_POOL
-    export TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID LOG_FILE
+    export TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID TELEGRAM_THREAD_ID LOG_FILE
     export DEBUG_MODE
     export PRESERVE_ROOT_SIZE_GB
 
