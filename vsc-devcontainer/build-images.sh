@@ -3,6 +3,13 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+LOG_DIR="${PROJECT_ROOT}/logs"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/build-images-$(date -u +%Y%m%d-%H%M%S).log"
+exec > >(tee -a "${LOG_FILE}") 2>&1
+
+echo "[INFO] Logging to ${LOG_FILE}"
+
 ENV_FILE="${PROJECT_ROOT}/.env"
 if [[ -f "${ENV_FILE}" ]]; then
 	# shellcheck source=/dev/null
@@ -40,14 +47,27 @@ maybe_set_arg AWSCLI_VERSION
 maybe_set_arg B2_VERSION
 maybe_set_arg BACKPORTS_URI
 maybe_set_arg BAT_VERSION
+maybe_set_arg DELTA_VERSION
+maybe_set_arg GH_VERSION
 maybe_set_arg CONSUL_VERSION
 maybe_set_arg FD_VERSION
 maybe_set_arg FZF_VERSION
 maybe_set_arg POSTGRESQL_CLIENT_VERSION
 maybe_set_arg REDIS_TOOLS_VERSION
 maybe_set_arg RIPGREP_VERSION
+maybe_set_arg RGA_VERSION
 maybe_set_arg SHELLCHECK_VERSION
 maybe_set_arg VAULT_VERSION
 maybe_set_arg YQ_VERSION
+maybe_set_arg OCI_TITLE
+maybe_set_arg OCI_DESCRIPTION
+maybe_set_arg OCI_SOURCE
+maybe_set_arg OCI_DOCUMENTATION
+maybe_set_arg OCI_URL
+maybe_set_arg OCI_LICENSES
+maybe_set_arg OCI_VENDOR
+maybe_set_arg OCI_VERSION
+maybe_set_arg OCI_REVISION
+maybe_set_arg OCI_CREATED
 
 docker buildx bake -f docker-bake.hcl all --load "${BAKE_SET_ARGS[@]}"

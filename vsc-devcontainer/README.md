@@ -63,6 +63,16 @@ Each image writes a manifest to:
 
 It includes tool versions, Python version, pip package list, and selected Debian package versions.
 
+## Package metadata (GitHub Packages)
+
+The container image publishes OCI labels so the GitHub Packages page shows a useful description and links:
+
+- `org.opencontainers.image.description`
+- `org.opencontainers.image.source`
+- `org.opencontainers.image.documentation`
+
+This makes the package page readable before download and points to the manifest location inside the image.
+
 ## Build
 
 This project uses Buildx Bake. The build date is included in tags via `BUILD_DATE`.
@@ -73,6 +83,8 @@ This project uses Buildx Bake. The build date is included in tags via `BUILD_DAT
 ## Push to GitHub Artifact Registry
 
 Use `./push-images.sh` (or run Bake with `--push`) after validation. Configure registry namespace via environment variables in the script or your shell.
+
+`push-images.sh` also updates the `latest` tag (and per-variant `*-latest` tags) to point at the most recently pushed images.
 
 ### GHCR (personal account)
 

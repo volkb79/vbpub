@@ -1,23 +1,37 @@
 # Devcontainer base image (pre-built)
 # Supports multiple Debian + Python variants via build args.
 
-ARG PYTHON_VERSION="3.13"
-ARG DEBIAN_VERSION="bookworm"
-ARG BASE_IMAGE="mcr.microsoft.com/devcontainers/python:1-${PYTHON_VERSION}-${DEBIAN_VERSION}"
-ARG BACKPORTS_URI="http://debian.anexia.at/debian"
+ARG PYTHON_VERSION
+ARG DEBIAN_VERSION
+ARG BASE_IMAGE="scratch"
+ARG BACKPORTS_URI
 
-ARG AWSCLI_VERSION="latest"
-ARG B2_VERSION="latest"
-ARG BAT_VERSION="latest"
-ARG CONSUL_VERSION="latest"
-ARG FD_VERSION="latest"
-ARG FZF_VERSION="latest"
-ARG POSTGRESQL_CLIENT_VERSION="latest"
-ARG REDIS_TOOLS_VERSION="latest"
-ARG RIPGREP_VERSION="latest"
-ARG SHELLCHECK_VERSION="latest"
-ARG VAULT_VERSION="latest"
-ARG YQ_VERSION="latest"
+ARG OCI_TITLE=""
+ARG OCI_DESCRIPTION=""
+ARG OCI_SOURCE=""
+ARG OCI_DOCUMENTATION=""
+ARG OCI_URL=""
+ARG OCI_LICENSES=""
+ARG OCI_VENDOR=""
+ARG OCI_VERSION=""
+ARG OCI_REVISION=""
+ARG OCI_CREATED=""
+
+ARG AWSCLI_VERSION
+ARG B2_VERSION
+ARG BAT_VERSION
+ARG DELTA_VERSION
+ARG GH_VERSION
+ARG CONSUL_VERSION
+ARG FD_VERSION
+ARG FZF_VERSION
+ARG POSTGRESQL_CLIENT_VERSION
+ARG REDIS_TOOLS_VERSION
+ARG RIPGREP_VERSION
+ARG RGA_VERSION
+ARG SHELLCHECK_VERSION
+ARG VAULT_VERSION
+ARG YQ_VERSION
 FROM ${BASE_IMAGE}
 
 SHELL ["/bin/bash", "-c"]
@@ -25,18 +39,43 @@ SHELL ["/bin/bash", "-c"]
 ARG PYTHON_VERSION
 ARG DEBIAN_VERSION
 ARG BACKPORTS_URI
+ARG OCI_TITLE=""
+ARG OCI_DESCRIPTION=""
+ARG OCI_SOURCE=""
+ARG OCI_DOCUMENTATION=""
+ARG OCI_URL=""
+ARG OCI_LICENSES=""
+ARG OCI_VENDOR=""
+ARG OCI_VERSION=""
+ARG OCI_REVISION=""
+ARG OCI_CREATED=""
 ARG AWSCLI_VERSION
 ARG B2_VERSION
 ARG BAT_VERSION
+ARG DELTA_VERSION
+ARG GH_VERSION
 ARG CONSUL_VERSION
 ARG FD_VERSION
 ARG FZF_VERSION
 ARG POSTGRESQL_CLIENT_VERSION
 ARG REDIS_TOOLS_VERSION
 ARG RIPGREP_VERSION
+ARG RGA_VERSION
 ARG SHELLCHECK_VERSION
 ARG VAULT_VERSION
 ARG YQ_VERSION
+
+# OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
+LABEL org.opencontainers.image.title="${OCI_TITLE}" \
+    org.opencontainers.image.description="${OCI_DESCRIPTION}" \
+    org.opencontainers.image.source="${OCI_SOURCE}" \
+    org.opencontainers.image.documentation="${OCI_DOCUMENTATION}" \
+    org.opencontainers.image.url="${OCI_URL}" \
+    org.opencontainers.image.licenses="${OCI_LICENSES}" \
+    org.opencontainers.image.vendor="${OCI_VENDOR}" \
+    org.opencontainers.image.version="${OCI_VERSION}" \
+    org.opencontainers.image.revision="${OCI_REVISION}" \
+    org.opencontainers.image.created="${OCI_CREATED}"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -68,10 +107,12 @@ RUN set -euo pipefail; \
     apt-get install -y --no-install-recommends \
         bash-completion \
         ca-certificates \
+        locales \
         curl \
         dnsutils \
         fuse3 \
         git \
+        git-lfs \
         gnupg \
         gzip \
         htop \
@@ -80,11 +121,17 @@ RUN set -euo pipefail; \
         jq \
         less \
         lsb-release \
+        lsof \
         man-db \
         mc \
         "${NETCAT_PKG}" \
+        ncdu \
+        openssl \
         python3-venv \
+        psmisc \
+        rsync \
         sqlite3 \
+        strace \
         sshfs \
         tar \
         tree \
@@ -92,14 +139,32 @@ RUN set -euo pipefail; \
         vim \
         wget \
         xz-utils \
+        pandoc \
+        poppler-utils \
+        p7zip-full \
     ; \
+    sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen; \
+    locale-gen en_US.UTF-8; \
+    update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8; \
     echo "user_allow_other" >> /etc/fuse.conf; \
     rm -rf /var/lib/apt/lists/*
+
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
 
 # Modern tools installation
 RUN set -euo pipefail; \
     get_latest_release() { \
         local repo="$1"; \
+        local location=""; \
+        location="$(curl -fsSLI "https://github.com/${repo}/releases/latest" \
+            | awk -F': ' 'tolower($1)=="location"{print $2}' \
+            | tail -1 \
+            | tr -d '\r\n')"; \
+        if [ -n "${location}" ]; then \
+            basename "${location}" | sed 's/^v//' | tr -d '\r\n'; \
+            return 0; \
+        fi; \
         curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" \
             | jq -r '.tag_name // empty' \
             | sed 's/^v//' \
@@ -122,6 +187,9 @@ RUN set -euo pipefail; \
     FZF_VER="$(resolve_version "${FZF_VERSION}" "junegunn/fzf")"; \
     YQ_VER="$(resolve_version "${YQ_VERSION}" "mikefarah/yq")"; \
     CONSUL_VER="$(resolve_version "${CONSUL_VERSION}" "hashicorp/consul")"; \
+    DELTA_VER="$(resolve_version "${DELTA_VERSION}" "dandavison/delta")"; \
+    GH_VER="$(resolve_version "${GH_VERSION}" "cli/cli")"; \
+    RGA_VER="$(resolve_version "${RGA_VERSION}" "phiresky/ripgrep-all")"; \
     VAULT_VER="$(resolve_version "${VAULT_VERSION}" "hashicorp/vault")"; \
     echo "B2_VER=${B2_VER}" > /tmp/tool-versions.env; \
     echo "BAT_VER=${BAT_VER}" >> /tmp/tool-versions.env; \
@@ -131,6 +199,9 @@ RUN set -euo pipefail; \
     echo "FZF_VER=${FZF_VER}" >> /tmp/tool-versions.env; \
     echo "YQ_VER=${YQ_VER}" >> /tmp/tool-versions.env; \
     echo "CONSUL_VER=${CONSUL_VER}" >> /tmp/tool-versions.env; \
+    echo "DELTA_VER=${DELTA_VER}" >> /tmp/tool-versions.env; \
+    echo "GH_VER=${GH_VER}" >> /tmp/tool-versions.env; \
+    echo "RGA_VER=${RGA_VER}" >> /tmp/tool-versions.env; \
     echo "VAULT_VER=${VAULT_VER}" >> /tmp/tool-versions.env
 
 RUN set -euo pipefail; \
@@ -144,13 +215,82 @@ RUN set -euo pipefail; \
 
 RUN set -euo pipefail; \
     . /tmp/tool-versions.env; \
-    curl -fsSL "https://github.com/sharkdp/bat/releases/download/v${BAT_VER}/bat_${BAT_VER}_amd64.deb" -o /tmp/bat.deb; \
-    curl -fsSL "https://github.com/sharkdp/fd/releases/download/v${FD_VER}/fd_${FD_VER}_amd64.deb" -o /tmp/fd.deb; \
-    curl -fsSL "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VER}/ripgrep_${RIPGREP_VER}-1_amd64.deb" -o /tmp/ripgrep.deb; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends /tmp/bat.deb /tmp/fd.deb /tmp/ripgrep.deb; \
-    rm -f /tmp/bat.deb /tmp/fd.deb /tmp/ripgrep.deb; \
-    rm -rf /var/lib/apt/lists/*
+    download_first_available() { \
+        local output="$1"; \
+        shift; \
+        local url=""; \
+        for url in "$@"; do \
+            if curl -fsSL "${url}" -o "${output}"; then \
+                echo "${url}"; \
+                return 0; \
+            fi; \
+        done; \
+        return 1; \
+    }; \
+    BAT_URL="$(download_first_available /tmp/bat.tar.gz \
+        "https://github.com/sharkdp/bat/releases/download/v${BAT_VER}/bat-v${BAT_VER}-x86_64-unknown-linux-gnu.tar.gz" \
+        "https://github.com/sharkdp/bat/releases/download/v${BAT_VER}/bat-${BAT_VER}-x86_64-unknown-linux-gnu.tar.gz" \
+        "https://github.com/sharkdp/bat/releases/download/v${BAT_VER}/bat-v${BAT_VER}-x86_64-unknown-linux-musl.tar.gz" \
+        "https://github.com/sharkdp/bat/releases/download/v${BAT_VER}/bat-${BAT_VER}-x86_64-unknown-linux-musl.tar.gz" \
+    )"; \
+    DELTA_URL="$(download_first_available /tmp/delta.tar.gz \
+        "https://github.com/dandavison/delta/releases/download/${DELTA_VER}/delta-${DELTA_VER}-x86_64-unknown-linux-gnu.tar.gz" \
+        "https://github.com/dandavison/delta/releases/download/v${DELTA_VER}/delta-${DELTA_VER}-x86_64-unknown-linux-gnu.tar.gz" \
+        "https://github.com/dandavison/delta/releases/download/${DELTA_VER}/delta-${DELTA_VER}-x86_64-unknown-linux-musl.tar.gz" \
+        "https://github.com/dandavison/delta/releases/download/v${DELTA_VER}/delta-${DELTA_VER}-x86_64-unknown-linux-musl.tar.gz" \
+    )"; \
+    FD_URL="$(download_first_available /tmp/fd.tar.gz \
+        "https://github.com/sharkdp/fd/releases/download/v${FD_VER}/fd-v${FD_VER}-x86_64-unknown-linux-gnu.tar.gz" \
+        "https://github.com/sharkdp/fd/releases/download/v${FD_VER}/fd-${FD_VER}-x86_64-unknown-linux-gnu.tar.gz" \
+        "https://github.com/sharkdp/fd/releases/download/v${FD_VER}/fd-v${FD_VER}-x86_64-unknown-linux-musl.tar.gz" \
+        "https://github.com/sharkdp/fd/releases/download/v${FD_VER}/fd-${FD_VER}-x86_64-unknown-linux-musl.tar.gz" \
+    )"; \
+    RGA_URL="$(download_first_available /tmp/rga.tar.gz \
+        "https://github.com/phiresky/ripgrep-all/releases/download/${RGA_VER}/ripgrep_all-v${RGA_VER}-x86_64-unknown-linux-gnu.tar.gz" \
+        "https://github.com/phiresky/ripgrep-all/releases/download/v${RGA_VER}/ripgrep_all-v${RGA_VER}-x86_64-unknown-linux-gnu.tar.gz" \
+        "https://github.com/phiresky/ripgrep-all/releases/download/${RGA_VER}/ripgrep_all-v${RGA_VER}-x86_64-unknown-linux-musl.tar.gz" \
+        "https://github.com/phiresky/ripgrep-all/releases/download/v${RGA_VER}/ripgrep_all-v${RGA_VER}-x86_64-unknown-linux-musl.tar.gz" \
+        "https://github.com/phiresky/ripgrep-all/releases/download/${RGA_VER}/ripgrep_all-${RGA_VER}-x86_64-unknown-linux-gnu.tar.gz" \
+        "https://github.com/phiresky/ripgrep-all/releases/download/v${RGA_VER}/ripgrep_all-${RGA_VER}-x86_64-unknown-linux-gnu.tar.gz" \
+        "https://github.com/phiresky/ripgrep-all/releases/download/${RGA_VER}/ripgrep_all-${RGA_VER}-x86_64-unknown-linux-musl.tar.gz" \
+        "https://github.com/phiresky/ripgrep-all/releases/download/v${RGA_VER}/ripgrep_all-${RGA_VER}-x86_64-unknown-linux-musl.tar.gz" \
+    )"; \
+    RIPGREP_URL="$(download_first_available /tmp/ripgrep.tar.gz \
+        "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VER}/ripgrep-${RIPGREP_VER}-x86_64-unknown-linux-gnu.tar.gz" \
+        "https://github.com/BurntSushi/ripgrep/releases/download/v${RIPGREP_VER}/ripgrep-${RIPGREP_VER}-x86_64-unknown-linux-gnu.tar.gz" \
+        "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VER}/ripgrep-${RIPGREP_VER}-x86_64-unknown-linux-musl.tar.gz" \
+        "https://github.com/BurntSushi/ripgrep/releases/download/v${RIPGREP_VER}/ripgrep-${RIPGREP_VER}-x86_64-unknown-linux-musl.tar.gz" \
+    )"; \
+    if [ -z "${BAT_URL}" ] || [ -z "${DELTA_URL}" ] || [ -z "${FD_URL}" ] || [ -z "${RGA_URL}" ] || [ -z "${RIPGREP_URL}" ]; then \
+        echo "[ERROR] Failed to download one or more release tarballs." >&2; \
+        echo "[ERROR] BAT_URL=${BAT_URL}" >&2; \
+        echo "[ERROR] DELTA_URL=${DELTA_URL}" >&2; \
+        echo "[ERROR] FD_URL=${FD_URL}" >&2; \
+        echo "[ERROR] RGA_URL=${RGA_URL}" >&2; \
+        echo "[ERROR] RIPGREP_URL=${RIPGREP_URL}" >&2; \
+        exit 1; \
+    fi; \
+    install_from_tar() { \
+        local tarball="$1"; \
+        local bin_name="$2"; \
+        local workdir="$3"; \
+        mkdir -p "${workdir}"; \
+        tar -xzf "${tarball}" -C "${workdir}"; \
+        local bin_path=""; \
+        bin_path="$(find "${workdir}" -type f -name "${bin_name}" -perm -111 | head -1)"; \
+        if [ -z "${bin_path}" ]; then \
+            echo "[ERROR] Failed to locate ${bin_name} in ${tarball}" >&2; \
+            exit 1; \
+        fi; \
+        install -m 755 "${bin_path}" "/usr/local/bin/${bin_name}"; \
+    }; \
+    install_from_tar /tmp/bat.tar.gz bat /tmp/bat-extract; \
+    install_from_tar /tmp/delta.tar.gz delta /tmp/delta-extract; \
+    install_from_tar /tmp/fd.tar.gz fd /tmp/fd-extract; \
+    install_from_tar /tmp/rga.tar.gz rga /tmp/rga-extract; \
+    install_from_tar /tmp/ripgrep.tar.gz rg /tmp/ripgrep-extract; \
+    rm -rf /tmp/bat.tar.gz /tmp/delta.tar.gz /tmp/fd.tar.gz /tmp/rga.tar.gz /tmp/ripgrep.tar.gz \
+        /tmp/bat-extract /tmp/delta-extract /tmp/fd-extract /tmp/rga-extract /tmp/ripgrep-extract
 
 RUN set -euo pipefail; \
     . /tmp/tool-versions.env; \
@@ -170,6 +310,13 @@ RUN set -euo pipefail; \
     . /tmp/tool-versions.env; \
     curl -fsSL "https://github.com/mikefarah/yq/releases/download/v${YQ_VER}/yq_linux_amd64" -o /usr/local/bin/yq; \
     chmod 755 /usr/local/bin/yq
+
+RUN set -euo pipefail; \
+    . /tmp/tool-versions.env; \
+    curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VER}/gh_${GH_VER}_linux_amd64.tar.gz" -o /tmp/gh.tar.gz; \
+    tar -xzf /tmp/gh.tar.gz -C /tmp; \
+    install -m 755 "/tmp/gh_${GH_VER}_linux_amd64/bin/gh" /usr/local/bin/gh; \
+    rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VER}_linux_amd64"
 
 RUN set -euo pipefail; \
     . /tmp/tool-versions.env; \
@@ -253,6 +400,14 @@ ENV VIRTUAL_ENV="/home/vscode/.venv"
 ENV PATH="/home/vscode/.venv/bin:${PATH}"
 
 USER root
+RUN set -euo pipefail; \
+        cat > /etc/profile.d/dstdns-venv.sh << 'EOF'
+if [ -n "${BASH_VERSION:-}" ] && [[ $- == *i* ]] && [ -d /home/vscode/.venv ]; then
+    # shellcheck source=/dev/null
+    source /home/vscode/.venv/bin/activate
+fi
+EOF
+USER vscode
 
 # Manifest of included tool versions
 RUN set -euo pipefail; \
@@ -262,14 +417,25 @@ RUN set -euo pipefail; \
     else \
         NETCAT_PKG="netcat-traditional"; \
     fi; \
+    b2_version_output="$(b2 version 2>&1 | head -1 || true)"; \
+    if [ -z "$b2_version_output" ]; then \
+        b2_version_output="$(b2 --version 2>&1 | head -1 || true)"; \
+    fi; \
+    shellcheck_version_output="$(shellcheck --version 2>&1 | awk -F': ' '/version/ {print $2; exit}' || true)"; \
+    if [ -z "$shellcheck_version_output" ]; then \
+        shellcheck_version_output="$(shellcheck --version 2>&1 | head -1 || true)"; \
+    fi; \
     { \
         echo "image.debian=${DEBIAN_VERSION}"; \
         echo "image.python=$(python3 --version 2>&1)"; \
-        echo "tool.b2=$(b2 --version 2>&1 | head -1)"; \
+        echo "tool.b2=${b2_version_output}"; \
         echo "tool.bat=$(bat --version 2>&1 | head -1)"; \
+        echo "tool.delta=$(delta --version 2>&1 | head -1)"; \
         echo "tool.fd=$(fd --version 2>&1 | head -1)"; \
         echo "tool.ripgrep=$(rg --version 2>&1 | head -1)"; \
-        echo "tool.shellcheck=$(shellcheck --version 2>&1 | head -1)"; \
+        echo "tool.rga=$(rga --version 2>&1 | head -1)"; \
+        echo "tool.gh=$(gh --version 2>&1 | head -1)"; \
+        echo "tool.shellcheck=${shellcheck_version_output}"; \
         echo "tool.fzf=$(fzf --version 2>&1)"; \
         echo "tool.yq=$(yq --version 2>&1)"; \
         echo "tool.consul=$(consul version 2>&1 | head -1)"; \
@@ -281,8 +447,8 @@ RUN set -euo pipefail; \
         /home/vscode/.venv/bin/pip list --format=freeze; \
         echo "dpkg.versions:"; \
         dpkg-query -W -f='${Package}=${Version}\n' \
-            bash-completion ca-certificates curl dnsutils fuse3 git gnupg gzip htop httpie iputils-ping jq less lsb-release man-db mc \
-            "${NETCAT_PKG}" python3-venv sqlite3 sshfs tar tree unzip vim wget xz-utils \
+            bash-completion ca-certificates curl dnsutils fuse3 git git-lfs gnupg gzip htop httpie iputils-ping jq less lsb-release lsof man-db mc \
+            "${NETCAT_PKG}" ncdu openssl pandoc p7zip-full poppler-utils python3-venv psmisc rsync sqlite3 strace sshfs tar tree unzip vim wget xz-utils \
                 postgresql-client redis-tools; \
             } > "${manifest}"; \
             chown vscode:vscode "${manifest}"
