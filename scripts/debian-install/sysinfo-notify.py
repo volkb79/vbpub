@@ -123,7 +123,10 @@ IMPORTANT: Send a message to your bot first before it can message you!
         
         if args.notify:
             print("Sending system info to Telegram...")
-            message = collector.format_html()
+            if args.caption and "BEFORE setup" in args.caption:
+                message = collector.format_html_before_setup()
+            else:
+                message = collector.format_html()
             
             # Add custom caption if provided
             if args.caption:

@@ -307,6 +307,19 @@ tg_send() {
     python3 "${SCRIPT_DIR}/telegram_client.py" --send "$msg" 2>/dev/null || true
 }
 
+tg_send_system_summary_once() {
+    # Send the initial system summary into the install thread (if enabled)
+    # and only once per install run (persisted across stage1->stage2).
+    if state_has system_summary_sent; then
+        return 0
+    fi
+    if [ -z "${SYSTEM_SUMMARY:-}" ]; then
+        return 0
+    fi
+    tg_send "$SYSTEM_SUMMARY"
+    state_set system_summary_sent
+}
+
 tg_init_thread() {
     local had_xtrace
     had_xtrace=$(xtrace_pause)
@@ -341,8 +354,13 @@ tg_init_thread() {
     fi
     xtrace_resume "$had_xtrace"
 
-    local title
-    title="${TELEGRAM_TOPIC_PREFIX} $(hostname -f 2>/dev/null || hostname) ${RUN_TS}"
+    local fqdn ip date_str prefix title
+    fqdn="$(hostname -f 2>/dev/null || hostname)"
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+    [ -z "${ip:-}" ] && ip="unknown"
+    date_str="$(date +%Y-%m-%d)"
+    prefix="${TELEGRAM_TOPIC_PREFIX:-Install}"
+    title="${prefix} ${fqdn} (${ip}) ${date_str}"
 
     # createForumTopic works only on forum-enabled supergroups. If it fails and
     # we're in 'auto' mode, we just fall back to non-threaded messaging.
@@ -385,7 +403,6 @@ get_system_summary() {
     # Use system_info.py for consistent system information collection
     # This replaces the old bash implementation and uses the same module as sysinfo-notify.py
     if [ -f "${SCRIPT_DIR}/system_info.py" ]; then
-        echo "Bootstrap Installation started."
         echo ""
         python3 "${SCRIPT_DIR}/system_info.py" --format text 2>> "$LOG_FILE" || {
             # Fallback to basic info if system_info.py fails
@@ -395,7 +412,6 @@ get_system_summary() {
         }
     else
         # Minimal fallback if system_info.py doesn't exist yet
-        echo "Bootstrap Installation started."
         echo "System: $(hostname) - $(hostname -I 2>/dev/null | awk '{print $1}')"
     fi
 }
@@ -490,6 +506,11 @@ RUN_SSH_SETUP="${RUN_SSH_SETUP}"
 RUN_GEEKBENCH="${RUN_GEEKBENCH}"
 RUN_BENCHMARKS="${RUN_BENCHMARKS}"
 BENCHMARK_DURATION="${BENCHMARK_DURATION}"
+
+# Optional validation (default enabled; runs after Geekbench in stage2)
+RUN_ZSWAP_VALIDATION="${RUN_ZSWAP_VALIDATION:-yes}"
+ZSWAP_VALIDATE_HOLD_SECONDS="${ZSWAP_VALIDATE_HOLD_SECONDS:-90}"
+ZSWAP_VALIDATE_PRESSURE_MB="${ZSWAP_VALIDATE_PRESSURE_MB:-auto}"
 
 CREATE_SWAP_PARTITIONS="${CREATE_SWAP_PARTITIONS}"
 TEST_ZSWAP_LATENCY="${TEST_ZSWAP_LATENCY}"
@@ -626,6 +647,9 @@ run_stage1() {
     # Optional: Create a forum topic for this install run so all notifications are grouped.
     tg_init_thread
 
+    # Now that the thread exists (and requests is installed), send the initial summary into it.
+    tg_send_system_summary_once
+
     # User configuration (aliases etc)
     if [ "$RUN_USER_CONFIG" = "yes" ]; then
         log_info "==> Configuring users (stage1)"
@@ -692,6 +716,7 @@ run_stage2() {
 
     log_info "==> Running stage2 (long-running / resume-safe)"
     tg_init_thread
+    tg_send_system_summary_once
     tg_send "▶️ vbpub stage2 started on $(hostname -f 2>/dev/null || hostname). Running: packages → swap partition prep → benchmarks → final swap setup (then optional docker/ssh/geekbench)."
 
     install_stage2_packages
@@ -834,12 +859,12 @@ run_stage2() {
                 local swap_state
                 swap_state=$(swapon --show=NAME,TYPE,SIZE,USED,PRIO --noheadings 2>/dev/null | head -50 || true)
                 if [ -n "$swap_state" ]; then
-                    tg_send "💾 Stage2: swap active (name type size used prio):\n${swap_state}"
+                    tg_send "Stage2: swap active (name type size used prio):\n${swap_state}"
                 else
-                    tg_send "💾 Stage2: swap configured and active."
+                    tg_send "Stage2: swap configured and active."
                 fi
             else
-                tg_send "💾 Stage2: swap configured."
+                tg_send "Stage2: swap configured."
             fi
         else
             log_error "✗ Swap config failed"
@@ -879,6 +904,38 @@ run_stage2() {
         fi
         set -e
         state_set geekbench_done
+    fi
+
+    # Optional: ZSWAP validation (best-effort)
+    if [ "${RUN_ZSWAP_VALIDATION:-no}" = "yes" ] && ! state_has zswap_validation_done; then
+        if [ -r /sys/module/zswap/parameters/enabled ] && grep -Eq '^(Y|1)$' /sys/module/zswap/parameters/enabled 2>/dev/null; then
+            log_info "==> Validating ZSWAP behavior (stage2)"
+            tg_send "Stage2: running ZSWAP validation (memory pressure + zswap stats)."
+
+            chmod +x ./zswap-validate.sh 2>/dev/null || true
+            report_file="${LOG_DIR}/zswap-validation-${RUN_TS}.txt"
+            set +e
+            zswap_report=$(./zswap-validate.sh 2>&1 | tee -a "$LOG_FILE" | tee "$report_file")
+            rc=${PIPESTATUS[0]}
+            set -e
+
+            if [ "$rc" -eq 0 ]; then
+                tg_send "Stage2: ZSWAP validation complete. Summary:\n$(printf '%s' "$zswap_report" | head -c 3000)"
+                if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -f "$report_file" ]; then
+                    tg_send_file "$report_file" "ZSWAP validation report"
+                fi
+                state_set zswap_validation_done
+            else
+                tg_send "⚠️ Stage2: ZSWAP validation encountered issues (rc=$rc). See log for details."
+                if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -f "$report_file" ]; then
+                    tg_send_file "$report_file" "ZSWAP validation report (failed)"
+                fi
+                state_set zswap_validation_done
+            fi
+        else
+            log_info "==> ZSWAP validation skipped (zswap not enabled)"
+            state_set zswap_validation_done
+        fi
     fi
 
     # Summary + completion messages
@@ -960,7 +1017,9 @@ main() {
     log_info "==> Collecting system summary"
     SYSTEM_SUMMARY=$(get_system_summary)
     echo "$SYSTEM_SUMMARY" | tee -a "$LOG_FILE"
-    tg_send "$SYSTEM_SUMMARY"
+    # NOTE: We deliberately do NOT Telegram-send the system summary yet.
+    # In stage1, python3-requests (used by telegram_client.py) is installed later.
+    # We send the summary after tg_init_thread() so it lands in the install topic.
     
     if [ "$EUID" -ne 0 ]; then log_error "Must run as root"; exit 1; fi
     

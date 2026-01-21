@@ -5756,7 +5756,8 @@ def format_benchmark_html(results):
                 # Show ALL write latency tests (6 total)
                 for w in valid_writes:
                     avg_us = w['avg_write_us']
-                    bar_len = int(10 * (avg_us - min_latency) / (max_latency - min_latency + 1)) if max_latency > min_latency else 5
+                    # Visual: more filled = better (lower latency)
+                    bar_len = int(10 * (max_latency - avg_us) / (max_latency - min_latency + 1)) if max_latency > min_latency else 5
                     bar = '█' * bar_len + '░' * (10 - bar_len)
                     is_best = (avg_us == min_latency)
                     marker = " ⭐" if is_best else ""
@@ -5765,7 +5766,7 @@ def format_benchmark_html(results):
                     comparison = ""
                     if baseline_write_ns > 0:
                         slowdown = (avg_us * 1000) / baseline_write_ns  # Convert us to ns for comparison
-                        comparison = f" ({slowdown:.0f}×)"
+                        comparison = f" ({slowdown:.0f}× slower)"
                     
                     html += f"  {w['compressor']:6s}+{w['allocator']:8s}: {bar} {avg_us:6.1f}µs{comparison}{marker}\n"
             html += "\n"
@@ -5793,7 +5794,8 @@ def format_benchmark_html(results):
                 for r in configs_list[:4]:  # Limit to top 4
                     avg_us = r['avg_read_us']
                     pattern = r.get('access_pattern', 'seq')[:3]
-                    bar_len = int(10 * (avg_us - min_latency) / (max_latency - min_latency + 1)) if max_latency > min_latency else 5
+                    # Visual: more filled = better (lower latency)
+                    bar_len = int(10 * (max_latency - avg_us) / (max_latency - min_latency + 1)) if max_latency > min_latency else 5
                     bar = '█' * bar_len + '░' * (10 - bar_len)
                     is_best = (avg_us == min_latency)
                     marker = " ⭐" if is_best else ""
@@ -5802,7 +5804,7 @@ def format_benchmark_html(results):
                     comparison = ""
                     if baseline_read_ns > 0:
                         slowdown = (avg_us * 1000) / baseline_read_ns  # Convert us to ns for comparison
-                        comparison = f" ({slowdown:.0f}×)"
+                        comparison = f" ({slowdown:.0f}× slower)"
                     
                     html += f"  {r['compressor']:6s}+{r['allocator']:8s}({pattern}): {bar} {avg_us:6.1f}µs{comparison}{marker}\n"
             html += "\n"

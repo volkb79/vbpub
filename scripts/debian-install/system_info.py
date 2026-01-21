@@ -92,6 +92,18 @@ class SystemInfo:
     def get_disk_info(self):
         """Get disk information - reports full disk size, not just root partition"""
         info = {}
+
+        # Always collect a human-friendly lsblk output (useful for concise Telegram messages).
+        try:
+            lsblk_pretty = subprocess.run(
+                ['lsblk', '-o', 'NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT'],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            info['lsblk_output'] = lsblk_pretty.stdout.strip()
+        except Exception:
+            pass
         
         # Get lsblk JSON output for comprehensive disk information
         try:
@@ -103,20 +115,8 @@ class SystemInfo:
             )
             info['lsblk'] = json.loads(lsblk_result.stdout)
         except:
-            # Fallback to text output if JSON not available
-            try:
-                lsblk_full = subprocess.run(
-                    ['lsblk', '-o', 'NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE'],
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
-                info['lsblk_output'] = lsblk_full.stdout.strip()
-            except subprocess.CalledProcessError:
-                # lsblk failed, continue without this info
-                pass
-            except Exception:
-                pass
+            # JSON collection failed; lsblk_output may still be present from the pretty collector.
+            pass
         
         try:
             # Get root partition info
@@ -495,6 +495,41 @@ class SystemInfo:
             if 'dns_servers' in self.info['network']:
                 html += f"  DNS: {', '.join(self.info['network']['dns_servers'])}\n"
         
+        return html
+
+    def format_html_before_setup(self):
+        """Compact HTML formatter for the 'BEFORE setup' Telegram message.
+
+        Focus: core identity + lsblk output; avoids verbose disk/swap summaries.
+        """
+
+        html = ""
+        html += f"<b>Hostname:</b> {self.info['hostname']}\n"
+        html += f"<b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+
+        # OS
+        html += f"<b>📀 Operating System</b>\n"
+        if 'distribution' in self.info['os']:
+            html += f"  {self.info['os']['distribution']}\n"
+        html += f"  Kernel: {self.info['os']['release']}\n\n"
+
+        # Hardware
+        html += f"<b>⚙️ Hardware</b>\n"
+        html += f"  CPU: {self.info['hardware'].get('cpu_model', 'Unknown')}\n"
+        html += f"  Cores: {self.info['hardware']['cpu_cores']}\n"
+        html += f"  Architecture: {self.info['hardware']['architecture']}\n\n"
+
+        # Memory
+        if 'memory' in self.info and 'total_gb' in self.info['memory']:
+            html += f"<b>💾 Memory</b>\n"
+            html += f"  Total: {self.info['memory']['total_gb']} GB\n"
+            html += f"  Available: {self.info['memory']['available_gb']} GB\n\n"
+
+        # lsblk
+        lsblk_out = self.info.get('disk', {}).get('lsblk_output')
+        if lsblk_out:
+            html += f"<b>💿 lsblk</b>\n<pre>{lsblk_out}</pre>\n"
+
         return html
     
     def format_text(self):

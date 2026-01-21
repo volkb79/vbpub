@@ -44,6 +44,8 @@ import sys
 import time
 import importlib.util
 import asyncio
+import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
@@ -489,6 +491,40 @@ def _require_mtproto_env(env: Dict[str, str]) -> tuple[int, str, str]:
     return api_id, api_hash, session_path
 
 
+def _isolated_session_path(session_path: str) -> str:
+    """Create a per-process copy of a Telethon SQLite session file.
+
+    Telethon stores sessions in SQLite. If two processes open the same session file
+    concurrently, SQLite may raise 'database is locked'. To make monitoring reliable,
+    we run watch/tail against a copied session DB.
+
+    If the session file doesn't exist yet, we return the original path (first login).
+    """
+
+    src = Path(session_path)
+    if not src.exists():
+        return session_path
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="vbpub-telethon-session-"))
+    dst = tmp_dir / src.name
+
+    try:
+        shutil.copy2(src, dst)
+    except Exception:
+        return session_path
+
+    # Copy common SQLite sidecar files if present.
+    for suffix in ("-journal", "-wal", "-shm"):
+        sidecar = Path(str(src) + suffix)
+        if sidecar.exists():
+            try:
+                shutil.copy2(sidecar, Path(str(dst) + suffix))
+            except Exception:
+                pass
+
+    return str(dst)
+
+
 def mtproto_watch(env_file: Path, *, chat_id: Optional[int], session_file: Optional[str]) -> int:
     if not _has_telethon():
         print(
@@ -520,6 +556,7 @@ def mtproto_watch(env_file: Path, *, chat_id: Optional[int], session_file: Optio
         return 2
 
     session_path = session_file or env_session_path or str(env_file.parent / ".telegram.user.session")
+    session_path = _isolated_session_path(session_path)
 
     async def _run() -> int:
         client = MtTelegramClient(session_path, api_id, api_hash)
@@ -569,6 +606,120 @@ def mtproto_watch(env_file: Path, *, chat_id: Optional[int], session_file: Optio
             maybe_coro = client.run_until_disconnected()
             if asyncio.iscoroutine(maybe_coro):
                 await maybe_coro
+            return 0
+        finally:
+            client.disconnect()
+
+    try:
+        return asyncio.run(_run())
+    except KeyboardInterrupt:
+        return 0
+
+
+def mtproto_tail(
+    env_file: Path,
+    *,
+    chat_id: Optional[int],
+    session_file: Optional[str],
+    limit: int,
+) -> int:
+    """Print the most recent messages from a chat via MTProto (user session).
+
+    This complements --mtproto-watch by letting you review history that was sent
+    before you started watching (useful for install runs).
+    """
+
+    if limit <= 0:
+        print("--mtproto-tail N requires N > 0", file=sys.stderr)
+        return 2
+
+    if not _has_telethon():
+        print(
+            "Missing dependency 'telethon'. Install it with: pip install telethon",
+            file=sys.stderr,
+        )
+        return 2
+
+    from telethon import TelegramClient as MtTelegramClient  # type: ignore
+    from telethon.errors import SessionPasswordNeededError  # type: ignore
+
+    env = _load_env_file(env_file)
+
+    try:
+        api_id, api_hash, env_session_path = _require_mtproto_env(env)
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    phone = env.get("TELEGRAM_PHONE") or os.environ.get("TELEGRAM_PHONE")
+
+    chat_id_val = chat_id
+    if chat_id_val is None:
+        chat_id_val = _parse_int_env(env.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID"))
+
+    if chat_id_val is None:
+        print("Missing TELEGRAM_CHAT_ID (or pass --chat-id)", file=sys.stderr)
+        return 2
+
+    session_path = session_file or env_session_path or str(env_file.parent / ".telegram.user.session")
+    session_path = _isolated_session_path(session_path)
+
+    async def _run() -> int:
+        client = MtTelegramClient(session_path, api_id, api_hash)
+        await client.connect()
+        try:
+            if not await client.is_user_authorized():
+                if not phone:
+                    phone_prompt = _prompt_required("TELEGRAM_PHONE (international format, e.g. +4917...)")
+                else:
+                    phone_prompt = phone
+
+                await client.send_code_request(phone_prompt)
+                code = _prompt_required("Enter the login code you received")
+                try:
+                    await client.sign_in(phone=phone_prompt, code=code)
+                except SessionPasswordNeededError:
+                    pw = _prompt_required("2FA is enabled. Enter your Telegram password")
+                    await client.sign_in(password=pw)
+
+            target = await client.get_entity(chat_id_val)
+            chat_name = getattr(target, "title", None) or getattr(target, "username", None) or str(chat_id_val)
+
+            print("MTProto tail")
+            print(f"- session file: {session_path}")
+            print(f"- chat: {chat_name}")
+            print(f"- chat_id: {chat_id_val}")
+            print(f"- limit: {limit}")
+            print()
+
+            # iter_messages yields newest -> oldest.
+            rows = []
+            async for msg in client.iter_messages(target, limit=limit):
+                try:
+                    sender = await client.get_entity(msg.sender_id) if getattr(msg, "sender_id", None) else None
+                    sender_name = (
+                        getattr(sender, "username", None)
+                        or getattr(sender, "first_name", None)
+                        or getattr(sender, "title", None)
+                        or "(unknown)"
+                    )
+                except Exception:
+                    sender_name = "(unknown)"
+
+                text = (getattr(msg, "message", None) or getattr(msg, "raw_text", None) or "").strip()
+
+                thread_hint = ""
+                reply_to = getattr(msg, "reply_to", None)
+                top_id = getattr(reply_to, "reply_to_top_id", None) if reply_to is not None else None
+                if top_id is not None:
+                    thread_hint = f" thread_top_id={top_id}"
+
+                rows.append(f"[{msg.date}] from={sender_name} msg_id={msg.id}{thread_hint} text={text}")
+
+            # Print oldest -> newest for readability.
+            for line in reversed(rows):
+                print(line)
+
             return 0
         finally:
             client.disconnect()
@@ -1019,6 +1170,12 @@ def main() -> int:
         help="Run a user-session (MTProto) reader that prints new messages from TELEGRAM_CHAT_ID",
     )
     parser.add_argument(
+        "--mtproto-tail",
+        type=int,
+        metavar="N",
+        help="Print the most recent N messages from TELEGRAM_CHAT_ID via MTProto (history review)",
+    )
+    parser.add_argument(
         "--bot-send-test",
         metavar="TEXT",
         help="Send a test message using the bot to TELEGRAM_CHAT_ID",
@@ -1050,6 +1207,14 @@ def main() -> int:
     args = parser.parse_args()
 
     env_file = Path(args.env_file)
+
+    if args.mtproto_tail is not None:
+        return mtproto_tail(
+            env_file,
+            chat_id=args.chat_id,
+            session_file=args.user_session_file,
+            limit=args.mtproto_tail,
+        )
 
     if args.mtproto_watch:
         return mtproto_watch(env_file, chat_id=args.chat_id, session_file=args.user_session_file)

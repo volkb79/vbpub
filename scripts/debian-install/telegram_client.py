@@ -129,6 +129,12 @@ class TelegramClient:
         Returns:
             bool: True if successful, False otherwise
         """
+        thread_id = message_thread_id if message_thread_id is not None else self.thread_id
+        # When posting into a forum topic thread, the topic title already carries identity;
+        # suppress per-message source prefix to keep messages compact.
+        if prefix_source and thread_id not in (None, ""):
+            prefix_source = False
+
         if prefix_source:
             prefixed_text = f"<b>{self.system_id}</b>\n{text}"
         else:
@@ -142,7 +148,6 @@ class TelegramClient:
             'parse_mode': parse_mode
         }
 
-        thread_id = message_thread_id if message_thread_id is not None else self.thread_id
         if thread_id not in (None, ""):
             data['message_thread_id'] = thread_id
         
@@ -193,6 +198,10 @@ class TelegramClient:
             print(f"Error: File not found: {file_path}")
             return False
         
+        thread_id = message_thread_id if message_thread_id is not None else self.thread_id
+        if prefix_source and thread_id not in (None, ""):
+            prefix_source = False
+
         if caption and prefix_source:
             caption = f"{self.system_id}\n{caption}"
         
@@ -205,7 +214,6 @@ class TelegramClient:
                     files = {'document': f}
                     data = {'chat_id': self.chat_id}
 
-                    thread_id = message_thread_id if message_thread_id is not None else self.thread_id
                     if thread_id not in (None, ""):
                         data['message_thread_id'] = thread_id
 
@@ -267,6 +275,10 @@ class TelegramClient:
             missing = set(file_paths) - set(valid_files)
             print(f"Warning: Skipping missing files: {missing}")
         
+        thread_id = message_thread_id if message_thread_id is not None else self.thread_id
+        if prefix_source and thread_id not in (None, ""):
+            prefix_source = False
+
         if caption and prefix_source:
             caption = f"{self.system_id}\n{caption}"
         

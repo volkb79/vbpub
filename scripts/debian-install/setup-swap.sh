@@ -83,6 +83,7 @@ ZFS_POOL="${ZFS_POOL:-tank}"  # ZFS pool name for zvol-based swap
 # Telegram
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+TELEGRAM_THREAD_ID="${TELEGRAM_THREAD_ID:-}"
 
 # Directories
 SWAP_DIR="/var/swap"
@@ -122,14 +123,29 @@ telegram_send() {
     [ -z "$TELEGRAM_BOT_TOKEN" ] && return 0
     [ -z "$TELEGRAM_CHAT_ID" ] && return 0
     local msg="$1"
-    local system_id=$(get_system_id)
-    # Use actual newline in string, not \n escape
-    local prefixed_msg="<b>${system_id}</b>
+
+    local prefixed_msg
+    if [ -n "${TELEGRAM_THREAD_ID:-}" ]; then
+        # When posting into a forum topic thread, the topic title already carries identity.
+        prefixed_msg="${msg}"
+    else
+        local system_id
+        system_id=$(get_system_id)
+        # Use actual newline in string, not \n escape
+        prefixed_msg="<b>${system_id}</b>
 ${msg}"
-    curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-        -d "chat_id=${TELEGRAM_CHAT_ID}" \
-        -d "text=${prefixed_msg}" \
-        -d "parse_mode=HTML" >/dev/null 2>&1 || true
+    fi
+
+    local curl_args=(
+        -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+        -d "chat_id=${TELEGRAM_CHAT_ID}"
+        -d "text=${prefixed_msg}"
+        -d "parse_mode=HTML"
+    )
+    if [ -n "${TELEGRAM_THREAD_ID:-}" ]; then
+        curl_args+=( -d "message_thread_id=${TELEGRAM_THREAD_ID}" )
+    fi
+    curl "${curl_args[@]}" >/dev/null 2>&1 || true
 }
 
 # Check if running as root
