@@ -1,3 +1,33 @@
+
+### Quick Start Examples
+
+```bash
+# GitHub App repository sync
+github/app-sync --app-id 2030793 --verbose
+
+# List GitHub App installations
+github/list-installations --app-id 2030793 --format table --show-repos
+
+# Decode JWT token
+echo "JWT_TOKEN" | utils/jwt-decode --validate --verbose
+
+# Checkout repository subtree
+utils/subtree-checkout volkb79/DST-DNS projects/controller
+
+# Initialize Docker Compose
+ciu --directory /path/to/project --verbose
+```
+
+### Configuration Validation
+
+```bash
+# Validate GitHub App configuration
+github/app-sync --validate --app-id 2030793 --verbose
+
+# Test JWT generation
+github/list-installations --validate --app-id 2030793
+
+
 # GitHub Authentication Scripts
 
 This directory contains scripts for managing Git authentication with GitHub Apps and SSH keys.

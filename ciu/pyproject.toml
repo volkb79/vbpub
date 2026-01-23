@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ciu"
+version = "0.1.0"
+description = "CIU deployment CLI"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "DST-DNS Team"}]
+
+[project.scripts]
+ciu = "ciu.cli:main"
