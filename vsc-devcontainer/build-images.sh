@@ -2,6 +2,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${PROJECT_ROOT}/.." && pwd)"
 
 LOG_DIR="${PROJECT_ROOT}/logs"
 mkdir -p "${LOG_DIR}"
@@ -10,10 +11,13 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 
 echo "[INFO] Logging to ${LOG_FILE}"
 
-ENV_FILE="${PROJECT_ROOT}/.env"
+ENV_FILE="${VBPUB_ENV_FILE:-${REPO_ROOT}/.env}"
 if [[ -f "${ENV_FILE}" ]]; then
 	# shellcheck source=/dev/null
 	source "${ENV_FILE}"
+elif [[ -f "${PROJECT_ROOT}/.env" ]]; then
+	# shellcheck source=/dev/null
+	source "${PROJECT_ROOT}/.env"
 fi
 
 BUILD_DATE="${BUILD_DATE:-$(date -u +%Y%m%d)}"
@@ -32,6 +36,13 @@ maybe_export() {
 maybe_export REGISTRY
 maybe_export NAMESPACE
 maybe_export IMAGE_NAME
+
+if [[ -z "${CIU_WHEEL_URL:-}" ]]; then
+	if [[ -n "${CIU_RELEASE_REPO:-}" && -n "${CIU_RELEASE_TAG:-}" && -n "${CIU_WHEEL_FILENAME:-}" ]]; then
+		CIU_WHEEL_URL="https://github.com/${CIU_RELEASE_REPO}/releases/download/${CIU_RELEASE_TAG}/${CIU_WHEEL_FILENAME}"
+		export CIU_WHEEL_URL
+	fi
+fi
 
 cd "${PROJECT_ROOT}"
 
@@ -59,6 +70,8 @@ maybe_set_arg RGA_VERSION
 maybe_set_arg SHELLCHECK_VERSION
 maybe_set_arg VAULT_VERSION
 maybe_set_arg YQ_VERSION
+maybe_set_arg CIU_WHEEL_URL
+maybe_set_arg CIU_WHEEL_SHA256
 maybe_set_arg OCI_TITLE
 maybe_set_arg OCI_DESCRIPTION
 maybe_set_arg OCI_SOURCE

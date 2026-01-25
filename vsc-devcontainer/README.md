@@ -39,9 +39,16 @@ The image sets:
 - `VIRTUAL_ENV=/home/vscode/.venv`
 - `PATH=/home/vscode/.venv/bin:$PATH`
 
+If CIU wheel inputs are provided at build time, the CIU wheel is downloaded and installed into the same virtualenv (optional SHA256 verification via `CIU_WHEEL_SHA256`).
+
 ## Version overrides
 
 Defaults are `latest`. Any variable defined in docker-bake.hcl can be overridden via environment variables when invoking the build.
+
+Additional optional build args:
+- `CIU_RELEASE_REPO`, `CIU_RELEASE_TAG`, `CIU_WHEEL_FILENAME`: derive the canonical GitHub Releases URL
+- `CIU_WHEEL_URL`: optional explicit override of the derived URL
+- `CIU_WHEEL_SHA256`: SHA256 checksum for the wheel (optional)
 
 Example:
 
@@ -79,6 +86,14 @@ This project uses Buildx Bake. The build date is included in tags via `BUILD_DAT
 
 - `docker-bake.hcl` defines 4 targets and an `all` group.
 - `./build-images.sh` sets `BUILD_DATE` and builds all variants.
+
+### Shared credentials
+
+`build-images.sh` and `push-images.sh` will load a shared repo-root env file if present:
+- vbpub/.env (preferred)
+- vsc-devcontainer/.env (fallback)
+
+This lets you store GitHub credentials once for multiple vbpub projects.
 
 ## Push to GitHub Artifact Registry
 

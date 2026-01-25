@@ -13,3 +13,4 @@ authors = [{name = "DST-DNS Team"}]
 
 [project.scripts]
 ciu = "ciu.cli:main"
+ciu-deploy = "ciu.deploy:main"

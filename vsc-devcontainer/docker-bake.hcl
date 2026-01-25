@@ -123,6 +123,14 @@ variable "YQ_VERSION" {
   default = "latest"
 }
 
+variable "CIU_WHEEL_URL" {
+  default = ""
+}
+
+variable "CIU_WHEEL_SHA256" {
+  default = ""
+}
+
 function "tag" {
   params = [debian, python]
   result = "${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:${debian}-py${python}-${BUILD_DATE}"
@@ -163,6 +171,8 @@ target "base" {
     SHELLCHECK_VERSION = "${SHELLCHECK_VERSION}"
     VAULT_VERSION = "${VAULT_VERSION}"
     YQ_VERSION = "${YQ_VERSION}"
+    CIU_WHEEL_URL = "${CIU_WHEEL_URL}"
+    CIU_WHEEL_SHA256 = "${CIU_WHEEL_SHA256}"
   }
 }
 

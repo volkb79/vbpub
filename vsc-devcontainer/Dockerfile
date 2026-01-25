@@ -32,6 +32,8 @@ ARG RGA_VERSION
 ARG SHELLCHECK_VERSION
 ARG VAULT_VERSION
 ARG YQ_VERSION
+ARG CIU_WHEEL_URL
+ARG CIU_WHEEL_SHA256
 FROM ${BASE_IMAGE}
 
 SHELL ["/bin/bash", "-c"]
@@ -64,6 +66,8 @@ ARG RGA_VERSION
 ARG SHELLCHECK_VERSION
 ARG VAULT_VERSION
 ARG YQ_VERSION
+ARG CIU_WHEEL_URL
+ARG CIU_WHEEL_SHA256
 
 # OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
 LABEL org.opencontainers.image.title="${OCI_TITLE}" \
@@ -99,6 +103,9 @@ RUN set -euo pipefail; \
         NETCAT_PKG="netcat-openbsd"; \
     else \
         NETCAT_PKG="netcat-traditional"; \
+    fi; \
+    if [ -f /etc/apt/sources.list.d/yarn.list ]; then \
+        rm -f /etc/apt/sources.list.d/yarn.list; \
     fi; \
     BACKPORTS_SUITE="${DEBIAN_VERSION}-backports"; \
     sed -e "s|@URI@|${BACKPORTS_URI}|g" -e "s|@SUITE@|${BACKPORTS_SUITE}|g" /tmp/backports.sources.in > "/etc/apt/sources.list.d/${BACKPORTS_SUITE}.sources"; \
@@ -395,6 +402,27 @@ RUN set -euo pipefail; \
         rich \
         structlog \
         tomli_w
+RUN set -euo pipefail; \
+    if [ -n "${CIU_WHEEL_URL}" ]; then \
+        wheel_dir="/tmp/ciu-wheel"; \
+        install -d -m 0755 "${wheel_dir}"; \
+        wheel_path="${wheel_dir}/ciu.whl"; \
+        curl -fsSL "${CIU_WHEEL_URL}" -o "${wheel_path}"; \
+        if [ -n "${CIU_WHEEL_SHA256}" ]; then \
+            echo "${CIU_WHEEL_SHA256}  ${wheel_path}" | sha256sum -c -; \
+        fi; \
+        wheel_name="$(/home/vscode/.venv/bin/python -c 'import sys, zipfile; from pathlib import Path; wheel_path=Path(sys.argv[1]); zf=zipfile.ZipFile(wheel_path); metadata_files=[name for name in zf.namelist() if name.endswith(".dist-info/METADATA")]; wheel_files=[name for name in zf.namelist() if name.endswith(".dist-info/WHEEL")]; assert metadata_files, "[ERROR] Missing METADATA in CIU wheel"; assert wheel_files, "[ERROR] Missing WHEEL metadata in CIU wheel"; metadata=zf.read(metadata_files[0]).decode("utf-8", "replace"); name=next((line.split(":", 1)[1].strip() for line in metadata.splitlines() if line.startswith("Name:")), None); version=next((line.split(":", 1)[1].strip() for line in metadata.splitlines() if line.startswith("Version:")), None); wheel_meta=zf.read(wheel_files[0]).decode("utf-8", "replace"); tag=next((line.split(":", 1)[1].strip() for line in wheel_meta.splitlines() if line.startswith("Tag:")), None); assert name and version and tag, "[ERROR] Missing Name/Version/Tag in CIU wheel metadata"; dist=name.replace("-", "_"); print(f"{dist}-{version}-{tag}.whl"); zf.close()' "${wheel_path}")"; \
+        if [ -z "${wheel_name}" ]; then \
+            echo "[ERROR] Failed to derive CIU wheel filename from metadata" >&2; \
+            exit 1; \
+        fi; \
+        wheel_dest="${wheel_dir}/${wheel_name}"; \
+        mv "${wheel_path}" "${wheel_dest}"; \
+        /home/vscode/.venv/bin/python -m pip install --disable-pip-version-check "${wheel_dest}"; \
+        rm -rf "${wheel_dir}"; \
+    else \
+        echo "CIU_WHEEL_URL not set; skipping CIU install"; \
+    fi
 
 ENV VIRTUAL_ENV="/home/vscode/.venv"
 ENV PATH="/home/vscode/.venv/bin:${PATH}"
