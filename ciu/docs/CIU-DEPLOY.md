@@ -16,6 +16,16 @@ This document matches the current implementation and provides a clean-room reimp
   - ciu-deploy --list-groups
 - Deploy specific groups:
   - ciu-deploy --groups infra,apps --deploy
+- Full external validation flow:
+  - ciu-deploy --update-cert-permission --generate-env --stop --build --deploy --healthcheck external --selftest external
+
+Why this order:
+- `--update-cert-permission` ensures TLS certs are readable before compose.
+- `--generate-env` ensures `.env.ciu` exists and is current.
+- `--stop` + `--build` ensures fresh images and a clean start.
+- `--deploy` starts the stack.
+- `--healthcheck external` validates reverse‑proxy routes.
+- `--selftest external` validates external connectivity.
 
 ## Actions (Ordered Execution)
 
@@ -31,6 +41,18 @@ Actions execute in the order specified on the CLI. If no actions are specified, 
 - --selftest [internal|external|both]
 - --print-config-context
 - --list-groups
+
+## Workspace Env Options
+
+- --generate-env
+  - Generate .env.ciu with autodetected values before loading env
+- --update-cert-permission
+  - Update Let’s Encrypt cert permissions (requires root)
+
+## CIU Global Options
+
+- `ciu.require_certs` (default: false) enforces TLS cert readability for `DOCKER_GID`.
+- `ciu.require_fqdn` (default: false) controls whether `PUBLIC_FQDN` must resolve during `.env.ciu` generation.
 
 ## Options (Modifiers)
 
@@ -62,7 +84,7 @@ apps = ["phase_4"]
 
 ```mermaid
 flowchart TD
-    A["Start CIU Deploy"] --> B["Load .env.workspace + validate" ]
+    A["Start CIU Deploy"] --> B["Load .env.ciu + validate" ]
     B --> C["Ensure ciu-global.toml exists" ]
     C --> D["Resolve phases/groups" ]
     D --> E["Execute actions in CLI order" ]
@@ -74,7 +96,7 @@ flowchart TD
 ### Key Steps
 
 1. **Load workspace env**
-   - Validates .env.workspace keys (REPO_ROOT, PHYSICAL_REPO_ROOT, DOCKER_NETWORK_INTERNAL, PUBLIC_FQDN, TLS paths, etc.).
+  - Validates .env.ciu keys (REPO_ROOT, PHYSICAL_REPO_ROOT, DOCKER_NETWORK_INTERNAL, PUBLIC_FQDN, TLS paths, etc.).
 
 2. **Ensure global config**
    - If ciu-global.toml is missing, CIU Deploy renders it by invoking CIU with --render-toml on a stack anchor.

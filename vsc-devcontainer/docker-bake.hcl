@@ -4,14 +4,13 @@ variable "REGISTRY" {
   default = "ghcr.io"
 }
 
-// Set NAMESPACE to your GHCR org/user (e.g., volkb79-2) so pushes land at ghcr.io/<namespace>/vsc-devcontainer:<variant>. 
-variable "NAMESPACE" {
+// Set GITHUB_USERNAME to your GHCR org/user (e.g., volkb79-2) so pushes land at ghcr.io/<username>/vsc-devcontainer:<variant>. 
+variable "GITHUB_USERNAME" {
   default = "volkb79-2"
 }
 
-// Override with IMAGE_NAME in your environment (.env or shell).
-variable "IMAGE_NAME" {
-  default = "vsc-devcontainer"
+variable "GITHUB_REPO" {
+  default = "vbpub"
 }
 
 // Used in tags; build script sets BUILD_DATE if not provided.
@@ -32,15 +31,15 @@ variable "OCI_DESCRIPTION" {
 }
 
 variable "OCI_SOURCE" {
-  default = "https://github.com/volkb79-2/vbpub"
+  default = "https://github.com/${GITHUB_USERNAME}/${GITHUB_REPO}"
 }
 
 variable "OCI_DOCUMENTATION" {
-  default = "https://github.com/volkb79-2/vbpub/tree/main/vsc-devcontainer"
+  default = "https://github.com/${GITHUB_USERNAME}/${GITHUB_REPO}/tree/main/vsc-devcontainer"
 }
 
 variable "OCI_URL" {
-  default = "https://github.com/volkb79-2/vbpub/tree/main/vsc-devcontainer"
+  default = "https://github.com/${GITHUB_USERNAME}/${GITHUB_REPO}/tree/main/vsc-devcontainer"
 }
 
 variable "OCI_LICENSES" {
@@ -123,22 +122,22 @@ variable "YQ_VERSION" {
   default = "latest"
 }
 
-variable "CIU_WHEEL_URL" {
-  default = ""
+variable "CIU_LATEST_TAG" {
+  default = "ciu-wheel-latest"
 }
 
-variable "CIU_WHEEL_SHA256" {
+variable "CIU_LATEST_ASSET_NAME" {
   default = ""
 }
 
 function "tag" {
   params = [debian, python]
-  result = "${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:${debian}-py${python}-${BUILD_DATE}"
+  result = "${REGISTRY}/${GITHUB_USERNAME}/vsc-devcontainer:${debian}-py${python}-${BUILD_DATE}"
 }
 
 function "latest_tag" {
   params = [debian, python]
-  result = "${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:${debian}-py${python}-latest"
+  result = "${REGISTRY}/${GITHUB_USERNAME}/vsc-devcontainer:${debian}-py${python}-latest"
 }
 
 target "base" {
@@ -171,8 +170,10 @@ target "base" {
     SHELLCHECK_VERSION = "${SHELLCHECK_VERSION}"
     VAULT_VERSION = "${VAULT_VERSION}"
     YQ_VERSION = "${YQ_VERSION}"
-    CIU_WHEEL_URL = "${CIU_WHEEL_URL}"
-    CIU_WHEEL_SHA256 = "${CIU_WHEEL_SHA256}"
+    GITHUB_USERNAME = "${GITHUB_USERNAME}"
+    GITHUB_REPO = "${GITHUB_REPO}"
+    CIU_LATEST_TAG = "${CIU_LATEST_TAG}"
+    CIU_LATEST_ASSET_NAME = "${CIU_LATEST_ASSET_NAME}"
   }
 }
 
@@ -213,7 +214,7 @@ target "trixie-py313" {
     PYTHON_VERSION = "3.13"
     DEBIAN_VERSION = "trixie"
   }
-  tags = [tag("trixie", "3.13"), latest_tag("trixie", "3.13"), "${REGISTRY}/${NAMESPACE}/${IMAGE_NAME}:latest"]
+  tags = [tag("trixie", "3.13"), latest_tag("trixie", "3.13"), "${REGISTRY}/${GITHUB_USERNAME}/vsc-devcontainer:latest"]
 }
 
 group "all" {

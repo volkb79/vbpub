@@ -17,7 +17,7 @@ Base images:
 Each image tag includes Debian version, Python version, and build date:
 
 ```
-<registry>/<namespace>/vsc-devcontainer:<debian>-py<python>-<YYYYMMDD>
+<registry>/<github_username>/vsc-devcontainer:<debian>-py<python>-<YYYYMMDD>
 ```
 
 Example:
@@ -46,9 +46,8 @@ If CIU wheel inputs are provided at build time, the CIU wheel is downloaded and 
 Defaults are `latest`. Any variable defined in docker-bake.hcl can be overridden via environment variables when invoking the build.
 
 Additional optional build args:
-- `CIU_RELEASE_REPO`, `CIU_RELEASE_TAG`, `CIU_WHEEL_FILENAME`: derive the canonical GitHub Releases URL
-- `CIU_WHEEL_URL`: optional explicit override of the derived URL
-- `CIU_WHEEL_SHA256`: SHA256 checksum for the wheel (optional)
+- `CIU_LATEST_TAG`, `CIU_LATEST_ASSET_NAME`: derive the canonical GitHub Releases URL
+	- Latest URL scheme: https://github.com/volkb79-2/vbpub/releases/download/ciu-wheel-latest/ciu-<version>-py3-none-any.whl
 
 Example:
 
@@ -97,7 +96,7 @@ This lets you store GitHub credentials once for multiple vbpub projects.
 
 ## Push to GitHub Artifact Registry
 
-Use `./push-images.sh` (or run Bake with `--push`) after validation. Configure registry namespace via environment variables in the script or your shell.
+Use `./push-images.sh` (or run Bake with `--push`) after validation. Configure registry owner via environment variables in the script or your shell.
 
 `push-images.sh` also updates the `latest` tag (and per-variant `*-latest` tags) to point at the most recently pushed images.
 
@@ -108,13 +107,13 @@ https://docs.github.com/en/packages/working-with-a-github-packages-registry/work
 
 
 1. Copy `.env.sample` to `.env` and fill in:
-	- `GITHUB_GHCR_IO_USERNAME`
-	- `GITHUB_GHCR_IO_PAT`
-	- `NAMESPACE`
+	- `GITHUB_USERNAME`
+	- `GITHUB_REPO`
+	- `GITHUB_PUSH_PAT`
 2. Create a GitHub Personal Access Token with:
 	- `write:packages` (required for push)
 	- `read:packages` (required for pull)
-3. Run `./push-images.sh` (the script will login if `GITHUB_GHCR_IO_PAT` is set).
+3. Run `./push-images.sh` (the script will login if `GITHUB_PUSH_PAT` is set).
 
 ## Usage in other repositories
 

@@ -30,24 +30,19 @@ maybe_export() {
 	fi
 }
 
-if [[ -n "${GITHUB_GHCR_IO_PAT:-}" ]]; then
-	if [[ -z "${GITHUB_GHCR_IO_USERNAME:-}" ]]; then
-		echo "[ERROR] GITHUB_GHCR_IO_USERNAME is required when GITHUB_GHCR_IO_PAT is set" >&2
+if [[ -n "${GITHUB_PUSH_PAT:-}" ]]; then
+	if [[ -z "${GITHUB_USERNAME:-}" ]]; then
+		echo "[ERROR] GITHUB_USERNAME is required when GITHUB_PUSH_PAT is set" >&2
 		exit 1
 	fi
-	echo "${GITHUB_GHCR_IO_PAT}" | docker login ghcr.io -u "${GITHUB_GHCR_IO_USERNAME}" --password-stdin
+	echo "${GITHUB_PUSH_PAT}" | docker login ghcr.io -u "${GITHUB_USERNAME}" --password-stdin
 fi
 
 maybe_export REGISTRY
-maybe_export NAMESPACE
-maybe_export IMAGE_NAME
-
-if [[ -z "${CIU_WHEEL_URL:-}" ]]; then
-	if [[ -n "${CIU_RELEASE_REPO:-}" && -n "${CIU_RELEASE_TAG:-}" && -n "${CIU_WHEEL_FILENAME:-}" ]]; then
-		CIU_WHEEL_URL="https://github.com/${CIU_RELEASE_REPO}/releases/download/${CIU_RELEASE_TAG}/${CIU_WHEEL_FILENAME}"
-		export CIU_WHEEL_URL
-	fi
-fi
+maybe_export GITHUB_USERNAME
+maybe_export GITHUB_REPO
+maybe_export CIU_LATEST_TAG
+maybe_export CIU_LATEST_ASSET_NAME
 
 cd "${PROJECT_ROOT}"
 
@@ -75,8 +70,10 @@ maybe_set_arg RGA_VERSION
 maybe_set_arg SHELLCHECK_VERSION
 maybe_set_arg VAULT_VERSION
 maybe_set_arg YQ_VERSION
-maybe_set_arg CIU_WHEEL_URL
-maybe_set_arg CIU_WHEEL_SHA256
+maybe_set_arg GITHUB_USERNAME
+maybe_set_arg GITHUB_REPO
+maybe_set_arg CIU_LATEST_TAG
+maybe_set_arg CIU_LATEST_ASSET_NAME
 maybe_set_arg OCI_TITLE
 maybe_set_arg OCI_DESCRIPTION
 maybe_set_arg OCI_SOURCE

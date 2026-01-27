@@ -80,8 +80,9 @@ Multi-stack orchestrator. CIU Deploy sequences multiple stacks using deployment 
 **Publish a wheel (GitHub Releases)**:
 - From the CIU repo root:
   - tools/publish-wheel-release.py
-- Requires `CIU_RELEASE_TOKEN` (or `GITHUB_TOKEN`) and `GITHUB_REPOSITORY` (or `CIU_RELEASE_REPO`).
-- Publishes a versioned release and a stable `ciu-latest` release asset.
+- Requires `GITHUB_PUSH_PAT`, `GITHUB_USERNAME`, and `GITHUB_REPO`.
+- Publishes a versioned release and uploads the versioned wheel asset to the
+  `ciu-wheel-latest` tag as an alias.
 
 ## Running tests
 
@@ -103,9 +104,17 @@ Required environment variables:
 Optional environment variables:
 - `CIU_PKG_SHA256` and `CIU_WHEEL_SHA256` for integrity verification
 - `CIU_PKG_CACHE_DIR` to control local caching (defaults to `.ci/ciu-dist` and is gitignored)
+- `CIU_PROJECT_ROOT` to publish from a non-default package root
+- `CIU_PACKAGE_NAME` to override the project name used for tags
+- `CIU_WHEEL_GLOB` to override the wheel filename glob
+- `CIU_RELEASE_TAG`, `CIU_LATEST_TAG`, `CIU_LATEST_ASSET_NAME` for custom tag/asset naming
 
 Recommended distribution:
 - Publish the CIU wheel to GitHub Releases and set `CIU_PKG_URL` / `CIU_WHEEL_URL` to the release asset URL.
+- Latest URL scheme:
+  - https://github.com/volkb79-2/vbpub/releases/download/ciu-wheel-latest/ciu-<version>-py3-none-any.whl
+- Versioned URL scheme:
+  - https://github.com/volkb79-2/vbpub/releases/download/ciu-wheel-<version>/ciu-<version>-py3-none-any.whl
 
 All dstdns scripts and docs should invoke `ciu` and `ciu-deploy` from the installed package.
 

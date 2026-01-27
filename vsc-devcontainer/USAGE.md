@@ -10,7 +10,10 @@ Environment configuration:
 - Copy `.env.sample` to `.env` and adjust values as needed.
 
 Optional overrides (environment variables):
-- `REGISTRY`, `NAMESPACE`, `IMAGE_NAME`, `BUILD_DATE`, `BACKPORTS_URI`
+- `REGISTRY`, `GITHUB_USERNAME`, `BUILD_DATE`, `BACKPORTS_URI`, `CIU_LATEST_TAG`, `CIU_LATEST_ASSET_NAME`
+
+Latest CIU wheel asset scheme:
+- https://github.com/volkb79-2/vbpub/releases/download/ciu-wheel-latest/ciu-<version>-py3-none-any.whl
 
 Any variable in docker-bake.hcl can be overridden for a build.
 
@@ -26,8 +29,8 @@ After validation, push all variants:
 
 - `./push-images.sh`
 
-Ensure you are logged in to the registry (e.g., `docker login ghcr.io`) and that `NAMESPACE` matches your org/user.
-If `GITHUB_GHCR_IO_PAT` and `GITHUB_GHCR_IO_USERNAME` are set in `.env`, the push script will log in automatically.
+Ensure you are logged in to the registry (e.g., `docker login ghcr.io`) and that `GITHUB_USERNAME` matches your org/user.
+If `GITHUB_PUSH_PAT` and `GITHUB_USERNAME` are set in `.env`, the push script will log in automatically.
 
 ## Use in devcontainer.json
 

@@ -54,6 +54,10 @@ from .workspace_env import (
     ensure_workspace_env,
     WorkspaceEnvError,
     parse_workspace_env,
+    generate_ciu_env,
+    update_cert_permissions,
+    detect_standalone_root,
+    ENV_FILE_NAME,
 )
 
 
@@ -288,6 +292,18 @@ Examples:
     )
 
     parser.add_argument(
+        '--generate-env',
+        action='store_true',
+        help='Generate .env.ciu with autodetected values'
+    )
+
+    parser.add_argument(
+        '--update-cert-permission',
+        action='store_true',
+        help='Update Let\'s Encrypt cert permissions (requires root)'
+    )
+
+    parser.add_argument(
         '-y', '--yes',
         action='store_true',
         help='Non-interactive mode (auto-confirm all prompts)'
@@ -350,15 +366,15 @@ def expand_env_vars_or_fail(raw_text: str, source: str) -> str:
         missing_list = ", ".join(sorted(missing))
         raise ValueError(
             f"[ERROR] Missing required environment values in {source}: {missing_list}.\n"
-            "[ERROR] .env.workspace is authoritative. Run env-workspace-setup-generate.sh "
-            "and source .env.workspace before running CIU."
+            "[ERROR] .env.ciu is authoritative. Run ciu --generate-env "
+            "and source .env.ciu before running CIU."
         )
 
     leftover = ENV_VAR_PATTERN.search(expanded)
     if leftover:
         raise ValueError(
             f"[ERROR] Unresolved environment placeholders remain in {source}: {leftover.group(0)}\n"
-            "[ERROR] Ensure all required values are set in .env.workspace."
+            "[ERROR] Ensure all required values are set in .env.ciu."
         )
 
     return expanded
@@ -396,6 +412,67 @@ def _stringify_env_value(value: Any) -> str:
     if value is None:
         return ""
     return str(value)
+
+
+def _validate_required_certs(config: dict) -> None:
+    ciu_config = config.get("ciu", {})
+    if not ciu_config.get("require_certs", False):
+        return
+
+    fqdn = os.environ.get("PUBLIC_FQDN") or ciu_config.get("public_fqdn")
+    letsencrypt_dir = os.environ.get("PUBLIC_TLS_CRT_PEM")
+    letsencrypt_dir = Path(letsencrypt_dir).parent.parent if letsencrypt_dir else None
+    if not fqdn or not letsencrypt_dir:
+        raise ValueError(
+            "[ERROR] ciu.require_certs is true but PUBLIC_FQDN or PUBLIC_TLS_CRT_PEM is missing."
+        )
+
+    docker_gid_value = os.environ.get("DOCKER_GID")
+    if not docker_gid_value:
+        raise ValueError("[ERROR] DOCKER_GID is required to validate cert permissions.")
+
+    try:
+        docker_gid = int(docker_gid_value)
+    except ValueError as exc:
+        raise ValueError(f"[ERROR] DOCKER_GID is not an integer: {docker_gid_value}") from exc
+
+    cert_path = Path(letsencrypt_dir) / "live" / fqdn / "fullchain.pem"
+    key_path = Path(letsencrypt_dir) / "live" / fqdn / "privkey.pem"
+
+    missing = [path for path in (cert_path, key_path) if not path.exists()]
+    if missing:
+        missing_list = ", ".join(str(path) for path in missing)
+        raise ValueError(
+            "[ERROR] Required TLS certificates are missing: "
+            f"{missing_list}.\n"
+            "[ERROR] Provision certificates or set reverse_proxy.require_certs = false."
+        )
+
+    def _is_readable_for_gid(path: Path) -> bool:
+        mode = path.stat().st_mode
+        if mode & stat.S_IROTH:
+            return True
+        if path.stat().st_gid == docker_gid and (mode & stat.S_IRGRP):
+            return True
+        return False
+
+    for path in (cert_path, key_path):
+        if not _is_readable_for_gid(path):
+            raise ValueError(
+                "[ERROR] TLS certificate not readable for DOCKER_GID. "
+                f"Path: {path}.\n"
+                "[ERROR] Run ciu-deploy --update-cert-permission or adjust host permissions."
+            )
+
+
+def _validate_required_fqdn(config: dict) -> None:
+    ciu_config = config.get("ciu", {})
+    if not ciu_config.get("require_fqdn", True):
+        return
+    if not os.environ.get("PUBLIC_FQDN"):
+        raise ValueError(
+            "[ERROR] ciu.require_fqdn is true but PUBLIC_FQDN is empty."
+        )
 
 
 def flatten_dict(data: dict, parent_key: str = "", sep: str = "_", prefix: str | None = None) -> dict:
@@ -1637,7 +1714,9 @@ def main_execution(
     define_root: Optional[Path] = None,
     skip_hostdir_check: bool = False,
     skip_hooks: bool = False,
-    skip_secrets: bool = False
+    skip_secrets: bool = False,
+    generate_env: bool = False,
+    update_cert_permission: bool = False
 ) -> dict:
     """
     Main execution pipeline for CIU.
@@ -1657,16 +1736,21 @@ def main_execution(
         print("[INFO] Loading workspace environment...", flush=True)
         try:
             if define_root:
-                root_env_file = define_root.resolve() / ".env.workspace"
+                root_env_file = define_root.resolve() / ENV_FILE_NAME
                 if not root_env_file.exists():
                     raise WorkspaceEnvError(
                         f"Workspace environment file not found at {root_env_file}. "
-                        "Define a valid root or generate .env.workspace first."
+                        "Define a valid root or generate .env.ciu first."
                     )
                 values = parse_workspace_env(root_env_file)
                 for key, value in values.items():
                     os.environ[key] = value
             else:
+                if generate_env:
+                    generate_ciu_env(working_dir)
+                if update_cert_permission:
+                    public_fqdn = os.environ.get("PUBLIC_FQDN")
+                    update_cert_permissions(working_dir, public_fqdn)
                 load_workspace_env(working_dir)
             ensure_workspace_env([
                 "REPO_ROOT",
@@ -1680,6 +1764,16 @@ def main_execution(
             ])
         except WorkspaceEnvError as e:
             raise ValueError(str(e)) from e
+
+        standalone_root = detect_standalone_root(working_dir)
+        if standalone_root:
+            env_repo_root = Path(os.environ.get("REPO_ROOT", "")).resolve()
+            if env_repo_root and env_repo_root != standalone_root:
+                raise ValueError(
+                    "[ERROR] standalone_root is true but REPO_ROOT does not match. "
+                    f"Expected: {standalone_root}, got: {env_repo_root}. "
+                    "Regenerate .env.ciu from the standalone root."
+                )
 
         print("[INFO] Rendering global configuration...", flush=True)
         global_config = render_global_config_chain(working_dir, repo_root_override=define_root)
@@ -1709,6 +1803,9 @@ def main_execution(
 
         print("[INFO] Auto-generating values (UID, GID, BUILD_VERSION)...")
         merged = auto_generate_values(merged)
+
+        _validate_required_fqdn(merged)
+        _validate_required_certs(merged)
 
         if skip_hostdir_check:
             print("[INFO] --skip-hostdir-check: Skipping hostdir creation/validation", flush=True)
@@ -1889,7 +1986,9 @@ def main(argv: Optional[list] = None) -> int:
         define_root=args.define_root,
         skip_hostdir_check=args.skip_hostdir_check,
         skip_hooks=args.skip_hooks,
-        skip_secrets=args.skip_secrets
+        skip_secrets=args.skip_secrets,
+        generate_env=args.generate_env,
+        update_cert_permission=args.update_cert_permission
     )
 
     if result.get('status') == 'success':

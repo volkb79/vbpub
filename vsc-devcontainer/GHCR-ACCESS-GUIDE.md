@@ -59,14 +59,14 @@ ghcr.io/volkb79-2/vsc-devcontainer:trixie-py3.13-20260118
 # Create PAT at: https://github.com/settings/tokens
 # Required scope: write:packages, read:packages
 
-echo $GITHUB_TOKEN | docker login ghcr.io -u volkb79-2 --password-stdin
+echo $GITHUB_PUSH_PAT | docker login ghcr.io -u $GITHUB_USERNAME --password-stdin
 ```
 
 **Option 2: Using password from .env**
 ```bash
 # From vsc-devcontainer directory:
 source .env
-echo $GITHUB_GHCR_IO_PAT | docker login ghcr.io -u $GITHUB_GHCR_IO_USERNAME --password-stdin
+echo $GITHUB_PUSH_PAT | docker login ghcr.io -u $GITHUB_USERNAME --password-stdin
 ```
 
 **Verify authentication:**

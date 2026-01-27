@@ -15,6 +15,68 @@ This document is aligned to the current implementation and is sufficient for a c
 - Print merged config:
    - ciu -d infra/db-core --print-context
 
+## Command-Line Arguments (Authoritative)
+
+### Core options
+
+- -d, --dir PATH
+   - Working directory containing service files (default: current directory)
+- -f, --file NAME
+   - Compose template name (default: docker-compose.yml.j2)
+- -y, --yes
+   - Non-interactive mode (auto-confirm prompts)
+
+### Render/diagnostics
+
+- --dry-run
+   - Skip docker compose execution
+- --print-context
+   - Print merged configuration as JSON
+- --render-toml
+   - Render ciu.toml from templates (resets state)
+
+### Workspace env
+
+- --generate-env
+   - Generate .env.ciu with autodetected values
+- --update-cert-permission
+   - Update Let’s Encrypt cert permissions (requires root)
+
+## CIU Global Options
+
+The following options live under `[ciu]` in `ciu-global.defaults.toml.j2`:
+
+- `require_certs` (default: false)
+   - When true, CIU validates that the Let’s Encrypt cert/key files from `.env.ciu`
+      exist and are readable by `DOCKER_GID` before compose starts.
+- `require_fqdn` (default: false)
+   - When true, CIU requires `PUBLIC_FQDN` to be present. When false, CIU allows
+      `PUBLIC_FQDN` to fall back to the public IP or `localhost` during `.env.ciu` generation.
+
+Optional metadata:
+- `standalone_root`
+   - Set to true to mark a repository as a standalone CIU project. CIU enforces
+      that `REPO_ROOT` matches the directory containing the flag and will fail
+      if CIU is executed from a nested path with a mismatched `.env.ciu`.
+
+### Root selection
+
+- --define-root PATH
+   - Override repository root directory (no parent walking)
+- --root-folder PATH
+   - Alias for --define-root
+
+### Skips/cleanup
+
+- --skip-hostdir-check
+   - Skip hostdir creation/validation (cleanup mode)
+- --skip-hooks
+   - Skip pre/post compose hooks
+- --skip-secrets
+   - Skip secret resolution/validation
+- --reset
+   - Clean service to fresh state (remove containers, volumes, configs)
+
 ## Inputs
 
 - ciu-global.defaults.toml.j2
@@ -36,7 +98,7 @@ The pipeline below matches CIU engine behavior:
 
 ```mermaid
 flowchart TD
-    A["Start (stack dir)"] --> B["Load .env.workspace"]
+   A["Start (stack dir)"] --> B["Load .env.ciu"]
     B --> C["Render global templates" ]
     C --> D["Render stack templates" ]
     D --> E["Deep merge global + stack" ]
@@ -56,7 +118,7 @@ flowchart TD
 ### Step Details
 
 1. **Load workspace env**
-   - Reads .env.workspace and validates required keys via ensure_workspace_env.
+   - Reads .env.ciu and validates required keys via ensure_workspace_env.
 
 2. **Render global config**
    - Ensures ciu-global.toml.j2 exists by copying defaults if missing.
@@ -169,7 +231,7 @@ REDIS_PASSWORD=...
 
 ## Fail-Fast Behavior
 
-- Missing required .env.workspace keys abort execution.
+- Missing required .env.ciu keys abort execution.
 - Missing deploy.env.shared values required for hostdir creation abort execution.
 - Missing stack root key (or multiple root keys) abort execution.
 - Registry authentication failures abort execution when registry.url is set.

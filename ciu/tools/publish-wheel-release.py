@@ -2,15 +2,18 @@
 """Publish CIU wheel to GitHub Releases using the REST API.
 
 Required environment:
-- CIU_RELEASE_TOKEN or GITHUB_TOKEN
-- CIU_RELEASE_REPO or GITHUB_REPOSITORY (owner/repo)
+- GITHUB_PUSH_PAT
+- GITHUB_USERNAME
+- GITHUB_REPO
 
 Optional environment:
-- CIU_RELEASE_TAG (default: ciu-v<version>)
+- CIU_PROJECT_ROOT (default: repo-root/ciu)
+- CIU_PACKAGE_NAME (default: project.name from pyproject.toml)
+- CIU_WHEEL_GLOB (default: <dist_name>-*.whl)
 - CIU_RELEASE_TITLE
 - CIU_RELEASE_NOTES
-- CIU_LATEST_TAG (default: ciu-latest)
-- CIU_LATEST_ASSET_NAME (default: ciu-latest-py3-none-any.whl)
+- CIU_LATEST_TAG (default: <package_name>-wheel-<version>)
+- CIU_LATEST_ASSET_NAME (default: <package_name>-wheel-latest-py3-none-any.whl)
 - CIU_LATEST_TITLE
 - CIU_LATEST_NOTES
 - CIU_DEBUG_API=1 for verbose API logging
@@ -96,7 +99,7 @@ def parse_json(body: str, context: str) -> Dict[str, Any]:
     return {}
 
 
-def build_wheel(project_root: Path) -> Path:
+def build_wheel(project_root: Path, wheel_glob: str) -> Path:
     dist_dir = project_root / "dist"
     if dist_dir.exists():
         shutil.rmtree(dist_dir)
@@ -107,9 +110,9 @@ def build_wheel(project_root: Path) -> Path:
         check=True,
         cwd=str(project_root),
     )
-    wheels = sorted(dist_dir.glob("ciu-*.whl"))
+    wheels = sorted(dist_dir.glob(wheel_glob))
     if not wheels:
-        fail("CIU wheel not found in dist/")
+        fail(f"Wheel not found in dist/ (glob: {wheel_glob})")
     return wheels[0]
 
 
@@ -128,6 +131,14 @@ def create_release(api_base: str, owner: str, repo: str, tag: str, title: str, n
     if resp.status >= 400:
         fail(f"Failed to create release {tag}", resp.status, resp.body)
     return parse_json(resp.body, f"create release {tag}")
+
+
+def update_release(api_base: str, owner: str, repo: str, release_id: int, title: str, notes: str, token: str) -> Dict[str, Any]:
+    payload = json.dumps({"name": title, "body": notes}).encode("utf-8")
+    resp = api_request("PATCH", f"{api_base}/repos/{owner}/{repo}/releases/{release_id}", token, data=payload, content_type="application/json")
+    if resp.status >= 400:
+        fail(f"Failed to update release {release_id}", resp.status, resp.body)
+    return parse_json(resp.body, f"update release {release_id}")
 
 
 def list_assets(api_base: str, owner: str, repo: str, release_id: int, token: str) -> list[Dict[str, Any]]:
@@ -161,6 +172,10 @@ def publish_release_asset(api_base: str, owner: str, repo: str, tag: str, title:
     release = get_release_by_tag(api_base, owner, repo, tag, token)
     if release is None:
         release = create_release(api_base, owner, repo, tag, title, notes, token)
+    else:
+        release_id = release.get("id")
+        if release_id:
+            update_release(api_base, owner, repo, int(release_id), title, notes, token)
 
     release_id = release.get("id")
     upload_url = release.get("upload_url")
@@ -177,7 +192,8 @@ def publish_release_asset(api_base: str, owner: str, repo: str, tag: str, title:
 
 
 def main() -> None:
-    project_root = Path(__file__).resolve().parent.parent
+    default_project_root = Path(__file__).resolve().parent.parent
+    project_root = Path(os.getenv("CIU_PROJECT_ROOT", default_project_root)).resolve()
     repo_root = project_root.parent
 
     env_file = Path(os.getenv("CIU_ENV_FILE", repo_root / ".env"))
@@ -191,47 +207,46 @@ def main() -> None:
     import tomllib
 
     data = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
-    version = data.get("project", {}).get("version")
+    project_meta = data.get("project", {})
+    version = project_meta.get("version")
     if not version:
         fail("Unable to read project.version from pyproject.toml")
+    package_name = os.getenv("CIU_PACKAGE_NAME", project_meta.get("name", "ciu"))
+    if not package_name:
+        fail("Unable to read project.name from pyproject.toml")
+    dist_name = package_name.replace("-", "_")
+    wheel_glob = os.getenv("CIU_WHEEL_GLOB", f"{dist_name}-*.whl")
 
-    token = os.getenv("CIU_RELEASE_TOKEN") or os.getenv("GITHUB_TOKEN")
+    token = os.getenv("GITHUB_PUSH_PAT")
     if not token:
-        fail("CIU_RELEASE_TOKEN or GITHUB_TOKEN is required")
+        fail("GITHUB_PUSH_PAT is required")
 
-    release_repo = os.getenv("CIU_RELEASE_REPO") or os.getenv("GITHUB_REPOSITORY")
-    if not release_repo or "/" not in release_repo:
-        fail("CIU_RELEASE_REPO or GITHUB_REPOSITORY is required (format: owner/repo)")
-
-    owner, repo = release_repo.split("/", 1)
+    owner = os.getenv("GITHUB_USERNAME")
+    repo = os.getenv("GITHUB_REPO")
+    if not owner or not repo:
+        fail("GITHUB_USERNAME and GITHUB_REPO are required")
     api_base = "https://api.github.com"
 
-    tag = os.getenv("CIU_RELEASE_TAG", f"ciu-v{version}")
-    release_title = os.getenv("CIU_RELEASE_TITLE", f"CIU {version}")
-    release_notes = os.getenv("CIU_RELEASE_NOTES", f"CIU wheel {version}")
+    tag = f"{package_name}-wheel-{version}"
+    release_title = os.getenv("CIU_RELEASE_TITLE", f"{package_name}-wheel-{version}-py3-none-any")
+    release_notes = os.getenv("CIU_RELEASE_NOTES", f"{package_name} wheel {version}")
 
-    wheel_path = build_wheel(project_root)
+    wheel_path = build_wheel(project_root, wheel_glob)
     wheel_hash = sha256(wheel_path.read_bytes()).hexdigest()
 
     publish_release_asset(api_base, owner, repo, tag, release_title, release_notes, wheel_path, wheel_path.name, token)
 
-    latest_tag = os.getenv("CIU_LATEST_TAG", "ciu-latest")
-    latest_asset_name = os.getenv("CIU_LATEST_ASSET_NAME", "ciu-latest-py3-none-any.whl")
-    latest_title = os.getenv("CIU_LATEST_TITLE", "CIU latest")
-    latest_notes = os.getenv("CIU_LATEST_NOTES", f"CIU latest wheel (points to {version})")
+    latest_tag = os.getenv("CIU_LATEST_TAG", f"{package_name}-wheel-latest")
+    latest_asset_name = os.getenv("CIU_LATEST_ASSET_NAME", wheel_path.name)
+    latest_title = os.getenv("CIU_LATEST_TITLE", f"{package_name}-wheel-latest")
+    latest_notes = os.getenv("CIU_LATEST_NOTES", f"{package_name} wheel latest (points to {version})")
 
-    latest_wheel_path = wheel_path.with_name(latest_asset_name)
-    shutil.copyfile(wheel_path, latest_wheel_path)
-    try:
-        publish_release_asset(api_base, owner, repo, latest_tag, latest_title, latest_notes, latest_wheel_path, latest_asset_name, token)
-    finally:
-        if latest_wheel_path.exists():
-            latest_wheel_path.unlink()
+    publish_release_asset(api_base, owner, repo, latest_tag, latest_title, latest_notes, wheel_path, latest_asset_name, token)
 
-    wheel_url = f"https://github.com/{release_repo}/releases/download/{tag}/{wheel_path.name}"
-    latest_wheel_url = f"https://github.com/{release_repo}/releases/download/{latest_tag}/{latest_asset_name}"
+    wheel_url = f"https://github.com/{owner}/{repo}/releases/download/{tag}/{wheel_path.name}"
+    latest_wheel_url = f"https://github.com/{owner}/{repo}/releases/download/{latest_tag}/{latest_asset_name}"
 
-    print("[INFO] Published CIU wheel")
+    print(f"[INFO] Published {package_name} wheel")
     print(f"[INFO] CIU_WHEEL_URL={wheel_url}")
     print(f"[INFO] CIU_WHEEL_SHA256={wheel_hash}")
     print(f"[INFO] CIU_WHEEL_LATEST_URL={latest_wheel_url}")

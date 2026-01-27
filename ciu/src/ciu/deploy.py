@@ -63,7 +63,7 @@ Execution Order:
 Configuration:
     - Service startup order: ciu-global.toml [deploy.phases]
     - Named service groups: ciu-global.toml [deploy.groups]
-    - Network name: DOCKER_NETWORK_INTERNAL from .env.workspace
+    - Network name: DOCKER_NETWORK_INTERNAL from .env.ciu
     - Repository paths: REPO_ROOT and PHYSICAL_REPO_ROOT environment variables
 """
 
@@ -89,7 +89,16 @@ from .config_constants import (
     STACK_CONFIG_DEFAULTS,
     STACK_CONFIG_RENDERED,
 )
-from .workspace_env import WorkspaceEnvError, ensure_workspace_env, load_workspace_env
+from .workspace_env import (
+    WorkspaceEnvError,
+    ensure_workspace_env,
+    load_workspace_env,
+    parse_workspace_env,
+    generate_ciu_env,
+    update_cert_permissions,
+    detect_standalone_root,
+    ENV_FILE_NAME,
+)
 
 
 def _find_repo_root(start: Path) -> Path:
@@ -489,14 +498,14 @@ def get_python_executable(repo_root) -> str:
     if not python_executable:
         error(
             "PYTHON_EXECUTABLE is not set. "
-            "Run env-workspace-setup-generate.sh and source .env.workspace."
+            "Run: ciu --generate-env (or ciu-deploy --generate-env) and source .env.ciu."
         )
     assert python_executable is not None
     python_path = Path(python_executable)
     if not python_path.exists():
         error(
             f"PYTHON_EXECUTABLE does not exist: {python_executable}. "
-            "Regenerate .env.workspace to update paths."
+            "Regenerate .env.ciu to update paths (ciu --generate-env)."
         )
     info(f"Using workspace Python: {python_executable}")
     return python_executable
@@ -1137,11 +1146,11 @@ def ensure_network(network_name):
     Ensure the shared Docker network exists.
     
     Args:
-        network_name: Network name from .env.workspace (DOCKER_NETWORK_INTERNAL)
+        network_name: Network name from .env.ciu (DOCKER_NETWORK_INTERNAL)
     """
     if not network_name:
         raise ValueError(
-            "network_name is required - must come from .env.workspace (DOCKER_NETWORK_INTERNAL)"
+            "network_name is required - must come from .env.ciu (DOCKER_NETWORK_INTERNAL)"
         )
     
     info(f"Ensuring Docker network '{network_name}' exists...")
@@ -1180,7 +1189,7 @@ def assert_devcontainer_connected_to_network(network_name):
         if not container_name:
             error(
                 "DEVCONTAINER_NAME is not set. "
-                "Run env-workspace-setup-generate.sh and source .env.workspace."
+                "Run: ciu --generate-env and source .env.ciu."
             )
         assert container_name is not None
         info(f"Checking devcontainer network connection: {container_name}")
@@ -1222,7 +1231,7 @@ def assert_devcontainer_connected_to_network(network_name):
 # Devcontainer network connection is now handled by .devcontainer/post-create.sh
 # This provides better developer experience:
 # - Auto-connection on devcontainer creation
-# - Network name derived from .env.workspace (DOCKER_NETWORK_INTERNAL)
+# - Network name derived from .env.ciu (DOCKER_NETWORK_INTERNAL)
 # - No dependency on orchestrator running
 # - Works immediately after container rebuild
 
@@ -3004,13 +3013,17 @@ Examples:
                              help='Repository root directory (default: current working directory)')
     option_group.add_argument('--root-folder', dest='repo_root', type=str, default=None,
                              help='Alias for --repo-root')
+    option_group.add_argument('--generate-env', action='store_true',
+                             help='Generate .env.ciu with autodetected values')
+    option_group.add_argument('--update-cert-permission', action='store_true',
+                             help='Update Let\'s Encrypt cert permissions (requires root)')
     
     args = parser.parse_args()
     
     # Log deployment start with ID
     info(f"Starting deployment (ID: {ctx.deployment_id})")
 
-    # Load workspace environment (.env.workspace) and validate required keys.
+    # Load workspace environment (.env.ciu) and validate required keys.
     # When a subtree is used as repo root, load the env file from that subtree
     # so REPO_ROOT/PHYSICAL_REPO_ROOT reflect the override instead of the parent.
     try:
@@ -3018,6 +3031,11 @@ Examples:
         if args.repo_root and not env_root.exists():
             error(f"Repository root does not exist: {env_root}")
             sys.exit(1)
+        if args.generate_env:
+            generate_ciu_env(env_root)
+        if args.update_cert_permission:
+            public_fqdn = os.environ.get("PUBLIC_FQDN")
+            update_cert_permissions(env_root, public_fqdn)
         load_workspace_env(env_root)
         ensure_workspace_env([
             'REPO_ROOT',
@@ -3026,6 +3044,8 @@ Examples:
             'PUBLIC_TLS_CRT_PEM',
             'PUBLIC_TLS_KEY_PEM',
             'DOCKER_GID',
+            'CONTAINER_UID',
+            'CONTAINER_GID',
             'USER_UID',
             'USER_GID',
             'DOCKER_NETWORK_INTERNAL'
@@ -3033,6 +3053,16 @@ Examples:
     except WorkspaceEnvError as env_error:
         error(str(env_error))
         return 1
+
+    standalone_root = detect_standalone_root(env_root)
+    if standalone_root:
+        env_repo_root = Path(os.environ.get("REPO_ROOT", "")).resolve()
+        if env_repo_root and env_repo_root != standalone_root:
+            error(
+                "standalone_root is true but REPO_ROOT does not match. "
+                f"Expected: {standalone_root}, got: {env_repo_root}. "
+                "Regenerate .env.ciu from the standalone root."
+            )
     
     # Get repository root (env or --repo-root argument).
     # If --repo-root is inside the current REPO_ROOT, remap PHYSICAL_REPO_ROOT
@@ -3045,7 +3075,7 @@ Examples:
         if env_repo_root_value:
             env_repo_root = Path(env_repo_root_value).resolve()
             if env_repo_root != repo_root:
-                warn(f"REPO_ROOT from .env.workspace differs: {env_repo_root}")
+                warn(f"REPO_ROOT from .env.ciu differs: {env_repo_root}")
             try:
                 rel_path = repo_root.relative_to(env_repo_root)
             except ValueError:
@@ -3059,7 +3089,7 @@ Examples:
         if not repo_root.exists():
             error(f"Repository root does not exist: {repo_root}")
             sys.exit(1)
-        info(f"Using repository root from .env.workspace: {repo_root}")
+        info(f"Using repository root from .env.ciu: {repo_root}")
     
     # Fail-fast: Validate global config defaults template exists
     global_config_defaults = repo_root / GLOBAL_CONFIG_DEFAULTS
@@ -3102,11 +3132,11 @@ Examples:
         error("Example: project_name = \"dstdns\"")
         sys.exit(1)
     
-    # Get network name from .env.workspace (single source of truth)
+    # Get network name from .env.ciu (single source of truth)
     network_name = deploy.get('network_name') or os.environ.get('DOCKER_NETWORK_INTERNAL')
     if not network_name:
-        error("CRITICAL: DOCKER_NETWORK_INTERNAL not set in .env.workspace")
-        error("Run env-workspace-setup-generate.sh and source .env.workspace")
+        error("CRITICAL: DOCKER_NETWORK_INTERNAL not set in .env.ciu")
+        error("Run: ciu --generate-env and source .env.ciu")
         sys.exit(1)
     
     # Handle --list-groups (exit immediately after printing)
