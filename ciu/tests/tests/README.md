@@ -16,3 +16,13 @@ Once Vault and Consul hooks are fully migrated, add integration tests that:
 3. Execute hooks and validate resulting state/seeded KV.
 
 These integration tests should run in the testing container to ensure consistent tooling.
+
+## Test Repo Fixture
+
+CIU includes a synthetic repository at [ciu/test-repo](../../test-repo) that
+covers multiple configuration layouts:
+
+- Standard multi-stack repo with vault + consul + apps
+- App without vault
+- App with vault hook
+- Standalone project with its own ciu-global.defaults.toml.j2

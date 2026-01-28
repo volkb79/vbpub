@@ -7,8 +7,8 @@ import sys
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ciu"))
-from ciu import parse_arguments  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from ciu.engine import parse_arguments  # noqa: E402
 
 
 class TestParseArgumentsDefaults:
@@ -23,6 +23,7 @@ class TestParseArgumentsDefaults:
         assert args.skip_hostdir_check is False
         assert args.skip_hooks is False
         assert args.skip_secrets is False
+        assert args.generate_env is False
         assert args.yes is False
         assert args.reset is False
         assert args.define_root is None
@@ -53,6 +54,7 @@ class TestParseArgumentsFlags:
             "--skip-hostdir-check",
             "--skip-hooks",
             "--skip-secrets",
+            "--generate-env",
             "--reset",
             "-y",
         ])
@@ -63,8 +65,17 @@ class TestParseArgumentsFlags:
         assert args.skip_hostdir_check is True
         assert args.skip_hooks is True
         assert args.skip_secrets is True
+        assert args.generate_env is True
         assert args.reset is True
         assert args.yes is True
+
+    def test_version_flag_exits(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            parse_arguments(["--version"])
+
+        assert exc.value.code == 0
+        captured = capsys.readouterr()
+        assert "ciu " in captured.out
 
 
 class TestParseArgumentsEdgeCases:

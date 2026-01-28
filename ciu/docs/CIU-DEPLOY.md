@@ -45,9 +45,17 @@ Actions execute in the order specified on the CLI. If no actions are specified, 
 ## Workspace Env Options
 
 - --generate-env
-  - Generate .env.ciu with autodetected values before loading env
+  - Generate .env.ciu with autodetected values before loading env (overrides existing file)
 - --update-cert-permission
   - Update Let’s Encrypt cert permissions (requires root)
+
+CIU Deploy also auto-generates .env.ciu when it is missing, even without
+--generate-env.
+
+## Version
+
+- --version
+  - Print CIU Deploy CLI version (build-date format: YYYYMMDD)
 
 ## CIU Global Options
 
@@ -84,18 +92,21 @@ apps = ["phase_4"]
 
 ```mermaid
 flowchart TD
-    A["Start CIU Deploy"] --> B["Load .env.ciu + validate" ]
-    B --> C["Ensure ciu-global.toml exists" ]
-    C --> D["Resolve phases/groups" ]
-    D --> E["Execute actions in CLI order" ]
-    E --> F["Per-stack CIU invocation" ]
-    F --> G["Healthcheck/selftest (optional)" ]
-    G --> H["END" ]
+  A["Start CIU Deploy"] --> B["Generate .env.ciu if missing" ]
+  B --> C["Load .env.ciu + validate" ]
+  C --> D["Ensure ciu-global.toml exists" ]
+  D --> E["Resolve phases/groups" ]
+  E --> F["Execute actions in CLI order" ]
+  F --> G["Per-stack CIU invocation" ]
+  G --> H["Healthcheck/selftest (optional)" ]
+  H --> I["END" ]
 ```
 
 ### Key Steps
 
 1. **Load workspace env**
+  - If .env.ciu is missing, CIU Deploy auto-generates it first.
+  - `--generate-env` always regenerates the file before loading.
   - Validates .env.ciu keys (REPO_ROOT, PHYSICAL_REPO_ROOT, DOCKER_NETWORK_INTERNAL, PUBLIC_FQDN, TLS paths, etc.).
 
 2. **Ensure global config**

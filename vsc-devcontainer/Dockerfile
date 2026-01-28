@@ -1,7 +1,10 @@
 # Devcontainer base image (pre-built)
 # Supports multiple Debian + Python variants via build args.
 
-ARG BASE_IMAGE="scratch"
+
+ARG PYTHON_VERSION="3.13"
+ARG DEBIAN_VERSION="trixie"
+ARG BASE_IMAGE="mcr.microsoft.com/devcontainers/python:1-${PYTHON_VERSION}-${DEBIAN_VERSION}"
 FROM ${BASE_IMAGE}
 
 SHELL ["/bin/bash", "-c"]

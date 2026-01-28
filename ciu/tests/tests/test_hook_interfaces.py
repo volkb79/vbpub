@@ -12,7 +12,8 @@ from pathlib import Path
 import pytest
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TEST_REPO = REPO_ROOT / "test-repo"
 
 
 def _load_module(module_path: Path):
@@ -24,22 +25,27 @@ def _load_module(module_path: Path):
     return module
 
 
-def _assert_hook_class(module, class_name: str) -> None:
-    hook_cls = getattr(module, class_name, None)
-    assert hook_cls is not None, f"{class_name} missing"
-    assert hasattr(hook_cls, "run"), f"{class_name}.run missing"
+def _assert_post_compose_interface(module) -> None:
+    hook_cls = getattr(module, "PostComposeHook", None)
+    if hook_cls is not None:
+        assert hasattr(hook_cls, "run"), "PostComposeHook.run missing"
+        return
+
+    hook_func = getattr(module, "post_compose_hook", None) or getattr(module, "run", None)
+    assert hook_func is not None, "post_compose_hook or run function missing"
+    assert callable(hook_func), "post_compose_hook must be callable"
 
 
 def test_vault_post_compose_hook_interface() -> None:
-    hook_path = REPO_ROOT / "infra" / "vault" / "post_compose_vault.py"
+    hook_path = TEST_REPO / "infra" / "vault-core" / "post_compose_hook.py"
     assert hook_path.exists(), "Vault hook file missing"
     module = _load_module(hook_path)
-    _assert_hook_class(module, "PostComposeHook")
+    _assert_post_compose_interface(module)
 
 
 def test_consul_hook_interface_or_skip() -> None:
-    hook_path = REPO_ROOT / "infra" / "consul-server" / "post_compose_consul.py"
+    hook_path = TEST_REPO / "infra" / "consul-core" / "post_compose_hook.py"
     if not hook_path.exists():
         pytest.skip("Consul post-compose hook not implemented yet")
     module = _load_module(hook_path)
-    _assert_hook_class(module, "PostComposeHook")
+    _assert_post_compose_interface(module)

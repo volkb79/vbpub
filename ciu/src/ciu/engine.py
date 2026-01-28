@@ -49,15 +49,12 @@ from .config_constants import (
     STACK_CONFIG_RENDERED,
     DOCKER_COMPOSE_OUTPUT,
 )
+from .cli_utils import get_cli_version
 from .workspace_env import (
-    load_workspace_env,
-    ensure_workspace_env,
     WorkspaceEnvError,
-    parse_workspace_env,
-    generate_ciu_env,
-    update_cert_permissions,
+    bootstrap_workspace_env,
+    resolve_env_root,
     detect_standalone_root,
-    ENV_FILE_NAME,
 )
 
 
@@ -182,6 +179,7 @@ def configure_logging(log_level: str = "INFO") -> None:
         logger.info(f"Logging configured: {log_level.upper()}")
 
 
+
 def parse_arguments(argv: Optional[list] = None) -> argparse.Namespace:
     """
     Parse command-line arguments for CIU.
@@ -295,6 +293,12 @@ Examples:
         '--generate-env',
         action='store_true',
         help='Generate .env.ciu with autodetected values'
+    )
+
+    parser.add_argument(
+        '--version',
+        action='version',
+        version=f"ciu {get_cli_version()}"
     )
 
     parser.add_argument(
@@ -1735,24 +1739,13 @@ def main_execution(
 
         print("[INFO] Loading workspace environment...", flush=True)
         try:
-            if define_root:
-                root_env_file = define_root.resolve() / ENV_FILE_NAME
-                if not root_env_file.exists():
-                    raise WorkspaceEnvError(
-                        f"Workspace environment file not found at {root_env_file}. "
-                        "Define a valid root or generate .env.ciu first."
-                    )
-                values = parse_workspace_env(root_env_file)
-                for key, value in values.items():
-                    os.environ[key] = value
-            else:
-                if generate_env:
-                    generate_ciu_env(working_dir)
-                if update_cert_permission:
-                    public_fqdn = os.environ.get("PUBLIC_FQDN")
-                    update_cert_permissions(working_dir, public_fqdn)
-                load_workspace_env(working_dir)
-            ensure_workspace_env([
+            bootstrap_workspace_env(
+                start_dir=working_dir,
+                define_root=define_root,
+                defaults_filename=GLOBAL_CONFIG_DEFAULTS,
+                generate_env=generate_env,
+                update_cert_permission=update_cert_permission,
+                required_keys=[
                 "REPO_ROOT",
                 "PHYSICAL_REPO_ROOT",
                 "DOCKER_NETWORK_INTERNAL",
@@ -1761,7 +1754,8 @@ def main_execution(
                 "PUBLIC_FQDN",
                 "PUBLIC_TLS_CRT_PEM",
                 "PUBLIC_TLS_KEY_PEM",
-            ])
+                ],
+            )
         except WorkspaceEnvError as e:
             raise ValueError(str(e)) from e
 
@@ -1975,6 +1969,32 @@ def main_execution(
 
 def main(argv: Optional[list] = None) -> int:
     args = parse_arguments(argv)
+
+    generate_env_only = (
+        args.generate_env
+        and not args.dry_run
+        and not args.reset
+        and not args.print_context
+        and not args.render_toml
+        and not args.update_cert_permission
+        and not args.skip_hostdir_check
+        and not args.skip_hooks
+        and not args.skip_secrets
+    )
+
+    if generate_env_only:
+        print("[INFO] Checking runtime dependencies...", flush=True)
+        check_runtime_dependencies()
+
+        env_root = resolve_env_root(
+            start_dir=args.dir,
+            define_root=args.define_root,
+            defaults_filename=GLOBAL_CONFIG_DEFAULTS,
+        )
+        env_path = generate_ciu_env(env_root)
+        print(f"[SUCCESS] Generated {env_path}", flush=True)
+        return 0
+
     result = main_execution(
         working_dir=args.dir,
         compose_file=args.file,

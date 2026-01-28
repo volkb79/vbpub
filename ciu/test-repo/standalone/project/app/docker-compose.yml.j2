@@ -1,0 +1,15 @@
+x-defaults: &service-defaults
+  environment:
+    {% for key, value in deploy.env.defaults.items() %}
+    - {{ key }}={{ value }}
+    {% endfor %}
+
+services:
+  {{ standalone_app.name }}:
+    <<: *service-defaults
+    image: {{ standalone_app.image }}
+    environment:
+      {% for key, value in standalone_app.env.items() %}
+      - {{ key }}={{ value }}
+      {% endfor %}
+    command: ["sh", "-c", "echo APP_NAME=$APP_NAME && sleep 3600"]

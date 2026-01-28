@@ -9,8 +9,8 @@ from unittest.mock import patch
 import pytest
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ciu"))
-from ciu import create_hostdirs  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from ciu.engine import create_hostdirs  # noqa: E402
 
 
 def _base_config() -> dict:

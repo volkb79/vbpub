@@ -8,8 +8,8 @@ from unittest.mock import Mock, patch
 import pytest
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ciu"))
-from ciu import validate_registry_auth  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from ciu.engine import validate_registry_auth  # noqa: E402
 
 
 class TestRegistryAuthValidation:

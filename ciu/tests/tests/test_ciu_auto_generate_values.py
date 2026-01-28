@@ -9,8 +9,8 @@ from unittest.mock import patch
 import pytest
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ciu"))
-from ciu import auto_generate_values  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from ciu.engine import auto_generate_values  # noqa: E402
 
 
 def _base_config() -> dict:
@@ -30,8 +30,8 @@ def _base_config() -> dict:
 def test_populates_build_metadata_and_ids():
     config = _base_config()
 
-    with patch("ciu.get_git_hash", return_value="abcd1234"), patch(
-        "ciu.get_timestamp", return_value="2026-01-23T00:00:00+00:00"
+    with patch("ciu.engine.get_git_hash", return_value="abcd1234"), patch(
+        "ciu.engine.get_timestamp", return_value="2026-01-23T00:00:00+00:00"
     ):
         result = auto_generate_values(config)
 

@@ -4,12 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ciu"
-version = "0.1.0"
+dynamic = ["version"]
 description = "CIU deployment CLI"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [{name = "DST-DNS Team"}]
+
+[tool.setuptools.dynamic]
+version = {attr = "ciu.__version__"}
 
 [project.scripts]
 ciu = "ciu.cli:main"

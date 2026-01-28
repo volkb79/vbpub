@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -208,9 +209,25 @@ def main() -> None:
 
     data = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
     project_meta = data.get("project", {})
+
     version = project_meta.get("version")
     if not version:
-        fail("Unable to read project.version from pyproject.toml")
+        version = os.getenv("CIU_BUILD_VERSION") or os.getenv("CIU_VERSION")
+
+    if not version:
+        try:
+            sys.path.insert(0, str(project_root / "src"))
+            import ciu  # type: ignore
+
+            version = getattr(ciu, "__version__", "")
+        except Exception:
+            version = ""
+
+    if not version:
+        version = datetime.now(timezone.utc).strftime("%Y%m%d")
+
+    if not version:
+        fail("Unable to resolve CIU version for release tagging")
     package_name = os.getenv("CIU_PACKAGE_NAME", project_meta.get("name", "ciu"))
     if not package_name:
         fail("Unable to read project.name from pyproject.toml")

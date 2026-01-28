@@ -10,8 +10,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ciu"))
-from ciu import reset_service  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from ciu.engine import reset_service  # noqa: E402
 
 
 def _base_config() -> dict:

@@ -144,12 +144,20 @@ celerybeat.pid
 # Environments
 .env
 .envrc
+.env.ciu
 .venv
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# CIU rendered outputs (never commit)
+ciu-global.toml
+ciu-global.toml.j2
+**/ciu.toml
+**/ciu.toml.j2
+**/docker-compose.yml
 
 # Spyder project settings
 .spyderproject

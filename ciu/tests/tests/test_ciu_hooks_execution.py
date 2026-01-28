@@ -7,8 +7,8 @@ from pathlib import Path
 import sys
 import tomllib
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ciu"))
-from ciu import execute_hooks  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from ciu.engine import execute_hooks  # noqa: E402
 
 
 def test_hook_env_updates_are_applied():

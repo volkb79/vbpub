@@ -75,7 +75,6 @@ import shutil
 import subprocess
 import sys
 import time
-import tomllib
 import traceback
 import urllib.error
 import urllib.request
@@ -83,31 +82,22 @@ import uuid
 from pathlib import Path
 from typing import Set, TypedDict
 
-from .config_constants import (
-    GLOBAL_CONFIG_DEFAULTS,
-    GLOBAL_CONFIG_RENDERED,
-    STACK_CONFIG_DEFAULTS,
-    STACK_CONFIG_RENDERED,
-)
+from .config_constants import GLOBAL_CONFIG_DEFAULTS, GLOBAL_CONFIG_RENDERED
+from .cli_utils import get_cli_version
 from .workspace_env import (
     WorkspaceEnvError,
-    ensure_workspace_env,
-    load_workspace_env,
-    parse_workspace_env,
-    generate_ciu_env,
-    update_cert_permissions,
+    bootstrap_workspace_env,
     detect_standalone_root,
-    ENV_FILE_NAME,
+)
+from .render_utils import (
+    find_stack_anchor,
+    build_global_config_debug_lines,
+    load_global_config,
+    render_global_config,
+    render_global_config_if_missing,
+    render_stack_configs,
 )
 
-
-def _find_repo_root(start: Path) -> Path:
-    current = start.resolve()
-    while current != current.parent:
-        if (current / "ciu-global.defaults.toml.j2").exists():
-            return current
-        current = current.parent
-    raise FileNotFoundError("Repository root not found (ciu-global.defaults.toml.j2 missing).")
 
 # Color codes for output
 BLUE = '\033[94m'
@@ -2551,112 +2541,8 @@ def print_config_context(repo_root):
     return True
 
 
-def load_global_config(repo_root) -> dict:
-    """Load global configuration with debug output."""
-    global_config_path = repo_root / GLOBAL_CONFIG_RENDERED
-
-    debug(f"Loading global config from: {global_config_path}")
-
-    if not global_config_path.exists():
-        error(
-            f"Rendered global config not found: {global_config_path}. "
-            "Render ciu-global.toml before running ciu-deploy."
-        )
-
-    try:
-        with open(global_config_path, 'rb') as f:
-            config = tomllib.load(f)
-
-        deploy = config.get('deploy', {})
-        set_debug_enabled(deploy.get('log_level'))
-
-        debug("=== Global Config Values ===")
-        debug(f"  deploy.project_name: {deploy.get('project_name', 'NOT SET')}")
-        debug(f"  deploy.environment_tag: {deploy.get('environment_tag', 'NOT SET')}")
-        debug(f"  deploy.network_name: {deploy.get('network_name', 'NOT SET')}")
-        debug(f"  deploy.log_level: {deploy.get('log_level', 'NOT SET')}")
-
-        registry = deploy.get('registry', {})
-        debug(f"  deploy.registry.namespace: {registry.get('namespace', 'NOT SET')}")
-        debug(f"  deploy.registry.url: {registry.get('url', '(empty - using local)')}")
-        debug("=== End Global Config ===")
-
-        return config
-    except Exception as e:
-        error(f"Could not load global config: {e}")
-        raise RuntimeError(f"Failed to load global config: {e}") from e
-
-
-def find_stack_anchor(repo_root: Path) -> Path:
-    """Find a stack directory containing ciu.defaults.toml.j2 for global render."""
-    candidates = []
-    for toml_path in repo_root.rglob(STACK_CONFIG_DEFAULTS):
-        relative = toml_path.relative_to(repo_root)
-        if not relative.parts:
-            continue
-        top_level = relative.parts[0]
-        if top_level not in {"applications", "infra", "infra-global", "tools"}:
-            continue
-        candidates.append(toml_path.parent)
-
-    if not candidates:
-        raise RuntimeError("No stack config found to render ciu-global.toml")
-
-    return sorted(candidates, key=lambda path: str(path))[0]
-
-
-def render_global_config_if_missing(repo_root: Path, python_exe: str) -> None:
-    """Render ciu-global.toml if missing before deployment actions."""
-    global_config_path = repo_root / GLOBAL_CONFIG_RENDERED
-    if global_config_path.exists():
-        return
-
-    anchor_dir = find_stack_anchor(repo_root)
-    info(
-        "Rendered global config missing; "
-        f"rendering via CIU using stack at {anchor_dir.relative_to(repo_root)}"
-    )
-
-    command = [
-        python_exe,
-        str(repo_root / "scripts" / "ciu" / "ciu.py"),
-        "--render-toml",
-        "-d",
-        str(anchor_dir),
-        "--define-root",
-        str(repo_root),
-    ]
-
-    result = subprocess.run(command, check=False)
-    if result.returncode != 0 or not global_config_path.exists():
-        raise RuntimeError("Failed to render ciu-global.toml before deployment")
-
-
-def render_stack_config(repo_root: Path, python_exe: str, stack_path: Path) -> None:
-    """Render stack ciu.toml for a specific stack directory."""
-    defaults_path = stack_path / STACK_CONFIG_DEFAULTS
-    if not defaults_path.exists():
-        warn(f"Skipping render for {stack_path}: {STACK_CONFIG_DEFAULTS} not found")
-        return
-
-    command = [
-        python_exe,
-        str(repo_root / "scripts" / "ciu" / "ciu.py"),
-        "--render-toml",
-        "-d",
-        str(stack_path),
-        "--define-root",
-        str(repo_root),
-    ]
-
-    result = subprocess.run(command, check=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to render ciu.toml for {stack_path}")
-
-
 def render_all_configs(
     repo_root: Path,
-    python_exe: str,
     deployment_phases: list[dict],
     selected_phases: list[int] | None
 ) -> None:
@@ -2667,22 +2553,7 @@ def render_all_configs(
         f"{anchor_dir.relative_to(repo_root)}"
     )
 
-    command = [
-        python_exe,
-        str(repo_root / "scripts" / "ciu" / "ciu.py"),
-        "--render-toml",
-        "-d",
-        str(anchor_dir),
-        "--define-root",
-        str(repo_root),
-    ]
-
-    result = subprocess.run(command, check=False)
-    if result.returncode != 0:
-        raise RuntimeError("Failed to render ciu-global.toml")
-
-    # Reload global config after render
-    global_config = load_global_config(repo_root)
+    global_config = render_global_config(repo_root)
     phases = load_deployment_phases(global_config)
 
     if selected_phases:
@@ -2715,45 +2586,8 @@ def render_all_configs(
     info(f"Rendering ciu.toml for {len(stack_paths)} stack(s)")
     for stack_path in sorted(stack_paths, key=lambda path: str(path)):
         info(f"  Rendering stack: {stack_path.relative_to(repo_root)}")
-        render_stack_config(repo_root, python_exe, stack_path)
 
-
-def ensure_global_config_rendered(repo_root: Path, python_exe: str, deployment_phases: list) -> None:
-    """Ensure ciu-global.toml exists by rendering via CIU if missing."""
-    global_config_path = repo_root / GLOBAL_CONFIG_RENDERED
-
-    if global_config_path.exists():
-        return
-
-    anchor_service = None
-    for phase in deployment_phases:
-        services = phase.get('services', [])
-        if services:
-            anchor_service = services[0]
-            break
-
-    if not anchor_service:
-        raise RuntimeError("No deployment services available to render global config")
-
-    service_path = repo_root / anchor_service['path']
-    info(
-        "Rendered global config missing after cleanup; "
-        f"rendering via CIU using {anchor_service['name']} ({anchor_service['path']})"
-    )
-
-    command = [
-        python_exe,
-        str(repo_root / "scripts" / "ciu" / "ciu.py"),
-        "--render-toml",
-        "-d",
-        str(service_path),
-        "--define-root",
-        str(repo_root),
-    ]
-
-    result = subprocess.run(command, check=False)
-    if result.returncode != 0 or not global_config_path.exists():
-        raise RuntimeError("Failed to render ciu-global.toml after cleanup")
+    render_stack_configs(stack_paths, global_config, preserve_state=True)
 
 # Registry deployment is now handled by:
 # 1. CIU validates deploy.registry.url (empty for local, non-empty for external)
@@ -3017,6 +2851,11 @@ Examples:
                              help='Generate .env.ciu with autodetected values')
     option_group.add_argument('--update-cert-permission', action='store_true',
                              help='Update Let\'s Encrypt cert permissions (requires root)')
+    option_group.add_argument(
+        '--version',
+        action='version',
+        version=f"ciu-deploy {get_cli_version()}"
+    )
     
     args = parser.parse_args()
     
@@ -3027,29 +2866,26 @@ Examples:
     # When a subtree is used as repo root, load the env file from that subtree
     # so REPO_ROOT/PHYSICAL_REPO_ROOT reflect the override instead of the parent.
     try:
-        env_root = Path(args.repo_root).resolve() if args.repo_root else Path.cwd()
-        if args.repo_root and not env_root.exists():
-            error(f"Repository root does not exist: {env_root}")
-            sys.exit(1)
-        if args.generate_env:
-            generate_ciu_env(env_root)
-        if args.update_cert_permission:
-            public_fqdn = os.environ.get("PUBLIC_FQDN")
-            update_cert_permissions(env_root, public_fqdn)
-        load_workspace_env(env_root)
-        ensure_workspace_env([
-            'REPO_ROOT',
-            'PHYSICAL_REPO_ROOT',
-            'PUBLIC_FQDN',
-            'PUBLIC_TLS_CRT_PEM',
-            'PUBLIC_TLS_KEY_PEM',
-            'DOCKER_GID',
-            'CONTAINER_UID',
-            'CONTAINER_GID',
-            'USER_UID',
-            'USER_GID',
-            'DOCKER_NETWORK_INTERNAL'
-        ])
+        env_root = bootstrap_workspace_env(
+            start_dir=Path.cwd(),
+            define_root=Path(args.repo_root).resolve() if args.repo_root else None,
+            defaults_filename=GLOBAL_CONFIG_DEFAULTS,
+            generate_env=args.generate_env,
+            update_cert_permission=args.update_cert_permission,
+            required_keys=[
+                'REPO_ROOT',
+                'PHYSICAL_REPO_ROOT',
+                'PUBLIC_FQDN',
+                'PUBLIC_TLS_CRT_PEM',
+                'PUBLIC_TLS_KEY_PEM',
+                'DOCKER_GID',
+                'CONTAINER_UID',
+                'CONTAINER_GID',
+                'USER_UID',
+                'USER_GID',
+                'DOCKER_NETWORK_INTERNAL'
+            ],
+        )
     except WorkspaceEnvError as env_error:
         error(str(env_error))
         return 1
@@ -3104,14 +2940,14 @@ Examples:
     os.chdir(repo_root)
     info(f"Working directory: {repo_root}")
 
-    # Get Python executable (prefer venv)
-    python_exe = get_python_executable(repo_root)
-
     # Ensure global config exists before loading
-    render_global_config_if_missing(repo_root, python_exe)
+    render_global_config_if_missing(repo_root)
 
     # Load global configuration
     global_config = load_global_config(repo_root)
+    set_debug_enabled(global_config.get('deploy', {}).get('log_level'))
+    for line in build_global_config_debug_lines(global_config):
+        debug(line)
 
     # Debug: Print workspace environment values
     info("="*70)
@@ -3221,7 +3057,7 @@ Examples:
 
             elif action == 'render_toml':
                 deployment_phases = load_deployment_phases(global_config)
-                render_all_configs(repo_root, python_exe, deployment_phases, selected_phases)
+                render_all_configs(repo_root, deployment_phases, selected_phases)
             
             elif action == 'build':
                 if not build_images(repo_root, use_cache=True):

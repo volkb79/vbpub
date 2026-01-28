@@ -1,0 +1,15 @@
+# CIU-generated files (do not commit)
+
+# Workspace env
+.env.ciu
+
+# Rendered global config + override template (auto-created when missing)
+ciu-global.toml
+ciu-global.toml.j2
+
+# Rendered stack config + override templates (auto-created when missing)
+**/ciu.toml
+**/ciu.toml.j2
+
+# Rendered compose output
+**/docker-compose.yml
